@@ -6,7 +6,7 @@
 
 One self-hosted endpoint for every AI subscription you pay for.
 
-douane connects your Claude, ChatGPT (Codex), Antigravity, Grok, GitHub Copilot and OpenCode Go subscriptions, plus any API key you hold, then serves them to any coding tool through OpenAI- and Anthropic-compatible APIs. It watches each account's quota, picks the account that should serve the next conversation, and keeps a conversation on the same account so the provider's prompt cache stays warm. A single Rust binary with an embedded dashboard; no Node.js, Docker or external database at runtime.
+douane connects your Claude, ChatGPT (Codex), Antigravity, Muse Code, Grok, GitHub Copilot and OpenCode Go subscriptions, plus any API key you hold, then serves them to any coding tool through OpenAI- and Anthropic-compatible APIs. It watches each account's quota, picks the account that should serve the next conversation, and keeps a conversation on the same account so the provider's prompt cache stays warm. A single Rust binary with an embedded dashboard; no Node.js, Docker or external database at runtime.
 
 ![Quotas page: accounts grouped by provider, with five-hour and weekly windows, resets and extra credits](docs/images/quotas.png)
 
@@ -29,6 +29,7 @@ douane connects your Claude, ChatGPT (Codex), Antigravity, Grok, GitHub Copilot 
 | --- | --- | --- |
 | Claude (Pro, Max) | OAuth in the dashboard, or credential import | Five-hour, weekly and weekly Opus windows, extra usage, banked resets |
 | Codex (ChatGPT plans) | OAuth in the dashboard, or credential import | Five-hour and weekly windows, credits, banked resets |
+| Muse Code (Meta subscription) | Meta device code in the dashboard, or credential import | Subscription windows observed in inference responses |
 | Antigravity | Google OAuth once a client is configured, or import | Per-model quotas |
 | Grok (SuperGrok) | Device code in the dashboard | Weekly or monthly credit windows |
 | OpenCode Go | Subscription key in the manual form | Five-hour, weekly and monthly windows |
@@ -176,6 +177,12 @@ account's list, and a request goes only to the accounts whose own list names its
 model. An account that still answers `NOT_FOUND` for a model is skipped for it
 for 24 hours or until a restart, the next account is tried, and the account
 stays usable.
+
+### Muse Code subscription
+
+Choose **Muse Code** in **Connect an account**, then authorize the displayed device code with your Meta account. This connects the direct Muse Code subscription. Muse models available through OpenCode Go remain a separate provider.
+
+Model ids use `meta/` followed by an id from the account's live catalog. Chat Completions, Messages and Responses clients use the subscription's Responses endpoint. Quotas stay unknown until Meta reports them in an inference response; the last reported windows survive a restart. douane does not switch an inactive subscription to pay-per-token API billing.
 
 ### GitHub Copilot clients
 

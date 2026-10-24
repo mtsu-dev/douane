@@ -97,6 +97,7 @@ async fn answer(
         return Json(response).into_response();
     }
     let mut events = vec![
+        json!({"type":"response.subscription_usage","subscription":{"tier":"private-tier", "weekly":{"used_percent":20,"resets_at":1792368000}}}),
         json!({"type":"response.created","response":{"id":"resp_muse","model":MUSE}}),
         json!({"type":"response.output_item.added","output_index":0,"item":output()[0]}),
         json!({"type":"response.output_text.delta","output_index":1,"delta":TEXT}),
@@ -114,20 +115,43 @@ async fn answer(
         _ => events.push(json!({"type":"response.completed","response":response})),
     }
     // Fragment inside UTF-8 and leave the terminal event without a separator.
-    let bytes = events
+    let encoded = events
         .iter()
         .map(|v| format!("event: {}\ndata: {v}\n\n", v["type"].as_str().unwrap()))
-        .collect::<String>()
-        .trim_end()
-        .as_bytes()
-        .to_vec();
+        .collect::<String>();
+    let bytes = if mode == "held-open" || mode == "late-usage" {
+        encoded.as_str()
+    } else {
+        encoded.trim_end()
+    }
+    .as_bytes()
+    .to_vec();
     let chunks: Vec<_> = bytes
         .chunks(7)
         .map(|b| Ok::<_, std::io::Error>(Bytes::copy_from_slice(b)))
         .collect();
+    let stream = futures_util::stream::iter(chunks);
+    if mode == "late-usage" {
+        let tail = futures_util::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(b"event: response.subscription_usage\ndata: {\"type\":\"response.subscription_usage\",\"subscription\":{\"weekly\":{\"used_percent\":55,\"resets_at\":1792368000}}}\n\n"))
+        });
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(stream.chain(tail).chain(futures_util::stream::pending())),
+        )
+            .into_response();
+    }
+    if mode == "held-open" {
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(stream.chain(futures_util::stream::pending())),
+        )
+            .into_response();
+    }
     (
         [("content-type", "text/event-stream")],
-        Body::from_stream(futures_util::stream::iter(chunks)),
+        Body::from_stream(stream),
     )
         .into_response()
 }
@@ -140,10 +164,11 @@ struct Fixture {
     _directory: tempfile::TempDir,
     client: reqwest::Client,
     key: String,
+    provider: String,
 }
 
 impl Fixture {
-    async fn new() -> Self {
+    async fn new(provider: &str) -> Self {
         let upstream = Arc::new(Upstream::default());
         let server = serve(
             Router::new()
@@ -171,7 +196,7 @@ impl Fixture {
         state
             .accounts
             .import(
-                json!({"provider":"opencode_go","access_token":"mock-go-key",
+                json!({"provider":provider,"access_token":"mock-go-key",
             "base_url":server.url}),
                 None,
             )
@@ -199,10 +224,18 @@ impl Fixture {
             _directory: directory,
             client,
             key,
+            provider: provider.into(),
         }
     }
 
-    async fn post(&self, path: &str, body: Value) -> reqwest::Response {
+    async fn post(&self, path: &str, mut body: Value) -> reqwest::Response {
+        if self.provider == "meta" {
+            body["model"] = json!(body["model"].as_str().unwrap().replacen(
+                "opencode_go/",
+                "meta/",
+                1
+            ));
+        }
         self.client
             .post(format!("{}/v1/{path}", self.gateway.url))
             .header("session_id", "stable-muse-session")
@@ -244,7 +277,13 @@ fn request(kind: &str, stream: bool, follow: bool) -> Value {
 
 #[tokio::test]
 async fn muse_uses_responses_for_every_client_and_tool_followup() {
-    let fixture = Fixture::new().await;
+    for provider in ["opencode_go", "meta"] {
+        muse_uses_responses_for_every_client_and_tool_followup_for(provider).await;
+    }
+}
+
+async fn muse_uses_responses_for_every_client_and_tool_followup_for(provider: &str) {
+    let fixture = Fixture::new(provider).await;
     let models: Value = fixture
         .client
         .get(format!("{}/v1/models", fixture.gateway.url))
@@ -259,7 +298,7 @@ async fn muse_uses_responses_for_every_client_and_tool_followup() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["id"] == format!("opencode_go/{MUSE}"))
+            .any(|m| m["id"] == format!("{provider}/{MUSE}"))
     );
     for kind in ["messages", "chat/completions", "responses"] {
         for follow in [false, true] {
@@ -297,7 +336,18 @@ async fn muse_uses_responses_for_every_client_and_tool_followup() {
             assert_eq!(sent.path, "/v1/responses");
             assert_eq!(sent.headers["authorization"], "Bearer mock-go-key");
             assert_eq!(sent.headers["session_id"], "stable-muse-session");
-            assert_eq!(sent.headers["x-opencode-session"], "stable-muse-session");
+            if provider == "opencode_go" {
+                assert_eq!(sent.headers["x-opencode-session"], "stable-muse-session");
+            } else {
+                assert_eq!(sent.headers["x-client-id"], "tbh:tui");
+                assert!(
+                    sent.headers["user-agent"]
+                        .to_str()
+                        .unwrap()
+                        .starts_with("muse-build/1.3.0")
+                );
+                assert_eq!(sent.body["stream"], true);
+            }
             assert_eq!(sent.body["model"], MUSE);
             assert_eq!(sent.body["tools"][0]["name"], "read");
             if kind != "messages" {
@@ -307,6 +357,10 @@ async fn muse_uses_responses_for_every_client_and_tool_followup() {
             if kind == "responses" {
                 let mut expected = request(kind, false, follow);
                 expected["model"] = json!(MUSE);
+                if provider == "meta" {
+                    expected["stream"] = json!(true);
+                    expected["instructions"] = json!("");
+                }
                 assert_eq!(
                     sent.body, expected,
                     "native reasoning and cache fields must stay opaque"
@@ -327,6 +381,18 @@ async fn muse_uses_responses_for_every_client_and_tool_followup() {
             }
         }
     }
+    if provider == "meta" {
+        let account = fixture.state.accounts.list().await.remove(0);
+        let snapshot = fixture.state.quotas.get(&account.id).await.unwrap();
+        assert_eq!(snapshot.windows[0].remaining_percent, Some(80.0));
+        assert!(snapshot.error.is_none());
+        let config = fixture.state.config.read().await.clone();
+        let reloaded = AppState::new(config, None).unwrap();
+        assert_eq!(
+            reloaded.quotas.get(&account.id).await.unwrap().windows[0].remaining_percent,
+            Some(80.0)
+        );
+    }
     assert!(
         fixture
             .state
@@ -340,12 +406,21 @@ async fn muse_uses_responses_for_every_client_and_tool_followup() {
 
 #[tokio::test]
 async fn muse_streams_text_tools_and_unterminated_completion_for_all_clients() {
-    let fixture = Fixture::new().await;
+    for provider in ["opencode_go", "meta"] {
+        muse_streams_text_tools_and_unterminated_completion_for_all_clients_for(provider).await;
+    }
+}
+
+async fn muse_streams_text_tools_and_unterminated_completion_for_all_clients_for(provider: &str) {
+    let fixture = Fixture::new(provider).await;
     for kind in ["messages", "chat/completions", "responses"] {
         let response = fixture.post(kind, request(kind, true, false)).await;
         assert_eq!(response.status(), StatusCode::OK);
         let text = response.text().await.unwrap();
         assert!(text.contains(TEXT), "{kind}: {text}");
+        if provider == "meta" {
+            assert!(!text.contains("subscription_usage") && !text.contains("private-tier"));
+        }
         assert!(
             text.contains("call_1") && text.contains("read"),
             "{kind}: {text}"
@@ -391,7 +466,13 @@ async fn muse_streams_text_tools_and_unterminated_completion_for_all_clients() {
 
 #[tokio::test]
 async fn muse_errors_and_disconnections_do_not_become_successful_completions() {
-    let fixture = Fixture::new().await;
+    for provider in ["opencode_go", "meta"] {
+        muse_errors_and_disconnections_do_not_become_successful_completions_for(provider).await;
+    }
+}
+
+async fn muse_errors_and_disconnections_do_not_become_successful_completions_for(provider: &str) {
+    let fixture = Fixture::new(provider).await;
     for kind in ["messages", "chat/completions", "responses"] {
         *fixture.upstream.mode.lock().unwrap() = "http-error".into();
         let response = fixture.post(kind, request(kind, false, false)).await;
@@ -402,7 +483,7 @@ async fn muse_errors_and_disconnections_do_not_become_successful_completions() {
                 .as_str()
                 .is_some_and(|m| !m.is_empty())
         );
-        if kind == "responses" {
+        if kind == "responses" && provider == "opencode_go" {
             assert_eq!(error["error"]["message"], "invalid fixture input");
         }
         for mode in ["stream-error", "truncated"] {
@@ -426,7 +507,8 @@ async fn muse_errors_and_disconnections_do_not_become_successful_completions() {
 
 #[tokio::test]
 async fn other_opencode_go_models_keep_chat_completions() {
-    let fixture = Fixture::new().await;
+    let provider = "opencode_go";
+    let fixture = Fixture::new(provider).await;
     for kind in ["messages", "chat/completions", "responses"] {
         let mut body = request(kind, false, false);
         body["model"] = json!("opencode_go/glm-5.3-flash");
@@ -440,8 +522,14 @@ async fn other_opencode_go_models_keep_chat_completions() {
 
 #[tokio::test]
 async fn muse_codex_websocket_uses_http_responses_and_preserves_native_items() {
+    for provider in ["opencode_go", "meta"] {
+        muse_codex_websocket_uses_http_responses_and_preserves_native_items_for(provider).await;
+    }
+}
+
+async fn muse_codex_websocket_uses_http_responses_and_preserves_native_items_for(provider: &str) {
     use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
-    let fixture = Fixture::new().await;
+    let fixture = Fixture::new(provider).await;
     let mut upgrade = format!(
         "{}/v1/responses",
         fixture.gateway.url.replace("http://", "ws://")
@@ -458,6 +546,7 @@ async fn muse_codex_websocket_uses_http_responses_and_preserves_native_items() {
     let (mut socket, _) = tokio_tungstenite::connect_async(upgrade).await.unwrap();
     for follow in [false, true] {
         let mut body = request("responses", true, follow);
+        body["model"] = json!(format!("{provider}/{MUSE}"));
         body["type"] = json!("response.create");
         socket
             .send(Message::Text(body.to_string().into()))
@@ -496,7 +585,9 @@ async fn muse_codex_websocket_uses_http_responses_and_preserves_native_items() {
             .unwrap()
             .clone();
         assert_eq!(sent.path, "/v1/responses");
-        assert_eq!(sent.headers["x-opencode-session"], "stable-muse-session");
+        if provider == "opencode_go" {
+            assert_eq!(sent.headers["x-opencode-session"], "stable-muse-session");
+        }
         assert_eq!(sent.body["prompt_cache_key"], "muse-cache");
         assert_eq!(sent.body["reasoning"]["effort"], "high");
         if follow {
@@ -505,4 +596,53 @@ async fn muse_codex_websocket_uses_http_responses_and_preserves_native_items() {
         }
     }
     socket.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn meta_completed_responses_finish_when_upstream_keeps_the_body_open() {
+    let fixture = Fixture::new("meta").await;
+    *fixture.upstream.mode.lock().unwrap() = "held-open".into();
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            let result = tokio::time::timeout(std::time::Duration::from_millis(700), async {
+                let response = fixture.post(kind, request(kind, stream, false)).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                response.text().await.unwrap()
+            })
+            .await
+            .expect("completed Meta response must not wait for EOF");
+            assert!(result.contains(TEXT));
+        }
+    }
+}
+
+#[tokio::test]
+async fn meta_late_subscription_usage_survives_prompt_client_completion() {
+    for stream in [false, true] {
+        let fixture = Fixture::new("meta").await;
+        *fixture.upstream.mode.lock().unwrap() = "late-usage".into();
+        fixture
+            .post("responses", request("responses", stream, false))
+            .await
+            .text()
+            .await
+            .unwrap();
+        let id = fixture.state.accounts.list().await.remove(0).id;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if fixture
+                    .state
+                    .quotas
+                    .get(&id)
+                    .await
+                    .is_some_and(|q| q.windows[0].remaining_percent == Some(45.0))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("private quota telemetry must survive the completed client response");
+    }
 }

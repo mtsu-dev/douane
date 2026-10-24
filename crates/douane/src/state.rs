@@ -198,14 +198,16 @@ impl AppState {
 
     /// Whether `account` can be sent `model`: it did not refuse it lately,
     /// and its own last live listing, when it has one, names it.
-    fn serves(&self, account: &str, model: &str) -> bool {
+    fn serves(&self, account: &str, model: &str, provider: SubscriptionProvider) -> bool {
         !self.refuses(account, model)
             && self
                 .listed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(account)
-                .is_none_or(|ids| ids.contains(model))
+                .map_or(provider != SubscriptionProvider::Meta, |ids| {
+                    ids.contains(model)
+                })
     }
 
     /// A catalog can list models an account's plan cannot use (Copilot), or
@@ -230,7 +232,7 @@ impl AppState {
             .eligible_in(provider, None, Some(model))
             .await
             .iter()
-            .any(|other| self.serves(&other.id, model));
+            .any(|other| self.serves(&other.id, model, other.provider));
         if !served {
             self.models
                 .write()
@@ -313,7 +315,8 @@ impl AppState {
             };
             if matches!(
                 account.provider,
-                SubscriptionProvider::OpencodeGo
+                SubscriptionProvider::Meta
+                    | SubscriptionProvider::OpencodeGo
                     | SubscriptionProvider::OpenaiCompatible
                     | SubscriptionProvider::Qwen
             ) {
@@ -321,6 +324,7 @@ impl AppState {
                     .base_url
                     .as_deref()
                     .unwrap_or(match account.provider {
+                        SubscriptionProvider::Meta => crate::subscriptions::meta::API,
                         SubscriptionProvider::OpencodeGo => "https://opencode.ai/zen/go/v1",
                         SubscriptionProvider::Qwen => "https://portal.qwen.ai/v1",
                         _ => "",
@@ -332,10 +336,23 @@ impl AppState {
                     } else {
                         format!("{root}/v1/models")
                     };
+                    let credential = if account.provider == SubscriptionProvider::Meta {
+                        self.oauth.credential(&account.id).await.ok()
+                    } else {
+                        Some(account.clone())
+                    };
                     let listing = self
                         .client
                         .get(url)
-                        .bearer_auth(&account.access_token)
+                        .headers(
+                            credential
+                                .as_ref()
+                                .map(|a| {
+                                    crate::relay::upstream_headers(a, &axum::http::HeaderMap::new())
+                                })
+                                .unwrap_or_default(),
+                        )
+                        .header("Accept", "application/json")
                         .timeout(std::time::Duration::from_secs(15))
                         .send()
                         .await
@@ -346,6 +363,16 @@ impl AppState {
                         None => None,
                     };
                     if let Some(data) = data.as_ref().and_then(|v| v["data"].as_array()) {
+                        if account.provider == SubscriptionProvider::Meta {
+                            let ids = data
+                                .iter()
+                                .filter_map(|m| m["id"].as_str().map(str::to_owned))
+                                .collect();
+                            self.listed
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(account.id.clone(), ids);
+                        }
                         available = data
                             .iter()
                             .filter_map(|m| {
@@ -638,7 +665,7 @@ impl AppState {
                 if client.is_some_and(|c| !c.access.allows(&a)) {
                     continue;
                 }
-                if !self.serves(&a.id, model) {
+                if !self.serves(&a.id, model, a.provider) {
                     continue;
                 }
                 let quota = self.quotas.get(&a.id).await;

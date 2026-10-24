@@ -191,6 +191,7 @@ pub(crate) fn upstream(
             Dialect::Chat,
             "/v1/chat/completions",
         ),
+        Meta => ("https://api.meta.ai", Dialect::Responses, "/v1/responses"),
         Copilot => {
             let wire = copilot_wire(client, endpoints);
             (COPILOT_API, wire, copilot_path(wire))
@@ -338,6 +339,21 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
                     out.insert("x-opencode-session", value.clone());
                 }
             }
+        }
+        SubscriptionProvider::Meta => {
+            out.insert(
+                header::USER_AGENT,
+                header::HeaderValue::from_static(crate::subscriptions::meta::USER_AGENT),
+            );
+            out.insert("x-client-id", header::HeaderValue::from_static("tbh:tui"));
+            out.insert(
+                header::ACCEPT,
+                header::HeaderValue::from_static("text/event-stream"),
+            );
+            out.insert(
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache"),
+            );
         }
         SubscriptionProvider::Copilot => {
             out.insert(
@@ -543,6 +559,9 @@ pub async fn forward(
         } else {
             None
         };
+        if account.provider == SubscriptionProvider::Meta {
+            crate::subscriptions::meta::prepare_request(&mut translated);
+        }
         let codex_sse =
             account.provider == SubscriptionProvider::Codex && !uri.path().ends_with("/compact");
         // Same dialect: the agent talks to its own provider and reads its
@@ -753,7 +772,10 @@ pub async fn forward(
                     .accounts
                     .cooldown(&account.id, wait, "upstream temporarily unavailable")
                     .await;
-                if let (true, Some(response)) = (native, response) {
+                if let (true, Some(response)) = (
+                    native && account.provider != SubscriptionProvider::Meta,
+                    response,
+                ) {
                     last_native = native_refusal(last_status, passed, response, idle).await;
                 }
                 continue;
@@ -770,6 +792,9 @@ pub async fn forward(
             }
             // A native refusal of the request itself (too long, invalid) is the
             // agent's to read and act on, compaction included; the account is fine.
+            if account.provider == SubscriptionProvider::Meta {
+                return error(last_status, summary);
+            }
             if let (true, Some(response)) = (native, response) {
                 if let Some(refusal) = native_refusal(last_status, passed, response, idle).await {
                     return refusal;
@@ -804,13 +829,22 @@ pub async fn forward(
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
         if stream && is_sse {
-            let mut streamed =
-                stream_response(response, from, to, model, call, idle, custom, replay);
+            let mut streamed = stream_response(
+                response,
+                from,
+                to,
+                model,
+                call,
+                idle,
+                custom,
+                replay,
+                state.clone(),
+            );
             streamed.headers_mut().extend(passed);
             return streamed;
         }
         let result = if is_sse {
-            collect_response(response, to, &mut call, idle, &mut replay).await
+            collect_response(response, to, &mut call, idle, &mut replay, &state).await
         } else {
             match read_bounded(response, 32 * 1024 * 1024, idle).await {
                 Ok(b) => serde_json::from_slice::<Value>(&b)
@@ -1096,25 +1130,93 @@ pub(crate) async fn read_bounded(
     Ok(bytes)
 }
 
+/// Subscription telemetry can follow a completed Muse answer. Finish the client
+/// promptly, then read only the existing response for its private quota event.
+fn meta_tail<S>(mut upstream: S, mut frames: Frames, state: Arc<AppState>, account: String)
+where
+    S: futures_util::Stream<Item = reqwest::Result<Bytes>> + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(5), async move {
+            loop {
+                let chunk = upstream.next().await;
+                let eof = chunk.is_none();
+                let events = match chunk {
+                    Some(Ok(chunk)) => frames.feed(&chunk),
+                    Some(Err(_)) => return,
+                    None => frames.finish(),
+                };
+                let Ok(events) = events else {
+                    return;
+                };
+                for event in events {
+                    if crate::subscriptions::meta::subscription_event(&event) {
+                        state.quotas.observe_meta_event(&account, &event).await;
+                        state.observe_usage(&account).await;
+                        return;
+                    }
+                }
+                if eof {
+                    return;
+                }
+                // A finished decoder has no further data; the timeout bounds
+                // a provider keeping its transport open without telemetry.
+            }
+        })
+        .await;
+    });
+}
+
 async fn collect_response(
     response: reqwest::Response,
     to: Dialect,
     call: &mut CallGuard,
     idle: Duration,
     replay: &mut Option<NativeReplay>,
+    quota_state: &Arc<AppState>,
 ) -> Result<Value, String> {
     let mut decoder = Frames::default();
     let mut upstream = response.bytes_stream();
     let mut collected = Collected::default();
+    let mut meta_complete = false;
     while let Some(chunk) = next_chunk(&mut upstream, idle, "upstream stream interrupted").await {
         for mut frame in decoder.feed(&chunk?)? {
+            if call.call.provider == "meta" {
+                quota_state
+                    .quotas
+                    .observe_meta_event(&call.call.account_id, &frame)
+                    .await;
+                quota_state.observe_usage(&call.call.account_id).await;
+            }
             if let Some(replay) = replay {
                 replay.observe(&mut frame);
             }
             collected.frame(&frame, to, call)?;
         }
+        if call.call.provider == "meta" && collected.result.is_some() {
+            meta_complete = true;
+            break;
+        }
     }
-    for mut frame in decoder.finish()? {
+    let tail = if meta_complete {
+        meta_tail(
+            upstream,
+            decoder,
+            quota_state.clone(),
+            call.call.account_id.clone(),
+        );
+        Vec::new()
+    } else {
+        decoder.finish()?
+    };
+    for mut frame in tail {
+        if call.call.provider == "meta" {
+            quota_state
+                .quotas
+                .observe_meta_event(&call.call.account_id, &frame)
+                .await;
+            quota_state.observe_usage(&call.call.account_id).await;
+        }
         if let Some(replay) = replay {
             replay.observe(&mut frame);
         }
@@ -1211,34 +1313,66 @@ fn stream_response(
     idle: Duration,
     custom: std::collections::BTreeSet<String>,
     replay: Option<NativeReplay>,
+    quota_state: Arc<AppState>,
 ) -> Response {
+    let meta = call.call.provider == "meta";
     let bridge = if from == to {
         None
     } else {
         Some(Bridge::new(to, from, &model).with_custom_tools(custom))
     };
     let state = (
-        Box::pin(response.bytes_stream()),
+        Some(Box::pin(response.bytes_stream())),
         Frames::default(),
         bridge,
         call,
         false,
         replay,
+        quota_state,
     );
     let stream = futures_util::stream::unfold(
         state,
-        move |(mut upstream, mut frames, mut bridge, mut call, mut done, mut replay)| async move {
+        move |(
+            mut upstream,
+            mut frames,
+            mut bridge,
+            mut call,
+            mut done,
+            mut replay,
+            quota_state,
+        )| async move {
             if done {
                 return None;
             }
             loop {
-                let next = next_chunk(&mut upstream, idle, "upstream stream interrupted").await;
+                let next = next_chunk(
+                    upstream.as_mut().expect("active upstream"),
+                    idle,
+                    "upstream stream interrupted",
+                )
+                .await;
                 let output: Result<Option<Bytes>, String> = match next {
                     Some(Ok(chunk)) => match frames.feed(&chunk) {
                         Ok(events) => {
                             let mut translated = String::new();
                             let mut failure = None;
                             for mut event in events {
+                                if meta && crate::subscriptions::meta::subscription_event(&event) {
+                                    quota_state
+                                        .quotas
+                                        .observe_meta_event(&call.call.account_id, &event)
+                                        .await;
+                                    quota_state.observe_usage(&call.call.account_id).await;
+                                    continue;
+                                }
+                                if meta {
+                                    crate::subscriptions::meta::sanitize_error_event(&mut event);
+                                }
+                                if meta && bridge.is_none() {
+                                    let kind = event["type"].as_str().unwrap_or("message");
+                                    translated
+                                        .push_str(&format!("event: {kind}\ndata: {event}\n\n"));
+                                }
                                 if let Some(replay) = &mut replay {
                                     replay.observe(&mut event);
                                 }
@@ -1253,9 +1387,20 @@ fn stream_response(
                                     }
                                 }
                             }
+                            if meta && call.complete && failure.is_none() {
+                                done = true;
+                                if let Some(body) = upstream.take() {
+                                    meta_tail(
+                                        body,
+                                        std::mem::take(&mut frames),
+                                        quota_state.clone(),
+                                        call.call.account_id.clone(),
+                                    );
+                                }
+                            }
                             if let Some(e) = failure {
                                 Err(e)
-                            } else if bridge.is_some() {
+                            } else if bridge.is_some() || meta {
                                 Ok((!translated.is_empty()).then(|| Bytes::from(translated)))
                             } else {
                                 Ok(Some(chunk))
@@ -1267,9 +1412,29 @@ fn stream_response(
                     None => {
                         done = true;
                         if let Some(b) = bridge.as_mut() {
+                            let ending = frames.finish();
+                            if meta && let Ok(events) = &ending {
+                                for event in events {
+                                    quota_state
+                                        .quotas
+                                        .observe_meta_event(&call.call.account_id, event)
+                                        .await;
+                                    quota_state.observe_usage(&call.call.account_id).await;
+                                }
+                            }
                             let tail = (|| -> Result<String, String> {
                                 let mut output = String::new();
-                                for mut event in frames.finish()? {
+                                for mut event in ending? {
+                                    if meta
+                                        && crate::subscriptions::meta::subscription_event(&event)
+                                    {
+                                        continue;
+                                    }
+                                    if meta {
+                                        crate::subscriptions::meta::sanitize_error_event(
+                                            &mut event,
+                                        );
+                                    }
                                     if let Some(replay) = &mut replay {
                                         replay.observe(&mut event);
                                     }
@@ -1294,11 +1459,35 @@ fn stream_response(
                         } else {
                             match frames.finish() {
                                 Ok(events) => {
-                                    for event in events {
+                                    let mut tail = String::new();
+                                    for mut event in events {
+                                        if meta
+                                            && crate::subscriptions::meta::subscription_event(
+                                                &event,
+                                            )
+                                        {
+                                            quota_state
+                                                .quotas
+                                                .observe_meta_event(&call.call.account_id, &event)
+                                                .await;
+                                            quota_state.observe_usage(&call.call.account_id).await;
+                                            continue;
+                                        }
+                                        if meta {
+                                            crate::subscriptions::meta::sanitize_error_event(
+                                                &mut event,
+                                            );
+                                        }
+                                        if meta {
+                                            let kind = event["type"].as_str().unwrap_or("message");
+                                            tail.push_str(&format!(
+                                                "event: {kind}\ndata: {event}\n\n"
+                                            ));
+                                        }
                                         call.observe(&event);
                                     }
                                     if call.complete {
-                                        Ok(None)
+                                        Ok((!tail.is_empty()).then(|| Bytes::from(tail)))
                                     } else {
                                         Err("upstream stream closed before completion".into())
                                     }
@@ -1312,7 +1501,7 @@ fn stream_response(
                     Ok(Some(bytes)) => {
                         return Some((
                             Ok::<Bytes, std::io::Error>(bytes),
-                            (upstream, frames, bridge, call, done, replay),
+                            (upstream, frames, bridge, call, done, replay, quota_state),
                         ));
                     }
                     Ok(None) if done => return None,
@@ -1324,7 +1513,7 @@ fn stream_response(
                             json!({"type":"error","error":{"type":"upstream_error","message":e}});
                         return Some((
                             Ok(Bytes::from(format!("event: error\ndata: {body}\n\n"))),
-                            (upstream, frames, bridge, call, done, replay),
+                            (upstream, frames, bridge, call, done, replay, quota_state),
                         ));
                     }
                 }

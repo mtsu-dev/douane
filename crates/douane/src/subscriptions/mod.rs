@@ -4,6 +4,7 @@
 //! explicit allowlist. Provider failures never copy response bodies into errors.
 
 mod google;
+pub(crate) mod meta;
 mod oauth;
 mod quota;
 mod reset;

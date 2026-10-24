@@ -13,6 +13,7 @@ Static SVG brand marks bundled with the dashboard. No package or runtime CDN is 
 | Gemini | `gemini.svg` | [LobeHub 1.95.1, Gemini color](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/gemini-color.svg) | MIT library asset; original multicolor star. |
 | Kimi | `kimi.svg` | [LobeHub 1.95.1, Kimi color](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/kimi-color.svg) | MIT library asset; original white K and blue dot, transparent background. |
 | GitHub Copilot | `copilot.svg` | [LobeHub 1.95.1, GithubCopilot](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/githubcopilot.svg) | MIT library asset; white monochrome variant. |
+| Muse Code / Meta | `meta.svg` | [LobeHub 1.95.1, Meta color](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/meta-color.svg) | MIT library asset; original blue Meta symbol. |
 | Qwen | `qwen.svg` | [LobeHub 1.95.1, Qwen color](https://unpkg.com/@lobehub/icons-static-svg@1.95.1/icons/qwen-color.svg) | MIT library asset; original violet gradient. |
 
 LobeHub's package metadata declares MIT and points to [the library license](https://github.com/lobehub/lobe-icons/blob/master/LICENSE). Logo trademarks remain with their respective owners. Google's press asset is recorded separately rather than represented as an open-source grant.

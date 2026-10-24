@@ -22,6 +22,7 @@ pub enum SubscriptionProvider {
     Xai,
     OpencodeGo,
     Copilot,
+    Meta,
     OpenaiCompatible,
 }
 
@@ -37,6 +38,7 @@ impl SubscriptionProvider {
             Self::Xai => "xai",
             Self::OpencodeGo => "opencode_go",
             Self::Copilot => "copilot",
+            Self::Meta => "meta",
             Self::OpenaiCompatible => "openai_compatible",
         }
     }
@@ -57,6 +59,7 @@ impl SubscriptionProvider {
             "kimi" | "kimi.ai" | "kimi-ai" => Some(Self::Kimi),
             "xai" | "grok" => Some(Self::Xai),
             "opencode_go" | "opencode-go" | "opencode" => Some(Self::OpencodeGo),
+            "meta" | "muse" | "muse-code" => Some(Self::Meta),
             "copilot" | "github-copilot" | "github_copilot" => Some(Self::Copilot),
             "openai" | "openai_compatible" | "openai-compatible" => Some(Self::OpenaiCompatible),
             _ => None,
@@ -183,6 +186,11 @@ pub struct AccountCredential {
     pub(crate) provider: SubscriptionProvider,
     pub(crate) access_token: String,
     pub(crate) refresh_token: Option<String>,
+    /// Meta device credential, distinct from its minted inference key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dca_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dca_expires_at: Option<String>,
     pub(crate) id_token: Option<String>,
     pub(crate) account_id: Option<String>,
     #[serde(default)]
@@ -379,6 +387,9 @@ impl AccountCredential {
     }
 
     pub(crate) fn needs_refresh(&self) -> bool {
+        if self.provider == SubscriptionProvider::Meta {
+            return self.access_token.starts_with("dca:") && self.dca_token.is_some();
+        }
         self.expires_at
             .as_deref()
             .and_then(parse_timestamp)
@@ -739,8 +750,10 @@ impl AccountStore {
         account.name = previous.name.clone();
         account.reserve_percent = previous.reserve_percent;
         account.reserve_windows = previous.reserve_windows.clone();
-        account.plan = previous.plan.clone().or(account.plan);
-        account.subscription = previous.subscription.clone().or(account.subscription);
+        if account.provider != SubscriptionProvider::Meta {
+            account.plan = previous.plan.clone().or(account.plan);
+            account.subscription = previous.subscription.clone().or(account.subscription);
+        }
         account.organization_id = previous.organization_id.clone().or(account.organization_id);
         account.updated_at = now();
         self.persist(&account)?;
@@ -874,6 +887,14 @@ fn same_identity(existing: &AccountCredential, account: &AccountCredential) -> b
 /// The checks `parse_import` applies, for a stored record coming back from
 /// an export.
 fn check_record(account: &AccountCredential) -> Result<(), SubscriptionError> {
+    if account.provider == SubscriptionProvider::Meta
+        && account
+            .base_url
+            .as_deref()
+            .is_some_and(|url| !super::meta::valid_api_base(url))
+    {
+        return Err(SubscriptionError::InvalidImport("untrusted Meta base URL"));
+    }
     let token = account.access_token.trim();
     if token.is_empty() || token.len() > 65_536 || token.chars().any(char::is_control) {
         return Err(SubscriptionError::InvalidImport("missing access token"));
@@ -1090,8 +1111,25 @@ fn parse_import(
                 .unwrap_or(&value),
         )
     };
-    let access_token = text(token, &["access_token", "accessToken", "api_key", "key"])
-        .ok_or(SubscriptionError::InvalidImport("missing access token"))?;
+    if provider == SubscriptionProvider::Meta
+        && [&value, token].iter().any(|record| {
+            record.get("is_subs_active").is_some_and(|v| v == false)
+                || record["require_payment"] == true
+        })
+    {
+        return Err(SubscriptionError::InvalidImport(
+            "Muse Code requires an active subscription",
+        ));
+    }
+    let access_token = text(
+        token,
+        if provider == SubscriptionProvider::Meta {
+            &["api_key", "access_token", "dca_token"]
+        } else {
+            &["access_token", "accessToken", "api_key", "key"]
+        },
+    )
+    .ok_or(SubscriptionError::InvalidImport("missing access token"))?;
     let expires_at = text(token, &["expired", "expiry", "expires_at", "expiration"])
         .or_else(|| {
             token
@@ -1130,6 +1168,13 @@ fn parse_import(
     if base_url.as_deref().is_some_and(|url| !valid_base_url(url)) {
         return Err(SubscriptionError::InvalidImport("invalid base URL"));
     }
+    if provider == SubscriptionProvider::Meta
+        && base_url
+            .as_deref()
+            .is_some_and(|url| !super::meta::valid_api_base(url))
+    {
+        return Err(SubscriptionError::InvalidImport("untrusted Meta base URL"));
+    }
     let route = text(&value, &["route", "prefix"]).map(|r| r.trim().to_ascii_lowercase());
     let dialect = text(&value, &["dialect", "format"]).map(|d| d.trim().to_ascii_lowercase());
     if route.is_some() || dialect.is_some() {
@@ -1159,6 +1204,18 @@ fn parse_import(
         provider,
         access_token,
         refresh_token: text(token, &["refresh_token", "refreshToken"]),
+        dca_token: if provider == SubscriptionProvider::Meta {
+            text(token, &["dca_token"])
+                .or_else(|| text(token, &["access_token"]).filter(|t| t.starts_with("dca:")))
+        } else {
+            None
+        },
+        dca_expires_at: text(token, &["dca_expired", "dca_expires_at"]).or_else(|| {
+            token["dca_expires_at"]
+                .as_i64()
+                .and_then(|n| time::OffsetDateTime::from_unix_timestamp(n).ok())
+                .map(timestamp)
+        }),
         id_token: text(token, &["id_token", "idToken"]),
         account_id: text(token, &["account_id", "account_uuid", "sub", "user_id"])
             .or_else(|| text(&value, &["account_id", "account_uuid", "sub", "user_id"])),
@@ -1185,11 +1242,18 @@ fn parse_import(
             })
             .unwrap_or_default(),
         project_id: text(&value, &["project_id", "projectId"]),
-        email: text(&value, &["email"]).or_else(|| text(token, &["email"])),
-        plan: text(&value, &["plan_type", "subscription_type", "plan"])
-            .or_else(|| text(token, &["subscriptionType", "plan_type"])),
+        email: text(&value, &["email", "user_email"]).or_else(|| text(token, &["email"])),
+        plan: text(
+            &value,
+            &["plan_type", "subscription_type", "plan", "subs_tier_name"],
+        )
+        .or_else(|| text(token, &["subscriptionType", "plan_type"])),
         subscription,
-        expires_at,
+        expires_at: if provider == SubscriptionProvider::Meta {
+            None
+        } else {
+            expires_at
+        },
         enabled: !value
             .get("disabled")
             .and_then(Value::as_bool)
@@ -1229,6 +1293,14 @@ pub(crate) fn subscription_from_value(
     value: &Value,
     source: &'static str,
 ) -> Option<SubscriptionTier> {
+    if provider == SubscriptionProvider::Meta {
+        return Some(SubscriptionTier {
+            id: text(value, &["subs_tier_id"])?,
+            label: text(value, &["subs_tier_name"])?,
+            multiplier: None,
+            source: source.into(),
+        });
+    }
     let organization = value.get("organization").unwrap_or(value);
     let plan = text(
         value,

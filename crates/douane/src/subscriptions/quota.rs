@@ -244,6 +244,7 @@ pub struct QuotaService {
     store: Arc<AccountStore>,
     oauth: Arc<OAuthManager>,
     cache: RwLock<BTreeMap<String, QuotaSnapshot>>,
+    save_lock: tokio::sync::Mutex<()>,
     verification_urls: RwLock<BTreeMap<String, String>>,
     failures: RwLock<BTreeMap<String, Failures>>,
     /// GitHub's Copilot entitlement endpoint; tests point it at a loopback.
@@ -267,6 +268,7 @@ impl QuotaService {
             store,
             oauth,
             cache: RwLock::new(cache),
+            save_lock: tokio::sync::Mutex::new(()),
             verification_urls: RwLock::new(BTreeMap::new()),
             failures: RwLock::new(BTreeMap::new()),
             copilot_user_url: "https://api.github.com/copilot_internal/user".into(),
@@ -276,6 +278,7 @@ impl QuotaService {
     /// Writes the snapshots next to the accounts, so the last numbers outlive
     /// a restart: a provider refusing quota reads still has something to show.
     pub async fn save(&self) {
+        let _guard = self.save_lock.lock().await;
         let path = self.store.quota_snapshot_path();
         let Ok(bytes) = serde_json::to_vec(&*self.cache.read().await) else {
             return;
@@ -399,6 +402,84 @@ impl QuotaService {
         self.failures.write().await.remove(&account.id);
     }
 
+    /// Muse reports subscription use in inference SSE, with no verified
+    /// standalone read endpoint. Never send a synthetic inference to poll it.
+    pub(crate) async fn observe_meta_event(&self, id: &str, event: &Value) {
+        if !super::meta::subscription_event(event) {
+            return;
+        }
+        let Some(account) = self
+            .store
+            .get(id)
+            .await
+            .filter(|a| a.provider == SubscriptionProvider::Meta)
+        else {
+            return;
+        };
+        let mut windows = Vec::new();
+        for (key, default_id, label) in [
+            ("weekly", "weekly", "Weekly"),
+            ("window", "session", "Session"),
+        ] {
+            let source = &event["subscription"][key];
+            let Some(used) = source["used_percent"]
+                .as_f64()
+                .filter(|p| p.is_finite() && (0.0..=100.0).contains(p))
+            else {
+                continue;
+            };
+            let reset = source["resets_at"]
+                .as_i64()
+                .and_then(|n| time::OffsetDateTime::from_unix_timestamp(n).ok())
+                .map(timestamp);
+            let id = if key == "window" {
+                source["window_duration_mins"]
+                    .as_u64()
+                    .filter(|n| *n > 0 && *n < 525600)
+                    .map(|n| match n {
+                        300 => "five-hour".into(),
+                        1440 => "daily".into(),
+                        10080 => "weekly".into(),
+                        38880..=46080 => "monthly".into(),
+                        n => format!("window-{}s", n * 60),
+                    })
+                    .unwrap_or_else(|| default_id.into())
+            } else {
+                default_id.into()
+            };
+            windows.push(QuotaWindow {
+                id,
+                label: label.into(),
+                remaining_percent: Some(100.0 - used),
+                reset_at: reset,
+                used: None,
+                limit: None,
+            });
+        }
+        if windows.is_empty() {
+            return;
+        }
+        let snapshot = QuotaSnapshot {
+            account_id: id.into(),
+            provider: account.provider,
+            windows,
+            updated_at: now(),
+            error: None,
+            subscription: account.subscription.clone(),
+            credits: vec![],
+            verification_required: false,
+            verification_available: false,
+        };
+        if self
+            .apply_observation(id, &snapshot, None, &account.updated_at)
+            .await
+            .is_ok()
+        {
+            self.cache.write().await.insert(id.into(), snapshot);
+            self.save().await;
+        }
+    }
+
     /// Accounts the poller should read now: a failing one once its retry
     /// delay has passed, a healthy one once its snapshot is `interval` old.
     /// Retry state of deleted accounts goes.
@@ -408,7 +489,9 @@ impl QuotaService {
             .list()
             .await
             .into_iter()
-            .filter(|account| account.provider.reports_quota())
+            .filter(|account| {
+                account.provider.reports_quota() && account.provider != SubscriptionProvider::Meta
+            })
             .map(|account| account.id)
             .collect();
         let mut failures = self.failures.write().await;
@@ -435,6 +518,19 @@ impl QuotaService {
             .get(id)
             .await
             .ok_or(SubscriptionError::NotFound)?;
+        if account.provider == SubscriptionProvider::Meta {
+            return Ok(self.get(id).await.unwrap_or(QuotaSnapshot {
+                account_id: id.into(),
+                provider: account.provider,
+                windows: vec![],
+                updated_at: now(),
+                error: None,
+                subscription: account.subscription,
+                credits: vec![],
+                verification_required: false,
+                verification_available: false,
+            }));
+        }
         // Nothing to read: no request, and no error snapshot to show.
         if !account.provider.reports_quota() {
             return Err(SubscriptionError::Unsupported);
@@ -666,7 +762,9 @@ impl QuotaService {
                 let windows = parse_copilot(&value, observed);
                 (value, windows)
             }
-            SubscriptionProvider::OpenaiCompatible | SubscriptionProvider::Qwen => {
+            SubscriptionProvider::OpenaiCompatible
+            | SubscriptionProvider::Qwen
+            | SubscriptionProvider::Meta => {
                 return Err(SubscriptionError::Unsupported);
             }
         };
@@ -1514,6 +1612,29 @@ fn parse_kimi(value: &Value, observed: time::OffsetDateTime) -> Vec<QuotaWindow>
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn meta_session_uses_the_known_reserve_window_and_unknown_duration_stays_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let account = store
+            .import(json!({"type":"meta","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store);
+        service.observe_meta_event(&account.id,&json!({"type":"response.subscription_usage","subscription":{"weekly":{"used_percent":30,"resets_at":1792368000},"window":{"used_percent":80,"resets_at":1792272519,"window_duration_mins":300}}})).await;
+        let snapshot = service.get(&account.id).await.unwrap();
+        let session = snapshot
+            .windows
+            .iter()
+            .find(|w| w.label == "Session")
+            .unwrap();
+        assert_eq!(reserve_kind(&session.id), Some("five-hour"));
+        assert_eq!(session.remaining_percent, Some(20.0));
+        service.observe_meta_event(&account.id,&json!({"type":"response.subscription_usage","subscription":{"window":{"used_percent":10}}})).await;
+        let snapshot = service.get(&account.id).await.unwrap();
+        assert_eq!(reserve_kind(&snapshot.windows[0].id), None);
+    }
 
     #[test]
     fn copilot_premium_requests_get_a_bar_and_unlimited_ones_none() {
