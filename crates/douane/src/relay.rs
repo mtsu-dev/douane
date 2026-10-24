@@ -164,7 +164,9 @@ pub(crate) fn upstream(
             "/v1/chat/completions",
         ),
         OpencodeGo => {
-            let wire = if client == Dialect::Responses && model.starts_with("muse-") {
+            // Muse only serves Responses. Translate at the provider boundary
+            // even when the caller uses Messages or Chat Completions.
+            let wire = if model.starts_with("muse-") {
                 Dialect::Responses
             } else {
                 Dialect::Chat
