@@ -64,7 +64,7 @@ const traffic = [
 	['gpt-6-luna', 'codex', 'acc-codex', 7210], ['claude-opus-5-5', 'claude', 'acc-claude-home', 6399], ['google/gemma-4-31b-it:free', 'openrouter', 'acc-openrouter', 2480]
 ];
 // Client keys: kept in memory, so edits show until the server stops.
-const client = (id, name, hint, access, shares) => ({ id, name, key_hint: `dk_\u2026${hint}`, created_at: ago(60 * 24 * 6), access: { pools: [], accounts: [], ...access }, shares });
+const client = (id, name, hint, access, shares, account_shares = {}) => ({ id, name, key_hint: `dk_\u2026${hint}`, created_at: ago(60 * 24 * 6), access: { pools: [], accounts: [], ...access }, shares, account_shares });
 const clients = [
 	client('cl-desktop', 'Desktop', '9f3a', { all: true }, {}),
 	client('cl-family', 'Family', '41c7', { all: false, pools: ['claude'] }, { claude: 25 }),
@@ -112,28 +112,23 @@ const usage = [
 	used('acc-go', 'monthly', 24 * 15, 39, { 'cl-desktop': 30 }, 6)
 ];
 const fakeKey = () => `dk_${Array.from({ length: 48 }, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('')}`;
-// The server's own check: shares of one pool add up to 100 at most.
-function overbooked(list) {
-	const totals = {};
-	for (const c of list) for (const [pool, share] of Object.entries(c.shares)) totals[pool] = (totals[pool] ?? 0) + share;
-	const over = Object.entries(totals).find(([, total]) => total > 100);
-	return over ? `shares of ${over[0]} add up to ${Math.round(over[1])}%, more than 100%` : null;
+// Individual shares stay within 100%; their sum may exceed it.
+function invalidShare(candidate) {
+	return [candidate.shares, candidate.account_shares].some(shares => Object.values(shares).some(value => typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 100));
 }
 function changeClient(method, id, body) {
 	if (method === 'POST') {
 		const key = fakeKey();
-		const created = client(`cl-${Date.now()}`, body.name ?? 'Client', key.slice(-4), body.access ?? { all: true }, body.shares ?? {});
-		const error = overbooked([...clients, created]);
-		if (error) return [400, { error: { message: error } }];
+		const created = client(`cl-${Date.now()}`, body.name ?? 'Client', key.slice(-4), body.access ?? { all: true }, body.shares ?? {}, body.account_shares ?? {});
+		if (invalidShare(created)) return [400, { error: { message: 'a share must be above 0 and at most 100' } }];
 		clients.push(created);
 		return [201, { client: created, key }];
 	}
 	const index = clients.findIndex((c) => c.id === id);
 	if (index < 0) return [404, { error: { message: 'client not found' } }];
 	if (method === 'DELETE') { clients.splice(index, 1); return [204, null]; }
-	const next = { ...clients[index], ...(body.name ? { name: body.name } : {}), ...(body.access ? { access: body.access } : {}), ...(body.shares ? { shares: body.shares } : {}) };
-	const error = overbooked(clients.map((c, i) => (i === index ? next : c)));
-	if (error) return [400, { error: { message: error } }];
+	const next = { ...clients[index], ...(body.name ? { name: body.name } : {}), ...(body.access ? { access: body.access } : {}), ...(body.shares ? { shares: body.shares } : {}), ...(body.account_shares ? { account_shares: body.account_shares } : {}) };
+	if (invalidShare(next)) return [400, { error: { message: 'a share must be above 0 and at most 100' } }];
 	let key = null;
 	if (body.rotate_key) { key = fakeKey(); next.key_hint = `dk_\u2026${key.slice(-4)}`; }
 	clients[index] = next;

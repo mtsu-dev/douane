@@ -6,6 +6,8 @@
 //! account-wide window (five hours, day, week, month) of every account in a
 //! pool. Unused shares stay reserved for their holders until the last seventh
 //! of the window, when anyone may use them; what no share covers is common.
+//! Account shares override pool shares. When authorized holders promise more
+//! than 100%, unused quota is common and each holder has its own usage cap.
 //! In the hours before an account's weekly reset (`free_before_reset_hours`),
 //! shares hold no one back.
 //!
@@ -49,6 +51,9 @@ pub struct Client {
     /// Percent of each account-wide window, by pool (provider or route).
     #[serde(default)]
     pub shares: BTreeMap<String, f64>,
+    /// Per-account percentages, overriding the pool's share without granting access.
+    #[serde(default)]
+    pub account_shares: BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -97,6 +102,13 @@ impl Access {
 }
 
 impl Client {
+    pub fn share_for(&self, pool: &str, account_id: &str) -> Option<f64> {
+        self.account_shares
+            .get(account_id)
+            .or_else(|| self.shares.get(pool))
+            .copied()
+    }
+
     /// The listing shown to the dashboard: everything but the key hash.
     pub fn public(&self) -> serde_json::Value {
         serde_json::json!({
@@ -106,6 +118,7 @@ impl Client {
             "created_at": self.created_at,
             "access": self.access,
             "shares": self.shares,
+            "account_shares": self.account_shares,
         })
     }
 }
@@ -240,6 +253,7 @@ pub struct ClientPatch {
     pub name: Option<String>,
     pub access: Option<Access>,
     pub shares: Option<BTreeMap<String, f64>>,
+    pub account_shares: Option<BTreeMap<String, f64>>,
     /// Replace the key; the new one is returned once.
     #[serde(default)]
     pub rotate_key: bool,
@@ -282,22 +296,6 @@ fn check_shares(shares: &BTreeMap<String, f64>) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// Shares of one pool may not promise more than the whole window.
-fn check_totals(clients: &[Client]) -> Result<(), String> {
-    let mut totals: BTreeMap<&str, f64> = BTreeMap::new();
-    for client in clients {
-        for (pool, share) in &client.shares {
-            *totals.entry(pool).or_default() += share;
-        }
-    }
-    match totals.into_iter().find(|(_, total)| *total > 100.0 + 1e-6) {
-        Some((pool, total)) => Err(format!(
-            "shares of {pool} add up to {total:.0}%, more than 100%"
-        )),
-        None => Ok(()),
-    }
 }
 
 impl Clients {
@@ -370,7 +368,6 @@ impl Clients {
         let _write = self.write.lock().unwrap_or_else(|e| e.into_inner());
         let mut list = self.list();
         let out = change(&mut list)?;
-        check_totals(&list)?;
         self.save(&list)?;
         *self.list.write().unwrap_or_else(|e| e.into_inner()) = list;
         Ok(out)
@@ -381,6 +378,8 @@ impl Clients {
         let name = check_name(patch.name.as_deref().unwrap_or(""))?;
         let shares = patch.shares.unwrap_or_default();
         check_shares(&shares)?;
+        let account_shares = patch.account_shares.unwrap_or_default();
+        check_shares(&account_shares)?;
         let key = new_key();
         let client = self.change(|list| {
             if list.len() >= MAX_CLIENTS {
@@ -400,6 +399,7 @@ impl Clients {
                 created_at: crate::subscriptions::now(),
                 access: patch.access.unwrap_or_default(),
                 shares,
+                account_shares,
             };
             list.push(client.clone());
             Ok(client)
@@ -411,6 +411,9 @@ impl Clients {
     pub fn update(&self, id: &str, patch: ClientPatch) -> Result<(Client, Option<String>), String> {
         let name = patch.name.as_deref().map(check_name).transpose()?;
         if let Some(shares) = &patch.shares {
+            check_shares(shares)?;
+        }
+        if let Some(shares) = &patch.account_shares {
             check_shares(shares)?;
         }
         let key = patch.rotate_key.then(new_key);
@@ -427,6 +430,9 @@ impl Clients {
             }
             if let Some(shares) = patch.shares {
                 client.shares = shares;
+            }
+            if let Some(shares) = patch.account_shares {
+                client.account_shares = shares;
             }
             if let Some(key) = &key {
                 client.key_hash = key_hash(key);
@@ -462,6 +468,7 @@ impl Clients {
         for client in &mut restored {
             check_name(&client.name)?;
             check_shares(&client.shares)?;
+            check_shares(&client.account_shares)?;
             if client.id.is_empty() || client.key_hash.len() != 64 {
                 return Err("a restored client lacks its id or key hash".into());
             }
@@ -469,6 +476,14 @@ impl Clients {
                 .into_iter()
                 .map(|id| accounts.get(&id).cloned().unwrap_or(id))
                 .collect();
+            let mut account_shares = BTreeMap::new();
+            for (id, share) in std::mem::take(&mut client.account_shares) {
+                let id = accounts.get(&id).cloned().unwrap_or(id);
+                if account_shares.insert(id, share).is_some() {
+                    return Err("conflicting account shares after account id remapping".into());
+                }
+            }
+            client.account_shares = account_shares;
         }
         let count = restored.len();
         let merge = move |list: &mut Vec<Client>| {
@@ -484,7 +499,6 @@ impl Clients {
         if dry_run {
             let mut list = self.list();
             merge(&mut list)?;
-            check_totals(&list)?;
             return Ok(count);
         }
         self.change(merge)
@@ -637,49 +651,70 @@ impl Clients {
             .collect()
     }
 
-    /// Share holders of a pool, by client id.
-    fn holders(&self, pool: &str) -> Vec<(String, f64)> {
+    /// Effective holders that may actually use this account.
+    fn holders(&self, pool: &str, account: &str) -> Vec<(String, f64)> {
         self.read()
             .iter()
-            .filter_map(|c| c.shares.get(pool).map(|s| (c.id.clone(), *s)))
+            .filter(|c| c.access.allows_in(pool, account))
+            .filter_map(|c| c.share_for(pool, account).map(|s| (c.id.clone(), s)))
             .collect()
     }
 
-    /// Percent of the window `me` may not touch: the unused shares of the
-    /// other holders, until the last seventh of the window frees them.
-    fn others_free(
+    /// Attributed usage, remaining budget and whether shares forbid another call.
+    /// Overbooking removes reservations and caps each holder at its own share.
+    /// Physical exhaustion stays the scheduler's responsibility (including credits).
+    fn budget(
         &self,
         holders: &[(String, f64)],
         me: &str,
         account: &str,
         reading: &Reading,
         now: i64,
-    ) -> f64 {
-        let length = window_seconds(reading.kind).unwrap_or(0.0);
-        if (reading.reset - now) as f64 <= length / 7.0 {
-            return 0.0;
-        }
+    ) -> (f64, f64, bool) {
         let usage = self.usage();
         let window = usage.windows.iter().find(|w| {
             w.account_id == account
                 && w.kind == reading.kind
                 && (w.reset - reading.reset).abs() <= RESET_TOLERANCE
         });
-        holders
-            .iter()
-            .filter(|(id, _)| id != me)
-            .map(|(id, share)| {
-                let used = window
-                    .and_then(|w| w.clients.get(id))
-                    .copied()
-                    .unwrap_or(0.0);
-                (share - used).max(0.0)
-            })
-            .sum()
+        let used_by = |id: &str| {
+            window
+                .and_then(|w| w.clients.get(id))
+                .copied()
+                .unwrap_or(0.0)
+        };
+        let mine = used_by(me);
+        let physical = (100.0 - reading.used).max(0.0);
+        if holders.iter().map(|(_, s)| s).sum::<f64>() > 100.0 + 1e-9 {
+            let cap = holders
+                .iter()
+                .find(|(id, _)| id == me)
+                .map(|(_, s)| (s - mine).max(0.0));
+            return (
+                mine,
+                cap.map_or(physical, |c| physical.min(c)),
+                cap.is_some_and(|c| c <= 1e-9),
+            );
+        }
+        let length = window_seconds(reading.kind).unwrap_or(0.0);
+        let free = if (reading.reset - now) as f64 <= length / 7.0 {
+            0.0
+        } else {
+            holders
+                .iter()
+                .filter(|(id, _)| id != me)
+                .map(|(id, share)| (share - used_by(id)).max(0.0))
+                .sum()
+        };
+        (
+            mine,
+            (physical - free).max(0.0),
+            free > 0.0 && physical <= free + 1e-9,
+        )
     }
 
-    /// The reset of the window where `client` has reached what the other
-    /// holders' shares leave it on this account; `None` when it may use it.
+    /// The reset of the window where reservations or an overbooked holder's
+    /// own cap forbid another call; `None` when shares allow it.
     /// Within `free_before` seconds of the account's weekly reset, shares
     /// no longer hold anyone back.
     pub fn share_blocks(
@@ -691,7 +726,7 @@ impl Clients {
         free_before: i64,
     ) -> Option<i64> {
         let snapshot = snapshot?;
-        let holders = self.holders(account.pool());
+        let holders = self.holders(account.pool(), &account.id);
         if holders.is_empty() || snapshot.longest_window_ends_within(free_before, now) {
             return None;
         }
@@ -699,17 +734,14 @@ impl Clients {
         readings(snapshot)
             .into_iter()
             .filter(|r| r.reset > now)
-            .find(|reading| {
-                let free = self.others_free(&holders, me, &account.id, reading, now);
-                free > 0.0 && reading.used >= 100.0 - free - 1e-9
-            })
+            .find(|reading| self.budget(&holders, me, &account.id, reading, now).2)
             .map(|r| r.reset)
     }
 
-    /// The snapshot as `client` sees it: with a share of the pool, each
+    /// The snapshot as `client` sees it: with an effective share, each
     /// account-wide window shows the part of what it may use that it has
     /// used, so a bar at 100% means it is held back. A client without a share
-    /// of the pool sees the account's whole quota, other shares included.
+    /// sees the account's whole quota, other shares included.
     /// Windows of an account whose shares are freed before its weekly reset
     /// stay as they are.
     pub fn client_view(
@@ -720,12 +752,12 @@ impl Clients {
         now: i64,
         free_before: i64,
     ) -> QuotaSnapshot {
-        if !client.shares.contains_key(pool)
+        if client.share_for(pool, &snapshot.account_id).is_none()
             || snapshot.longest_window_ends_within(free_before, now)
         {
             return snapshot;
         }
-        let holders = self.holders(pool);
+        let holders = self.holders(pool, &snapshot.account_id);
         let account = snapshot.account_id.clone();
         let readings = readings(&snapshot);
         for window in &mut snapshot.windows {
@@ -738,22 +770,8 @@ impl Clients {
             if reading.reset <= now {
                 continue;
             }
-            let free = self.others_free(&holders, &client.id, &account, reading, now);
-            let mine = {
-                let usage = self.usage();
-                usage
-                    .windows
-                    .iter()
-                    .find(|w| {
-                        w.account_id == account
-                            && w.kind == reading.kind
-                            && (w.reset - reading.reset).abs() <= RESET_TOLERANCE
-                    })
-                    .and_then(|w| w.clients.get(&client.id))
-                    .copied()
-                    .unwrap_or(0.0)
-            };
-            let budget = mine + (100.0 - free - reading.used).max(0.0);
+            let (mine, remaining, _) = self.budget(&holders, &client.id, &account, reading, now);
+            let budget = mine + remaining;
             let used = if budget <= 1e-9 {
                 100.0
             } else {
@@ -828,6 +846,353 @@ mod tests {
     }
 
     #[test]
+    fn shares_totaling_100_despite_float_rounding_keep_their_reservations() {
+        let (_dir, clients) = clients();
+        for percent in [0.2, 83.9, 15.9] {
+            clients
+                .create(ClientPatch {
+                    shares: Some([("claude".into(), percent)].into()),
+                    ..named(&format!("holder {percent}"))
+                })
+                .unwrap();
+        }
+        let (unshared, _) = clients.create(named("unshared")).unwrap();
+        let reset = NOW + 3 * 86_400;
+        let full = snapshot("a", 99.0, reset);
+        clients.observe(&full, NOW);
+        assert_eq!(
+            clients.share_blocks(Some(&unshared), &account("a"), Some(&full), NOW, 0),
+            Some(reset)
+        );
+    }
+
+    #[test]
+    fn restore_rejects_colliding_account_overrides_without_changing_clients() {
+        for mapped_orphan in [false, true] {
+            let (dir, clients) = clients();
+            let (original, _) = clients.create(named("unchanged")).unwrap();
+            let before = std::fs::read(dir.path().join(".clients")).unwrap();
+            let mut restored = original.clone();
+            restored.name = "restored".into();
+            restored.account_shares = [("a".into(), 10.0), ("b".into(), 95.0)].into();
+            let mapping = if mapped_orphan {
+                [("a".into(), "c".into()), ("b".into(), "c".into())].into()
+            } else {
+                [("a".into(), "b".into())].into()
+            };
+            for dry_run in [true, false] {
+                let error = clients
+                    .restore(vec![restored.clone()], &mapping, dry_run)
+                    .unwrap_err();
+                assert!(error.contains("conflicting account shares"), "{error}");
+                assert_eq!(clients.list(), vec![original.clone()]);
+                assert_eq!(std::fs::read(dir.path().join(".clients")).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn overbooked_95_plus_10_shares_are_accepted() {
+        let (_dir, clients) = clients();
+        for percent in [95.0, 10.0] {
+            clients
+                .create(ClientPatch {
+                    name: Some(format!("holder {percent}")),
+                    shares: Some([("claude".to_owned(), percent)].into()),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        assert_eq!(clients.list().len(), 2);
+        let (_target_dir, target) = self::clients();
+        target
+            .restore(clients.list(), &BTreeMap::new(), true)
+            .unwrap();
+        target
+            .restore(clients.list(), &BTreeMap::new(), false)
+            .unwrap();
+        assert_eq!(target.list().len(), 2);
+    }
+
+    #[test]
+    fn account_shares_json_is_accepted_and_listed() {
+        let (_dir, clients) = clients();
+        let patch: ClientPatch = serde_json::from_value(serde_json::json!({
+            "name": "account holder", "account_shares": {"a": 10.0}
+        }))
+        .unwrap();
+        let (client, _) = clients.create(patch).unwrap();
+        assert_eq!(client.public()["account_shares"]["a"], 10.0);
+    }
+
+    #[test]
+    fn overbooking_is_first_consumer_wins_and_each_holder_has_a_cap() {
+        for small_first in [false, true] {
+            let (_dir, clients) = clients();
+            let mut holders = vec![];
+            for percent in [95.0, 10.0] {
+                holders.push(
+                    clients
+                        .create(ClientPatch {
+                            name: Some(format!("holder {percent}")),
+                            shares: Some([("claude".into(), percent)].into()),
+                            ..Default::default()
+                        })
+                        .unwrap()
+                        .0,
+                );
+            }
+            let (unshared, _) = clients.create(named("unshared")).unwrap();
+            let a = account("a");
+            let reset = NOW + 3 * 86_400;
+            clients.observe(&snapshot("a", 0.0, reset), NOW);
+            let (first, next, amount, leftover) = if small_first {
+                (&holders[1], &holders[0], 10.0, 90.0)
+            } else {
+                (&holders[0], &holders[1], 95.0, 5.0)
+            };
+            clients.call_ended("a", Some(&first.id), 1.0);
+            let after = snapshot("a", amount, reset);
+            clients.observe(&after, NOW);
+            assert_eq!(
+                clients.share_blocks(Some(first), &a, Some(&after), NOW, 0),
+                Some(reset)
+            );
+            assert_eq!(
+                clients
+                    .client_view(first, after.clone(), "claude", NOW, 0)
+                    .windows[0]
+                    .remaining_percent,
+                Some(0.0)
+            );
+            assert_eq!(
+                clients.share_blocks(Some(next), &a, Some(&after), NOW, 0),
+                None
+            );
+            assert_eq!(
+                clients.share_blocks(Some(&unshared), &a, Some(&after), NOW, 0),
+                None
+            );
+            assert_eq!(
+                clients
+                    .client_view(&unshared, after.clone(), "claude", NOW, 0)
+                    .windows[0]
+                    .remaining_percent,
+                Some(leftover)
+            );
+            // The last seventh frees reservations, but does not remove overbooked caps.
+            let late = reset - 3600;
+            assert_eq!(
+                clients.share_blocks(Some(first), &a, Some(&after), late, 0),
+                Some(reset)
+            );
+            assert_eq!(
+                clients.share_blocks(Some(first), &a, Some(&after), late, 7200),
+                None
+            );
+            assert_eq!(
+                clients
+                    .client_view(first, after, "claude", late, 7200)
+                    .windows[0]
+                    .remaining_percent,
+                Some(leftover)
+            );
+            clients.call_ended("a", Some(&next.id), 1.0);
+            let full = snapshot("a", 100.0, reset);
+            clients.observe(&full, NOW);
+            assert_eq!(
+                clients.client_view(next, full, "claude", NOW, 0).windows[0].remaining_percent,
+                Some(0.0)
+            );
+            // A new window clears the cap's attributed usage.
+            let fresh = snapshot("a", 0.0, reset + 7 * 86_400);
+            clients.observe(&fresh, NOW);
+            assert_eq!(
+                clients.share_blocks(Some(first), &a, Some(&fresh), NOW, 0),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn account_overrides_replace_pool_shares_and_only_authorized_holders_count() {
+        let (_dir, clients) = clients();
+        let (holder, _) = clients
+            .create(ClientPatch {
+                name: Some("holder".into()),
+                shares: Some([("claude".into(), 95.0)].into()),
+                account_shares: Some([("a".into(), 10.0)].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        clients
+            .create(ClientPatch {
+                name: Some("restricted".into()),
+                shares: Some([("claude".into(), 95.0)].into()),
+                access: Some(Access {
+                    all: false,
+                    pools: Default::default(),
+                    accounts: ["a".into()].into(),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        let (unshared, _) = clients.create(named("unshared")).unwrap();
+        assert_eq!(holder.share_for("claude", "a"), Some(10.0));
+        assert_eq!(holder.share_for("claude", "b"), Some(95.0));
+        let reset = NOW + 3 * 86_400;
+        for id in ["a", "b"] {
+            clients.observe(&snapshot(id, 0.0, reset), NOW);
+            clients.call_ended(id, Some(&holder.id), 1.0);
+            clients.observe(&snapshot(id, 10.0, reset), NOW);
+        }
+        assert_eq!(
+            clients.share_blocks(
+                Some(&holder),
+                &account("a"),
+                Some(&snapshot("a", 10.0, reset)),
+                NOW,
+                0
+            ),
+            Some(reset)
+        );
+        assert_eq!(
+            clients.share_blocks(
+                Some(&holder),
+                &account("b"),
+                Some(&snapshot("b", 10.0, reset)),
+                NOW,
+                0
+            ),
+            None
+        );
+        // Only 5 points are common on b: the restricted holder cannot overbook it.
+        assert_eq!(
+            clients.share_blocks(
+                Some(&unshared),
+                &account("b"),
+                Some(&snapshot("b", 15.0, reset)),
+                NOW,
+                0
+            ),
+            Some(reset)
+        );
+        // An account override never authorizes access, even to an unlisted pool.
+        let (restricted, _) = clients
+            .create(ClientPatch {
+                account_shares: Some([("c".into(), 100.0)].into()),
+                access: Some(Access {
+                    all: false,
+                    pools: Default::default(),
+                    accounts: Default::default(),
+                }),
+                ..named("denied")
+            })
+            .unwrap();
+        assert!(!restricted.access.allows(&account("c")));
+        assert!(
+            clients
+                .holders("claude", "c")
+                .iter()
+                .all(|(id, _)| id != &restricted.id)
+        );
+    }
+
+    #[test]
+    fn overbooked_view_is_bounded_by_the_physical_remainder() {
+        let (_dir, clients) = clients();
+        let (small, _) = clients
+            .create(ClientPatch {
+                shares: Some([("claude".into(), 10.0)].into()),
+                ..named("small")
+            })
+            .unwrap();
+        let (large, _) = clients
+            .create(ClientPatch {
+                shares: Some([("claude".into(), 95.0)].into()),
+                ..named("large")
+            })
+            .unwrap();
+        let reset = NOW + 3 * 86_400;
+        clients.observe(&snapshot("a", 0.0, reset), NOW);
+        clients.call_ended("a", Some(&small.id), 1.0);
+        clients.observe(&snapshot("a", 5.0, reset), NOW);
+        clients.call_ended("a", Some(&large.id), 1.0);
+        let almost_full = snapshot("a", 99.0, reset);
+        clients.observe(&almost_full, NOW);
+        let view = clients.client_view(&small, almost_full, "claude", NOW, 0);
+        assert!((view.windows[0].remaining_percent.unwrap() - 100.0 / 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn account_shares_persist_validate_and_restore_without_broadening_access() {
+        let (dir, clients) = clients();
+        let (client, _) = clients
+            .create(ClientPatch {
+                account_shares: Some([("old".into(), 95.0), ("missing".into(), 10.0)].into()),
+                access: Some(Access {
+                    all: false,
+                    pools: Default::default(),
+                    accounts: ["old".into()].into(),
+                }),
+                ..named("scoped")
+            })
+            .unwrap();
+        assert_eq!(
+            Clients::open(dir.path()).unwrap().list(),
+            vec![client.clone()]
+        );
+        let (_target_dir, target) = self::clients();
+        let mapping = [("old".into(), "new".into())].into();
+        target
+            .restore(vec![client.clone()], &mapping, true)
+            .unwrap();
+        assert!(target.list().is_empty());
+        target.restore(vec![client], &mapping, false).unwrap();
+        let restored = target.list().remove(0);
+        assert_eq!(
+            restored.account_shares,
+            [("new".into(), 95.0), ("missing".into(), 10.0)].into()
+        );
+        assert_eq!(restored.access.accounts, ["new".into()].into());
+        assert!(!restored.access.all);
+        assert!(restored.access.pools.is_empty());
+        assert!(!restored.access.allows(&account("missing")));
+        for percent in [0.0, -1.0, 101.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                clients
+                    .update(
+                        &restored.id,
+                        ClientPatch {
+                            account_shares: Some([("a".into(), percent)].into()),
+                            ..Default::default()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+        clients
+            .update(
+                &restored.id,
+                ClientPatch {
+                    account_shares: Some(Default::default()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(clients.list()[0].account_shares.is_empty());
+        // Legacy client records inherit pool shares without a migration.
+        let mut legacy = serde_json::to_value(restored).unwrap();
+        legacy.as_object_mut().unwrap().remove("account_shares");
+        assert!(
+            serde_json::from_value::<Client>(legacy)
+                .unwrap()
+                .account_shares
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn every_call_needs_a_client_key_even_before_the_first_client() {
         let (_dir, clients) = clients();
         assert_eq!(
@@ -895,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn shares_of_a_pool_never_promise_more_than_the_window() {
+    fn individual_shares_remain_valid_with_overbooking() {
         let (_dir, clients) = clients();
         let share = |pool: &str, percent: f64| ClientPatch {
             name: Some("x".into()),
@@ -903,16 +1268,11 @@ mod tests {
             ..ClientPatch::default()
         };
         clients.create(share("claude", 60.0)).unwrap();
-        assert!(
-            clients
-                .create(share("claude", 50.0))
-                .unwrap_err()
-                .contains("more than 100%")
-        );
+        clients.create(share("claude", 50.0)).unwrap();
         clients.create(share("claude", 40.0)).unwrap();
         clients.create(share("codex", 100.0)).unwrap();
         assert!(clients.create(share("claude", 0.0)).is_err());
-        assert_eq!(clients.list().len(), 3);
+        assert_eq!(clients.list().len(), 4);
     }
 
     #[test]

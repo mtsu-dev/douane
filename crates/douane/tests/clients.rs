@@ -333,7 +333,10 @@ async fn a_restore_points_account_access_at_the_ids_accounts_get_there() {
             reqwest::Method::POST,
             "/admin/api/clients",
             None,
-            Some(json!({"name":"Scoped","access":{"all":false,"accounts":[source_id]}})),
+            Some(
+                json!({"name":"Scoped","access":{"all":false,"accounts":[source_id]},
+                "account_shares":{source_id.clone():10.0}}),
+            ),
         )
         .await;
     let key = created["key"].as_str().unwrap().to_owned();
@@ -352,9 +355,97 @@ async fn a_restore_points_account_access_at_the_ids_accounts_get_there() {
     assert_eq!(target.state.accounts.list().await.len(), 1);
     assert_eq!(
         target.state.clients.list()[0].access.accounts,
-        [target_id].into()
+        [target_id.clone()].into()
+    );
+    assert_eq!(
+        target.state.clients.list()[0].account_shares,
+        [(target_id, 10.0)].into()
     );
     let (status, models) = target.models(Some(&key)).await;
     assert_eq!(status, 200);
     assert!(models.iter().any(|m| m.starts_with("codex/")), "{models:?}");
+}
+
+#[tokio::test]
+async fn account_shares_create_update_list_and_persist_over_http() {
+    let directory = tempfile::tempdir().unwrap();
+    let gateway = instance(&directory).await;
+    let (status, created) = gateway
+        .send(
+            reqwest::Method::POST,
+            "/admin/api/clients",
+            None,
+            Some(json!({"name":"Scoped","shares":{"codex":95.0},"account_shares":{"a":10.0}})),
+        )
+        .await;
+    assert_eq!(status, 201, "{created}");
+    assert_eq!(created["client"]["account_shares"], json!({"a":10.0}));
+    let id = created["client"]["id"].as_str().unwrap();
+    let path = format!("/admin/api/clients/{id}");
+    let (status, second) = gateway
+        .send(
+            reqwest::Method::POST,
+            "/admin/api/clients",
+            None,
+            Some(json!({"name":"Second","shares":{"codex":10.0}})),
+        )
+        .await;
+    assert_eq!(status, 201, "{second}");
+    for percent in [0.0, -1.0, 101.0] {
+        let (status, _) = gateway
+            .send(
+                reqwest::Method::PATCH,
+                &path,
+                None,
+                Some(json!({"account_shares":{"a":percent}})),
+            )
+            .await;
+        assert_eq!(status, 400);
+    }
+    let (status, updated) = gateway
+        .send(
+            reqwest::Method::PATCH,
+            &path,
+            None,
+            Some(json!({"account_shares":{"b":25.0}})),
+        )
+        .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(updated["client"]["account_shares"], json!({"b":25.0}));
+    let (_, listed) = gateway
+        .send(reqwest::Method::GET, "/admin/api/clients", None, None)
+        .await;
+    let listed = listed["clients"].as_array().unwrap();
+    let stored = listed.iter().find(|c| c["id"] == id).unwrap();
+    assert_eq!(stored["account_shares"], json!({"b":25.0}));
+    assert!(stored.get("key_hash").is_none());
+    let (_, exported) = gateway
+        .send(reqwest::Method::GET, "/admin/api/export", None, None)
+        .await;
+    assert_eq!(exported["clients"][0]["account_shares"], json!({"b":25.0}));
+    assert_eq!(
+        AccountStore::open(directory.path().join("accounts"))
+            .unwrap()
+            .list()
+            .await
+            .len(),
+        0
+    );
+    drop(gateway);
+    let restarted = instance(&directory).await;
+    assert_eq!(
+        restarted.state.clients.list()[0].account_shares,
+        [("b".to_owned(), 25.0)].into()
+    );
+    let (status, cleared) = restarted
+        .send(
+            reqwest::Method::PATCH,
+            &path,
+            None,
+            Some(json!({"account_shares":{}})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(cleared["client"]["account_shares"], json!({}));
+    assert_eq!(cleared["client"]["shares"], json!({"codex":95.0}));
 }

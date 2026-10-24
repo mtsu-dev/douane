@@ -116,6 +116,9 @@ struct ClientRules {
     /// Comma-separated `pool=percent` shares; an empty value removes them.
     #[arg(long, value_delimiter = ',')]
     share: Option<Vec<String>>,
+    /// Comma-separated `account_id=percent` overrides; an empty value removes them.
+    #[arg(long, value_delimiter = ',')]
+    account_share: Option<Vec<String>>,
 }
 
 impl ClientRules {
@@ -132,7 +135,11 @@ impl ClientRules {
             patch["access"] =
                 json!({"all": false, "pools": list(self.pools), "accounts": list(self.accounts)});
         }
-        if let Some(shares) = self.share {
+        for (field, shares) in [
+            ("shares", self.share),
+            ("account_shares", self.account_share),
+        ] {
+            let Some(shares) = shares else { continue };
             let mut map = serde_json::Map::new();
             for share in shares.iter().filter(|s| !s.is_empty()) {
                 let (pool, percent) = share
@@ -144,7 +151,7 @@ impl ClientRules {
                     .with_context(|| format!("{share}: the percent is not a number"))?;
                 map.insert(pool.to_owned(), json!(percent));
             }
-            patch["shares"] = Value::Object(map);
+            patch[field] = Value::Object(map);
         }
         Ok(())
     }
@@ -192,7 +199,9 @@ async fn client_command(
             }
             rules.patch(&mut body)?;
             if body.as_object().is_some_and(|p| p.is_empty()) {
-                bail!("give --name, --all, --pools, --accounts, --share or --rotate-key");
+                bail!(
+                    "give --name, --all, --pools, --accounts, --share, --account-share or --rotate-key"
+                );
             }
             let value = send(
                 client
@@ -541,6 +550,62 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn client_account_shares_can_be_added_updated_and_cleared() {
+        for (arguments, expected) in [
+            (
+                vec![
+                    "douanectl",
+                    "client",
+                    "add",
+                    "family",
+                    "--share",
+                    "claude=95",
+                    "--account-share",
+                    "abc=10%,def=25",
+                ],
+                json!({"shares":{"claude":95.0},"account_shares":{"abc":10.0,"def":25.0}}),
+            ),
+            (
+                vec![
+                    "douanectl",
+                    "client",
+                    "set",
+                    "id",
+                    "--account-share",
+                    "abc=20",
+                ],
+                json!({"account_shares":{"abc":20.0}}),
+            ),
+            (
+                vec![
+                    "douanectl",
+                    "client",
+                    "set",
+                    "id",
+                    "--account-share",
+                    "",
+                    "--share",
+                    "",
+                ],
+                json!({"shares":{},"account_shares":{}}),
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let rules = match cli.command {
+                Command::Client(
+                    ClientCommand::Add { rules, .. } | ClientCommand::Set { rules, .. },
+                ) => rules,
+                _ => panic!("expected client rules"),
+            };
+            let mut patch = json!({});
+            rules.patch(&mut patch).unwrap();
+            assert_eq!(patch, expected);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn an_export_file_is_readable_by_its_owner_only() {

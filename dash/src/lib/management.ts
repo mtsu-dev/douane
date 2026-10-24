@@ -30,7 +30,7 @@ export type Call = { id: string | number; started_at: string; model: string; pro
 export type Status = { version: string; uptime_seconds: number; in_flight: number; requests: number; errors: number; accounts: number; enabled_accounts: number; providers: number; input_tokens: number; output_tokens: number; cache_read_tokens?: number; cache_write_tokens?: number; client_api_base_url?: string | null; clients?: number };
 /** The accounts a client key may use; `all` includes accounts connected later. */
 export type ClientAccess = { all: boolean; pools: string[]; accounts: string[] };
-export type Client = { id: string; name: string; key_hint: string; created_at: string; access: ClientAccess; shares: Record<string, number> };
+export type Client = { id: string; name: string; key_hint: string; created_at: string; access: ClientAccess; shares: Record<string, number>; account_shares: Record<string, number> };
 /** Percent points of one account-wide window attributed to each client id (`""` is a call without key). */
 export type ClientUsage = { account_id: string; kind: ReserveWindow; reset: number; used: number; clients: Record<string, number>; outside: number };
 export type ClientsReport = { clients: Client[]; usage: ClientUsage[] };
@@ -39,7 +39,7 @@ export type ClientTotals = { client_id: string; provider: string; model: string;
 /** One client's calls and tokens in one UTC hour, `hour` as `YYYY-MM-DDTHH`. */
 export type ClientHour = { client_id: string; hour: string; calls: number; tokens: number };
 export type ClientStats = { since: string; totals: ClientTotals[]; hours: ClientHour[] };
-export type ClientPatch = { name?: string; access?: ClientAccess; shares?: Record<string, number>; rotate_key?: boolean };
+export type ClientPatch = { name?: string; access?: ClientAccess; shares?: Record<string, number>; account_shares?: Record<string, number>; rotate_key?: boolean };
 export type ClientSaved = { client: Client; key: string | null };
 export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'smart';
 export type QuotaDisplay = 'accounts' | 'average';
