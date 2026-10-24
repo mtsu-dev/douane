@@ -57,6 +57,7 @@ struct DeviceFlow {
 
 pub struct OAuthManager {
     client: reqwest::Client,
+    meta_client: reqwest::Client,
     store: Arc<AccountStore>,
     pending: Mutex<BTreeMap<String, Pending>>,
     codex_token_url: String,
@@ -70,12 +71,19 @@ pub struct OAuthManager {
     pub(crate) copilot_device_url: String,
     pub(crate) copilot_token_url: String,
     pub(crate) github_user_url: String,
+    pub(crate) meta_device_url: String,
+    pub(crate) meta_token_url: String,
+    pub(crate) meta_mint_url: String,
 }
 
 impl OAuthManager {
     pub fn new(client: reqwest::Client, store: Arc<AccountStore>) -> Self {
         let google = GoogleOAuth::load(client.clone(), &store.oauth_clients_path());
         Self {
+            meta_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("Meta HTTP client"),
             client,
             store,
             pending: Mutex::new(BTreeMap::new()),
@@ -86,6 +94,9 @@ impl OAuthManager {
             copilot_device_url: "https://github.com/login/device/code".into(),
             copilot_token_url: "https://github.com/login/oauth/access_token".into(),
             github_user_url: "https://api.github.com/user".into(),
+            meta_device_url: "https://auth.meta.com/oidc/device/authorization/".into(),
+            meta_token_url: "https://auth.meta.com/oidc/device/token/".into(),
+            meta_mint_url: "https://api.meta.ai/muse-code/key".into(),
         }
     }
 
@@ -94,7 +105,8 @@ impl OAuthManager {
             SubscriptionProvider::Codex
             | SubscriptionProvider::Claude
             | SubscriptionProvider::Xai
-            | SubscriptionProvider::Copilot => true,
+            | SubscriptionProvider::Copilot
+            | SubscriptionProvider::Meta => true,
             SubscriptionProvider::Gemini | SubscriptionProvider::Antigravity => {
                 self.google.supports(provider)
             }
@@ -107,6 +119,9 @@ impl OAuthManager {
         provider: SubscriptionProvider,
         redirect_uri: Option<String>,
     ) -> Result<OAuthAttempt, SubscriptionError> {
+        if provider == SubscriptionProvider::Meta {
+            return self.start_meta().await;
+        }
         if provider == SubscriptionProvider::Xai {
             return self.start_xai().await;
         }
@@ -457,6 +472,16 @@ impl OAuthManager {
         {
             return Ok(account);
         }
+        if account.provider == SubscriptionProvider::Meta {
+            let dca = account
+                .dca_token
+                .as_deref()
+                .ok_or(SubscriptionError::NoRefreshToken)?;
+            let value = super::meta::mint(&self.meta_client, &self.meta_mint_url, dca).await?;
+            super::meta::apply_minted(&mut account, &value)?;
+            self.store.update_credential(account).await?;
+            return self.store.get(id).await.ok_or(SubscriptionError::NotFound);
+        }
         let refresh_token = account
             .refresh_token
             .as_deref()
@@ -509,6 +534,73 @@ impl OAuthManager {
         apply_identity(&mut account);
         self.store.update_credential(account).await?;
         self.store.get(id).await.ok_or(SubscriptionError::NotFound)
+    }
+
+    async fn start_meta(&self) -> Result<OAuthAttempt, SubscriptionError> {
+        let response = send_json(
+            self.meta_client
+                .post(&self.meta_device_url)
+                .header("User-Agent", "muse-code/1.0.2")
+                .form(&[("client_id", super::meta::CLIENT)]),
+        )
+        .await?;
+        let code = text(&response, &["device_code"]).ok_or(SubscriptionError::InvalidResponse)?;
+        let user_code =
+            text(&response, &["user_code"]).ok_or(SubscriptionError::InvalidResponse)?;
+        let url = text(
+            &response,
+            &["verification_uri_complete", "verification_uri"],
+        )
+        .filter(|url| super::meta::valid_verification(url))
+        .ok_or(SubscriptionError::InvalidResponse)?;
+        let interval = response["interval"].as_u64().unwrap_or(5).clamp(1, 60);
+        let expires = response["expires_in"].as_i64().unwrap_or(900).clamp(1, 900);
+        let attempt = OAuthAttempt {
+            id: random_id(),
+            provider: SubscriptionProvider::Meta,
+            url,
+            state: random_id(),
+            redirect_uri: String::new(),
+            expires_at: timestamp(
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(expires),
+            ),
+            status: "pending".into(),
+            account_id: None,
+            error: None,
+            error_code: None,
+            user_code: Some(user_code),
+            interval: Some(interval),
+            verification_required: false,
+            verification_available: false,
+        };
+        self.save_attempt(Pending {
+            public: attempt.clone(),
+            verifier: String::new(),
+            device: Some(DeviceFlow {
+                provider: SubscriptionProvider::Meta,
+                code,
+                token_endpoint: self.meta_token_url.clone(),
+                next_poll: time::OffsetDateTime::now_utc(),
+                interval,
+            }),
+            verification_url: None,
+        })
+        .await;
+        Ok(attempt)
+    }
+
+    async fn meta_account(&self, token: Value) -> Result<AccountSummary, SubscriptionError> {
+        let dca = text(&token, &["access_token"]).ok_or(SubscriptionError::InvalidResponse)?;
+        let minted = super::meta::mint(&self.meta_client, &self.meta_mint_url, &dca).await?;
+        let mut value = minted;
+        value["type"] = json!("meta");
+        value["dca_token"] = json!(dca);
+        if let Some(expires) = token["expires_in"].as_i64().filter(|n| *n > 0) {
+            value["dca_expired"] = json!(timestamp(
+                time::OffsetDateTime::now_utc() + time::Duration::seconds(expires)
+            ));
+        }
+        self.store.import(value, None).await
     }
 
     async fn xai_discovery(&self) -> Result<(String, String), SubscriptionError> {
@@ -700,10 +792,15 @@ impl OAuthManager {
         };
         let client_id = match flow.provider {
             SubscriptionProvider::Copilot => COPILOT_CLIENT,
+            SubscriptionProvider::Meta => super::meta::CLIENT,
             _ => XAI_CLIENT,
         };
-        let response = self
-            .client
+        let poll_client = if flow.provider == SubscriptionProvider::Meta {
+            &self.meta_client
+        } else {
+            &self.client
+        };
+        let response = poll_client
             .post(&flow.token_endpoint)
             .timeout(Duration::from_secs(30))
             .header("Accept", "application/json")
@@ -747,6 +844,8 @@ impl OAuthManager {
                         Err(SubscriptionError::Upstream(403))
                     }
                     Some(value) if status.is_success() && error.is_none() => match flow.provider {
+                        SubscriptionProvider::Meta => self.meta_account(value).await,
+
                         SubscriptionProvider::Copilot => match text(&value, &["access_token"]) {
                             Some(token) => {
                                 let account = self.copilot_account(&token).await;
@@ -1119,6 +1218,178 @@ mod tests {
         assert_eq!(credential.account_id.as_deref(), Some("42"));
         assert!(credential.refresh_token.is_none() && credential.expires_at.is_none());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn meta_device_lifecycle_mint_renewal_and_private_storage() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let poll_count = polls.clone();
+        let mint_count = mints.clone();
+        let app = Router::new()
+            .route("/device", post(|form: axum::extract::Form<BTreeMap<String,String>>| async move {
+                assert_eq!(form["client_id"], super::super::meta::CLIENT);
+                Json(json!({"device_code":"secret-device", "user_code":"TEST-CODE", "verification_uri":"https://auth.meta.com/activate", "interval":1, "expires_in":900}))
+            }))
+            .route("/token", post(move |form: axum::extract::Form<BTreeMap<String,String>>| { let count=poll_count.clone(); async move {
+                assert_eq!(form["device_code"], "secret-device");
+                assert_eq!(form["client_id"], super::super::meta::CLIENT);
+                match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => (StatusCode::BAD_REQUEST, Json(json!({"error":"authorization_pending"}))),
+                    1 => (StatusCode::BAD_REQUEST, Json(json!({"error":"slow_down"}))),
+                    _ => (StatusCode::OK, Json(json!({"access_token":"dca:private", "expires_in":3600})))
+                }
+            }}))
+            .route("/mint", post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| { let count=mint_count.clone(); async move {
+                assert_eq!(headers["authorization"], "Bearer dca:private");
+                assert_eq!(body["dca_token"], "dca:private");
+                let n=count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                Json(json!({"api_key":format!("private-key-{n}"), "base_url":"https://api.meta.ai/v1", "user_email":"meta@example.test", "subs_tier_name":if n==0 {"Contributor"} else {"Updated"}, "subs_tier_id":"contributor", "is_subs_active":true, "require_payment":false}))
+            }}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(dir.path()).unwrap());
+        let mut manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+        manager.meta_device_url = format!("{base}/device");
+        manager.meta_token_url = format!("{base}/token");
+        manager.meta_mint_url = format!("{base}/mint");
+        let attempt = manager
+            .start(SubscriptionProvider::Meta, None)
+            .await
+            .unwrap();
+        assert_eq!(attempt.user_code.as_deref(), Some("TEST-CODE"));
+        assert!(
+            !serde_json::to_string(&attempt)
+                .unwrap()
+                .contains("secret-device")
+        );
+        for expected in ["pending", "pending", "complete"] {
+            manager
+                .pending
+                .lock()
+                .await
+                .get_mut(&attempt.id)
+                .unwrap()
+                .device
+                .as_mut()
+                .unwrap()
+                .next_poll = time::OffsetDateTime::now_utc();
+            let status = manager.status(&attempt.id).await.unwrap();
+            assert_eq!(status.status, expected);
+            if expected == "pending" && polls.load(Ordering::SeqCst) == 2 {
+                assert_eq!(
+                    manager.pending.lock().await[&attempt.id]
+                        .device
+                        .as_ref()
+                        .unwrap()
+                        .interval,
+                    6
+                );
+            }
+        }
+        let id = manager
+            .status(&attempt.id)
+            .await
+            .unwrap()
+            .account_id
+            .unwrap();
+        let credential = store.get(&id).await.unwrap();
+        assert_eq!(credential.access_token, "private-key-0");
+        assert_eq!(credential.dca_token.as_deref(), Some("dca:private"));
+        assert!(credential.expires_at.is_none());
+        assert!(credential.dca_expires_at.is_some());
+        let (a, b) = tokio::join!(manager.force_refresh(&id), manager.force_refresh(&id));
+        assert_eq!(a.unwrap().access_token, "private-key-1");
+        assert_eq!(b.unwrap().access_token, "private-key-1");
+        assert_eq!(mints.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            store.get(&id).await.unwrap().subscription.unwrap().label,
+            "Updated"
+        );
+        let public = serde_json::to_string(&store.list().await).unwrap();
+        for secret in ["dca:private", "private-key-1", "secret-device"] {
+            assert!(!public.contains(secret));
+        }
+        let exported = serde_json::to_value(store.export().await.remove(0)).unwrap();
+        assert_eq!(exported["dca_token"], "dca:private");
+        let fresh_dir = tempfile::tempdir().unwrap();
+        let restored = AccountStore::open(fresh_dir.path()).unwrap();
+        let restored_id = restored.restore(exported).await.unwrap().id;
+        assert_eq!(
+            restored
+                .get(&restored_id)
+                .await
+                .unwrap()
+                .dca_token
+                .as_deref(),
+            Some("dca:private")
+        );
+        assert_eq!(
+            AccountStore::open(dir.path())
+                .unwrap()
+                .get(&id)
+                .await
+                .unwrap()
+                .access_token,
+            "private-key-1"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn meta_device_denial_expiry_and_mint_errors_are_safe() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        for reason in ["access_denied", "expired_token", "private-token-error"] {
+            let app = Router::new().route(
+                "/token",
+                post(move || async move {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error":reason,"error_description":"dca:secret"})),
+                    )
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(AccountStore::open(dir.path()).unwrap());
+            let manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+            let mut attempt = manager
+                .start(SubscriptionProvider::Codex, None)
+                .await
+                .unwrap();
+            attempt.provider = SubscriptionProvider::Meta;
+            manager
+                .save_attempt(Pending {
+                    public: attempt.clone(),
+                    verifier: String::new(),
+                    device: Some(DeviceFlow {
+                        provider: SubscriptionProvider::Meta,
+                        code: "secret".into(),
+                        token_endpoint: endpoint,
+                        next_poll: time::OffsetDateTime::now_utc(),
+                        interval: 1,
+                    }),
+                    verification_url: None,
+                })
+                .await;
+            let status = manager.status(&attempt.id).await.unwrap();
+            assert_eq!(status.status, "error");
+            let public = serde_json::to_string(&status).unwrap();
+            assert!(!public.contains("dca:secret") && !public.contains("private-token-error"));
+            assert!(store.list().await.is_empty());
+            server.abort();
+        }
     }
 
     #[test]

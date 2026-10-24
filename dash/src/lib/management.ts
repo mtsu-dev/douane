@@ -108,7 +108,7 @@ export const management = {
 };
 
 export const providerNames: Record<string, string> = {
-	codex: 'Codex', claude: 'Claude', gemini: 'Gemini', antigravity: 'Antigravity', qwen: 'Qwen', kimi: 'Kimi', copilot: 'GitHub Copilot', iflow: 'iFlow', opencode_go: 'OpenCode Go', xai: 'Grok', grok: 'Grok', openai_compatible: 'OpenAI-compatible'
+	codex: 'Codex', claude: 'Claude', gemini: 'Gemini', antigravity: 'Antigravity', qwen: 'Qwen', kimi: 'Kimi', copilot: 'GitHub Copilot', meta: 'Muse Code', iflow: 'iFlow', opencode_go: 'OpenCode Go', xai: 'Grok', grok: 'Grok', openai_compatible: 'OpenAI-compatible'
 };
 /** The pool an account serves: its route for a custom endpoint, else its provider. */
 export function accountPool(account: Account) { return account.route || account.provider; }

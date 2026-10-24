@@ -1040,6 +1040,7 @@ pub async fn providers(State(state): State<Arc<AppState>>) -> Json<Value> {
         {"id":"opencode_go","oauth":false,"quota":true,"docs_url":"https://opencode.ai/docs/go/"},
         {"id":"xai","oauth":true,"quota":true,"docs_url":"https://grok.com"},
         {"id":"copilot","oauth":true,"quota":true,"docs_url":"https://github.com/settings/copilot"},
+        {"id":"meta","oauth":true,"quota":true,"docs_url":"https://muse.meta.com"},
         {"id":"antigravity","oauth":true,"quota":true,"docs_url":"https://antigravity.google"},
         {"id":"kimi","oauth":false,"quota":true,"docs_url":"https://kimi.com/code"},
         {"id":"qwen","oauth":false,"quota":false,"docs_url":"https://chat.qwen.ai"},

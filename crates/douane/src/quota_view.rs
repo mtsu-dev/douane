@@ -24,6 +24,7 @@ pub fn provider_name(provider: SubscriptionProvider) -> &'static str {
         SubscriptionProvider::Xai => "Grok",
         SubscriptionProvider::OpencodeGo => "OpenCode Go",
         SubscriptionProvider::Copilot => "GitHub Copilot",
+        SubscriptionProvider::Meta => "Muse Code",
         SubscriptionProvider::OpenaiCompatible => "Compatible OpenAI",
     }
 }

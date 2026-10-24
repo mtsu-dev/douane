@@ -44,7 +44,7 @@ const quotas = [
 	quota('acc-go', [window('five-hour', '5 hours', 100, 5), window('weekly', 'Weekly', 88, 70), window('monthly', 'Monthly', 61, 24 * 15)])
 ];
 const providers = [
-	['claude', 'Claude', true, true], ['codex', 'Codex', true, true], ['opencode_go', 'OpenCode Go', false, true],
+	['claude', 'Claude', true, true], ['codex', 'Codex', true, true], ['meta', 'Muse Code', true, true], ['opencode_go', 'OpenCode Go', false, true],
 	['xai', 'Grok', true, true], ['copilot', 'GitHub Copilot', true, true], ['antigravity', 'Antigravity', false, true],
 	['kimi', 'Kimi', false, true], ['qwen', 'Qwen', false, false], ['openai_compatible', 'OpenAI-compatible', false, false]
 ].map(([id, name, oauth, quota]) => ({ id, name, oauth, quota, docs_url: 'https://example.com' }));
@@ -161,6 +161,12 @@ const resets = (id) => {
 };
 
 function api(method, path, body, query = new URLSearchParams()) {
+	// A pending device login for the sample dashboard. No provider request or credential is created.
+	if (method === 'POST' && path === '/oauth/start' && body?.provider === 'meta') return {
+		id: 'sample-meta-device', provider: 'meta', url: 'https://auth.meta.com/oidc/device/', user_code: 'MUSE-DEMO',
+		state: '', redirect_uri: '', status: 'pending', interval: 5, expires_at: at(0.25)
+	};
+	if (method === 'GET' && path === '/oauth/sample-meta-device') return { status: 'pending', interval: 5 };
 	const target = path.match(/^\/clients(?:\/([^/]+))?$/);
 	if (target && method !== 'GET') return changeClient(method, target[1] && decodeURIComponent(target[1]), body ?? {});
 	if (method === 'POST' && path === '/restore') return { restored: 2, accounts: [], errors: [], settings: false };

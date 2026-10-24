@@ -10,8 +10,9 @@
 	import kimi from '$lib/assets/providers/kimi.svg';
 	import qwen from '$lib/assets/providers/qwen.svg';
 	import copilot from '$lib/assets/providers/copilot.svg';
+	import meta from '$lib/assets/providers/meta.svg';
 	let { provider, size = 20 }: { provider: string; size?: number } = $props();
-	const logos: Record<string,string> = { claude,codex,openai,opencode_go:go,opencode:go,xai,grok:xai,antigravity,gemini,google:gemini,kimi,qwen,copilot };
+	const logos: Record<string,string> = { claude,codex,openai,opencode_go:go,opencode:go,xai,grok:xai,antigravity,gemini,google:gemini,kimi,qwen,copilot,meta };
 	let logo = $derived(logos[provider]);
 </script>
 
