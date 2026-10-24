@@ -35,20 +35,12 @@
 	function pool(id: string): Pool { return pools.find(item => item.id === id) ?? { id, provider: id, name: id, accounts: [] }; }
 	function accountName(id: string) { const account = accounts.find(item => item.id === id); return account ? privateLabel(account.name) : t('activity.unknownAccount'); }
 	function byKind(a: { kind: ReserveWindow }, b: { kind: ReserveWindow }) { return reserveWindows.indexOf(a.kind) - reserveWindows.indexOf(b.kind); }
-	function reaches(client: Client, item: Pool) { return client.access.all || client.access.pools.includes(item.id) || item.accounts.some(account => client.access.accounts.includes(account.id)); }
-	/** Per pool the client reaches, its points in each window kind: the highest of the pool's accounts, the one a share holds back first. */
+	/** Keep each account's usage beside its effective share, including pool defaults. */
 	function clientUsage(client: Client) {
-		const ids = [...new Set([...pools.filter(item => reaches(client, item)).map(item => item.id), ...Object.keys(client.shares)])];
-		return ids.map(id => {
-			const item = pool(id);
-			const kinds = new Map<ReserveWindow, { kind: ReserveWindow; points: number; account: string }>();
-			for (const row of usage) {
-				if (!item.accounts.some(account => account.id === row.account_id)) continue;
-				const points = row.clients[client.id] ?? 0;
-				const current = kinds.get(row.kind);
-				if (!current || points > current.points) kinds.set(row.kind, { kind: row.kind, points, account: row.account_id });
-			}
-			return { pool: item, share: client.shares[id] ?? null, kinds: [...kinds.values()].sort(byKind) };
+		return accounts.filter(account => client.access.all || client.access.pools.includes(account.route || account.provider) || client.access.accounts.includes(account.id)).map(account => {
+			const item = pool(account.route || account.provider);
+			const kinds = usage.filter(row => row.account_id === account.id).map(row => ({ kind: row.kind, points: row.clients[client.id] ?? 0 })).sort(byKind);
+			return { account, pool: item, share: client.account_shares?.[account.id] ?? client.shares[item.id] ?? null, kinds };
 		}).filter(entry => entry.kinds.length || entry.share != null);
 	}
 	type Segment = { id: string; label: string; points: number; color: string; kind: 'client' | 'outside' | 'rest' };
@@ -128,6 +120,7 @@
 		{#each clients as client (client.id)}
 			{@const access = accessSummary(client)}
 			{@const shares = Object.entries(client.shares)}
+			{@const accountShares = Object.entries(client.account_shares ?? {})}
 			<article class="client-card" style:--client={colors.get(client.id)}>
 				<header>
 					<div class="client-title"><span class="client-dot"></span><h2>{client.name}</h2><code title={t('clients.createdAt', { date: formatDate(client.created_at) })}>{client.key_hint}</code></div>
@@ -147,14 +140,15 @@
 					{/if}
 				</div>
 				<div class="shares">
-					{#each shares as [id, share] (id)}{@const item = pool(id)}<span class="share-chip" title={t('clients.shareOf', { pool: item.name })}><ChartPie size={15}/>{item.name}<strong>{percent(share)}</strong></span>
-					{:else}<span class="muted small">{t('clients.noShare')}</span>{/each}
+					{#each shares as [id, share] (id)}{@const item = pool(id)}<span class="share-chip" title={t('clients.shareOf', { pool: item.name })}><ChartPie size={15}/>{item.name}<strong>{percent(share)}</strong></span>{/each}
+					{#each accountShares as [id, share] (id)}<span class="share-chip" title={t('clients.accountShareOf', { name: accountName(id) })}><ChartPie size={15}/>{accountName(id)}<strong>{percent(share)}</strong></span>{/each}
+					{#if !shares.length && !accountShares.length}<span class="muted small">{t('clients.noShare')}</span>{/if}
 				</div>
-				{#each clientUsage(client) as entry (entry.pool.id)}
+				{#each clientUsage(client) as entry (entry.account.id)}
 					<div class="pool-usage">
-						<p class="pool-name"><ProviderMark provider={entry.pool.provider} size={18}/>{entry.pool.name}</p>
+						<p class="pool-name"><ProviderMark provider={entry.pool.provider} size={18}/>{accountName(entry.account.id)}</p>
 						{#each entry.kinds as kind (kind.kind)}
-							<div class="usage-line" title={entry.pool.accounts.length > 1 ? t('clients.highest', { name: accountName(kind.account) }) : undefined}>
+							<div class="usage-line">
 								<span class="kind">{reserveWindowLabel(kind.kind)}</span>
 								<span class="usage-track"><span class="usage-fill" style:width="{Math.min(100, kind.points)}%"></span>{#if entry.share != null}<span class="share-mark" style:left="{Math.min(100, entry.share)}%"></span>{/if}</span>
 								<span class="usage-value tabular" class:over={entry.share != null && kind.points >= entry.share}>{entry.share == null ? percent(kind.points) : t('clients.ofShare', { used: formatDecimal(kind.points), share: formatDecimal(entry.share) })}</span>

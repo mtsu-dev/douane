@@ -726,7 +726,7 @@ impl AppState {
                 })
                 .unwrap_or_default();
             Err(format!(
-                "{} {pool} is used up until {until}; other clients' shares are reserved for them",
+                "{} {pool} is used up until {until}; its overbooked share cap is reached or quota is reserved for other clients",
                 crate::clients::SHARE_USED_UP
             ))
         } else if ordered.is_empty() {
@@ -1186,6 +1186,122 @@ mod tests {
             credits: vec![],
             ..credits_only(id)
         }
+    }
+
+    #[tokio::test]
+    async fn overbooked_account_caps_fail_over_and_match_public_quotas() {
+        use axum::{body::Body, http::Request};
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let mut ids = vec![];
+        for name in ["a", "b"] {
+            ids.push(
+                state
+                    .accounts
+                    .import(
+                        json!({"type":"codex","access_token":"fixture",
+                "account_id":name,"name":name}),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        let (small, key) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("small".into()),
+                shares: Some([("codex".into(), 20.0)].into()),
+                account_shares: Some([(ids[0].clone(), 10.0)].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("large".into()),
+                shares: Some([("codex".into(), 95.0)].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let at = |id: &str, used: f64| {
+            let mut snapshot = weekly(id, "2099-01-08T00:00:00Z");
+            snapshot.windows[0].remaining_percent = Some(100.0 - used);
+            snapshot
+        };
+        for id in &ids {
+            state.quotas.insert_for_test(at(id, 0.0)).await;
+            state.observe_usage(id).await;
+        }
+        state.clients.call_ended(&ids[0], Some(&small.id), 1.0);
+        state.quotas.insert_for_test(at(&ids[0], 10.0)).await;
+        state.observe_usage(&ids[0]).await;
+        let (_, candidates) = state
+            .candidates_for("gpt-5.5", Some("codex"), None, Some(&small))
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+            vec![ids[1].clone()]
+        );
+
+        let response = crate::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/quotas")
+                    .header("authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let view: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let entries = view["providers"][0]["entries"].as_array().unwrap();
+        for (id, expected) in [(&ids[0], 0.0), (&ids[1], 100.0)] {
+            let entry = entries.iter().find(|e| e["id"] == id.as_str()).unwrap();
+            assert_eq!(entry["windows"][0]["remaining_percent"], expected, "{view}");
+        }
+        // With access restricted to the spent account, the HTTP router returns 429.
+        state
+            .clients
+            .update(
+                &small.id,
+                crate::clients::ClientPatch {
+                    access: Some(crate::clients::Access {
+                        all: false,
+                        pools: Default::default(),
+                        accounts: [ids[0].clone()].into(),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let response = crate::router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/responses")
+                    .header("authorization", format!("Bearer {key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model":"codex/gpt-5.5","input":"test"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 429);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains("overbooked share cap"));
     }
 
     #[tokio::test]
