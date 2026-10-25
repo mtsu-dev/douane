@@ -82,6 +82,7 @@ impl OAuthManager {
         Self {
             meta_client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .user_agent("muse-code/1.0.2")
                 .build()
                 .expect("Meta HTTP client"),
             client,
@@ -1233,9 +1234,14 @@ mod tests {
                 assert_eq!(form["client_id"], super::super::meta::CLIENT);
                 Json(json!({"device_code":"secret-device", "user_code":"TEST-CODE", "verification_uri":"https://auth.meta.com/activate", "interval":1, "expires_in":900}))
             }))
-            .route("/token", post(move |form: axum::extract::Form<BTreeMap<String,String>>| { let count=poll_count.clone(); async move {
+            .route("/token", post(move |headers: axum::http::HeaderMap, form: axum::extract::Form<BTreeMap<String,String>>| { let count=poll_count.clone(); async move {
                 assert_eq!(form["device_code"], "secret-device");
                 assert_eq!(form["client_id"], super::super::meta::CLIENT);
+                // Meta redirects clients without its native User-Agent to
+                // facebook.com/unsupportedbrowser instead of returning OAuth JSON.
+                if headers.get("user-agent").and_then(|h| h.to_str().ok()) != Some("muse-code/1.0.2") {
+                    return (StatusCode::FOUND, Json(json!({})));
+                }
                 match count.fetch_add(1, Ordering::SeqCst) {
                     0 => (StatusCode::BAD_REQUEST, Json(json!({"error":"authorization_pending"}))),
                     1 => (StatusCode::BAD_REQUEST, Json(json!({"error":"slow_down"}))),
