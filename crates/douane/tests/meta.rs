@@ -8,7 +8,7 @@ async fn native_meta_subscription_is_importable_and_private() {
     assert_eq!(provider.as_str(), "meta");
     assert!(
         provider.reports_quota(),
-        "quotas are observed only from native inference telemetry"
+        "quotas are observed from native subscription telemetry"
     );
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(AccountStore::open(dir.path()).unwrap());
@@ -29,11 +29,11 @@ async fn meta_models_are_discovered_and_routed_per_account() {
     use douane::{settings::Config, state::AppState};
     let app = Router::new()
         .route(
-            "/first/v1/models",
+            "/first/muse-code/models",
             get(|| async { Json(json!({"data":[{"id":"muse-first"},{"id":"filtered"}]})) }),
         )
         .route(
-            "/second/v1/models",
+            "/second/muse-code/models",
             get(|| async { Json(json!({"data":[{"id":"muse-second"}]})) }),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

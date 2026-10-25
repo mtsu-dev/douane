@@ -747,6 +747,22 @@ pub async fn public_models(
         Err(refusal) => error(StatusCode::UNAUTHORIZED, refusal.message()),
     }
 }
+/// The native Muse CLI needs provider metadata and bare ids from Meta only.
+pub async fn muse_models(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    public_models(
+        State(state),
+        headers,
+        Query(Params {
+            provider: Some("meta".into()),
+            ids: Some("upstream".into()),
+            ..Default::default()
+        }),
+    )
+    .await
+}
 /// The management listing of client models: every model, as without keys.
 pub async fn management_models(
     State(state): State<Arc<AppState>>,
@@ -824,7 +840,11 @@ fn public_model(model: &crate::state::Model, upstream: bool) -> Value {
     } else {
         &model.id
     };
-    json!({"id":id,"object":"model","created":0,"owned_by":model.route.as_deref().unwrap_or(model.provider.as_str()),"name":model.name,"label":model.name,"context_length":model.context_length,"context_window":model.context_length,"max_output_tokens":model.max_output_tokens,"thinking":model.thinking,"reasoning_efforts":reasoning_efforts(model.thinking.as_ref()),"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true})
+    let mut value = json!({"id":id,"object":"model","created":0,"owned_by":model.route.as_deref().unwrap_or(model.provider.as_str()),"name":model.name,"label":model.name,"context_length":model.context_length,"context_window":model.context_length,"max_output_tokens":model.max_output_tokens,"thinking":model.thinking,"reasoning_efforts":reasoning_efforts(model.thinking.as_ref()),"supported_endpoint_types":["anthropic","openai","openai-response"],"supports_websockets":true});
+    if let Some(metadata) = &model.metadata {
+        value["metadata"] = metadata.clone();
+    }
+    value
 }
 /// A model's effort levels as the Grok CLI lists them: highest first, `high`
 /// flagged as the default when the model offers it. Null without levels.

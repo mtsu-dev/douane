@@ -402,9 +402,14 @@ impl QuotaService {
         self.failures.write().await.remove(&account.id);
     }
 
-    /// Muse reports subscription use in inference SSE, with no verified
-    /// standalone read endpoint. Never send a synthetic inference to poll it.
+    /// Muse reports subscription use in inference SSE and in key mint replies.
+    /// Never send a synthetic inference to poll it.
     pub(crate) async fn observe_meta_event(&self, id: &str, event: &Value) {
+        self.observe_meta_event_at(id, event, time::OffsetDateTime::now_utc())
+            .await;
+    }
+
+    async fn observe_meta_event_at(&self, id: &str, event: &Value, observed: time::OffsetDateTime) {
         if !super::meta::subscription_event(event) {
             return;
         }
@@ -463,19 +468,29 @@ impl QuotaService {
             account_id: id.into(),
             provider: account.provider,
             windows,
-            updated_at: now(),
+            updated_at: timestamp(observed),
             error: None,
             subscription: account.subscription.clone(),
             credits: vec![],
             verification_required: false,
             verification_available: false,
         };
+        let mut cache = self.cache.write().await;
+        if cache
+            .get(id)
+            .and_then(|q| parse_timestamp(&q.updated_at))
+            .is_some_and(|last| last > observed)
+        {
+            return;
+        }
         if self
             .apply_observation(id, &snapshot, None, &account.updated_at)
             .await
             .is_ok()
         {
-            self.cache.write().await.insert(id.into(), snapshot);
+            cache.insert(id.into(), snapshot);
+            drop(cache);
+            self.failures.write().await.remove(id);
             self.save().await;
         }
     }
@@ -519,6 +534,20 @@ impl QuotaService {
             .await
             .ok_or(SubscriptionError::NotFound)?;
         if account.provider == SubscriptionProvider::Meta {
+            let mut usage = self.oauth.take_meta_usage(id).await;
+            if usage.is_none() && account.dca_token.is_some() {
+                // The native key response includes subs_usage. Renew through
+                // the shared credential lock and persist the key before use.
+                if let Err(error) = self.oauth.force_refresh(id).await {
+                    return self
+                        .complete_refresh(id, &account, Err(error), trigger)
+                        .await;
+                }
+                usage = self.oauth.take_meta_usage(id).await;
+            }
+            if let Some((observed, event)) = usage {
+                self.observe_meta_event_at(id, &event, observed).await;
+            }
             return Ok(self.get(id).await.unwrap_or(QuotaSnapshot {
                 account_id: id.into(),
                 provider: account.provider,
@@ -1631,6 +1660,13 @@ mod tests {
             .unwrap();
         assert_eq!(reserve_kind(&session.id), Some("five-hour"));
         assert_eq!(session.remaining_percent, Some(20.0));
+        let older = parse_timestamp(&snapshot.updated_at).unwrap() - time::Duration::seconds(1);
+        service.observe_meta_event_at(&account.id, &json!({"type":"response.subscription_usage","subscription":{"weekly":{"used_percent":0}}}), older).await;
+        assert_eq!(service.get(&account.id).await.unwrap().windows.len(), 2);
+        assert_eq!(
+            service.get(&account.id).await.unwrap().updated_at,
+            snapshot.updated_at
+        );
         service.observe_meta_event(&account.id,&json!({"type":"response.subscription_usage","subscription":{"window":{"used_percent":10}}})).await;
         let snapshot = service.get(&account.id).await.unwrap();
         assert_eq!(reserve_kind(&snapshot.windows[0].id), None);

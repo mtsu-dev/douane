@@ -411,7 +411,7 @@ pub(crate) async fn choose(
 pub async fn forward(
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let client = match state.clients.authenticate(&headers) {
@@ -430,6 +430,17 @@ pub async fn forward(
         Ok(v) => v,
         Err(_) => return error(StatusCode::BAD_REQUEST, "body must be valid JSON"),
     };
+    if uri.path().starts_with("/muse-code/") {
+        // Native Muse uses bare model ids. Pin this endpoint to its own
+        // subscription even when another provider serves the same model.
+        headers.insert("x-douane-provider", "meta".parse().unwrap());
+        if value["model"]
+            .as_str()
+            .is_some_and(|model| model.contains('/') && !model.starts_with("meta/"))
+        {
+            return error(StatusCode::BAD_REQUEST, "Muse Code requires a Meta model");
+        }
+    }
     let stream = value["stream"].as_bool().unwrap_or(false);
     let (model, candidates, session) = match choose(&state, &value, &headers, client.as_ref()).await
     {

@@ -172,6 +172,9 @@ impl Fixture {
         let upstream = Arc::new(Upstream::default());
         let server = serve(
             Router::new()
+                .route("/muse-code/models", get(|| async { Json(json!({"data":[
+                    {"id":MUSE,"metadata":{"muse-code":{"name":"Muse Spark","family":"avocado","release_date":"2026-09-02","limit":{"context":1007997,"output":128000},"options":{},"variants":{"high":{"reasoningEffort":"high"}}}}}
+                ]})) }))
                 .route(
                     "/v1/models",
                     get(|| async { Json(json!({"data":[{"id":MUSE},{"id":"glm-5.3-flash"}]})) }),
@@ -273,6 +276,125 @@ fn request(kind: &str, stream: bool, follow: bool) -> Value {
             ]) } else { json!([{"role":"user","content":"read the file"}]) },
             "tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}}}]}),
     }
+}
+
+#[tokio::test]
+async fn native_muse_routes_require_a_client_key_and_stay_in_meta() {
+    let fixture = Fixture::new("meta").await;
+    for path in ["models", "responses"] {
+        let url = format!("{}/muse-code/{path}", fixture.gateway.url);
+        let request = if path == "models" {
+            reqwest::Client::new().get(&url)
+        } else {
+            reqwest::Client::new()
+                .post(&url)
+                .json(&request("responses", true, false))
+        };
+        assert_eq!(request.send().await.unwrap().status(), 401, "{path}");
+    }
+    for follow in [false, true] {
+        let mut body = request("responses", true, follow);
+        body["model"] = json!(MUSE);
+        let response = fixture
+            .client
+            .post(format!("{}/muse-code/responses", fixture.gateway.url))
+            .header("session_id", "stable-muse-session")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let text = response.text().await.unwrap();
+        assert!(text.contains("response.completed") && text.contains(TEXT));
+        let sent = fixture
+            .upstream
+            .seen
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(sent.path, "/v1/responses");
+        assert_eq!(sent.body["model"], MUSE);
+        assert_eq!(sent.headers["session_id"], "stable-muse-session");
+        if follow {
+            assert_eq!(sent.body["input"][1], output()[0]);
+        }
+    }
+    let catalogue: Value = fixture
+        .client
+        .get(format!(
+            "{}/muse-code/models?provider=opencode_go",
+            fixture.gateway.url
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalogue["data"].as_array().unwrap().len(), 1);
+    assert_eq!(catalogue["data"][0]["id"], MUSE);
+    assert_eq!(catalogue["data"][0]["owned_by"], "meta");
+    assert_eq!(
+        catalogue["data"][0]["metadata"]["muse-code"]["limit"]["context"],
+        1007997
+    );
+    fixture
+        .state
+        .models
+        .write()
+        .await
+        .iter_mut()
+        .find(|m| m.upstream_id == MUSE)
+        .unwrap()
+        .enabled = false;
+    let catalogue: Value = fixture
+        .client
+        .get(format!("{}/muse-code/models", fixture.gateway.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(catalogue["data"].as_array().unwrap().is_empty());
+    let go = Fixture::new("opencode_go").await;
+    let response = go
+        .client
+        .post(format!("{}/muse-code/responses", go.gateway.url))
+        .json(&request("responses", true, false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        400,
+        "an explicit aggregator prefix cannot escape Meta"
+    );
+    let mut body = request("responses", true, false);
+    body["model"] = json!(MUSE);
+    let response = go
+        .client
+        .post(format!("{}/muse-code/responses", go.gateway.url))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(!response.status().is_success());
+    assert!(go.upstream.seen.lock().unwrap().is_empty());
+    let catalogue: Value = go
+        .client
+        .get(format!("{}/muse-code/models", go.gateway.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(catalogue["data"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

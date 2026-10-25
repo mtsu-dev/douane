@@ -46,7 +46,8 @@ pub(crate) async fn mint(
             .post(endpoint)
             .bearer_auth(dca)
             .header("User-Agent", "muse-code/1.0.2")
-            .json(&json!({"dca_token":dca})),
+            .header("x-api-version", "1.0.0")
+            .json(&json!({"dca_token":dca, "onboard":false})),
     )
     .await?;
     if value["is_subs_active"] != true || value["require_payment"] == true {
