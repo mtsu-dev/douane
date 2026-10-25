@@ -100,7 +100,8 @@ async fn native_stream(
         .unwrap_or_else(|| reply(3));
     let parts = reply["response"]["candidates"][0]["content"]["parts"]
         .as_array()
-        .unwrap();
+        .cloned()
+        .unwrap_or_default();
     let mut data = String::new();
     let sentinels = mock.empty_stream_sentinels.load(Ordering::Relaxed);
     if sentinels {
@@ -120,6 +121,12 @@ async fn native_stream(
             event["response"]["candidates"][0]["content"] = json!({"parts":[{"text":""}]});
         }
         data.push_str(&format!("data: {event}\n\n"));
+    }
+    if let Some(feedback) = reply.pointer("/response/promptFeedback") {
+        data.push_str(&format!(
+            "data: {}\n\n",
+            json!({"response":{"promptFeedback":feedback}})
+        ));
     }
     if let Some(error) = reply.get("tail_error") {
         let event = json!({"response":{"error":error}});
@@ -869,8 +876,8 @@ async fn dynamic_system_reminders_keep_signed_history_in_every_dialect() {
                     );
                 }
             }
-            // Rewriting a reminder that preceded an already signed call must
-            // still refuse the entire request before reaching the provider.
+            // Inline reminders belong to editable client context. Root
+            // instructions remain separately bound to the session scope.
             let key = if kind == "responses" {
                 "input"
             } else {
@@ -884,8 +891,11 @@ async fn dynamic_system_reminders_keep_signed_history_in_every_dialect() {
                 let (status, body) = fixture
                     .post(kind, changed, Some("dynamic-system"), stream)
                     .await;
-                assert_eq!(status, 400, "{kind}, index={index}: {body}");
-                assert_eq!(fixture.mock.received.lock().unwrap().len(), 3);
+                assert_eq!(status, 200, "{kind}, index={index}: {body}");
+                let received = fixture.mock.received.lock().unwrap();
+                let native = &received.last().unwrap()["request"];
+                let instructions = native["systemInstruction"].to_string();
+                assert!(instructions.contains("Changed historical instruction"));
             }
         }
     }
@@ -1232,5 +1242,174 @@ async fn replay_owner_refusals_never_fall_back_to_another_account() {
         assert_eq!(fixture.mock.received.lock().unwrap().len(), 2);
         assert!(alternate.received.lock().unwrap().is_empty());
         task.abort();
+    }
+}
+
+#[tokio::test]
+async fn compacted_suffix_and_native_metadata_follow_the_client_projection_in_every_dialect() {
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            let mut replies = vec![reply(1), reply(2), reply(3)];
+            for response in &mut replies[..2] {
+                let parts = response["response"]["candidates"][0]["content"]["parts"]
+                    .as_array_mut()
+                    .unwrap();
+                parts[2]["synthetic_metadata"] = json!({"never":"visible"});
+                parts[3]["synthetic_metadata"] = json!("opaque native field");
+                parts[3]["functionCall"]["synthetic_metadata"] = json!("opaque call field");
+            }
+            let fixture = Fixture::new("antigravity", replies.clone()).await;
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let (status, body) = fixture
+                    .post(
+                        kind,
+                        request(kind, &ids, "antigravity"),
+                        Some("compaction"),
+                        stream,
+                    )
+                    .await;
+                assert_eq!(status, 200, "{kind}/{stream}: {body}");
+                assert!(!body.contains("synthetic_metadata"));
+                assert!(!body.contains("opaque call field"));
+                ids.push(call_id(kind, &body, stream));
+            }
+            let mut compacted = request(kind, &ids, "antigravity");
+            let key = if kind == "responses" {
+                "input"
+            } else {
+                "messages"
+            };
+            let keep = if kind == "responses" { 3 } else { 2 };
+            let original = compacted[key].as_array().unwrap();
+            let suffix = original[original.len() - keep..].to_vec();
+            let mut messages = Vec::new();
+            if kind == "chat/completions" {
+                messages.push(original[0].clone());
+            }
+            messages.push(json!({"role":"user","content":"Synthetic compact summary"}));
+            messages.push(json!({"role":"system","content":"New inline compact reminder"}));
+            messages.extend(suffix);
+            // Microcompaction is also client-owned: preserve the edited result.
+            let last = messages.last_mut().unwrap();
+            match kind {
+                "messages" => last["content"][0]["content"] = json!("Truncated client tool result"),
+                "responses" => last["output"] = json!("Truncated client tool result"),
+                _ => last["content"] = json!("Truncated client tool result"),
+            }
+            compacted[key] = json!(messages);
+            let (status, body) = fixture
+                .post(kind, compacted, Some("compaction"), stream)
+                .await;
+            assert_eq!(status, 200, "{kind}/{stream}: {body}");
+            assert!(body.contains("DONE"), "{body}");
+            let received = fixture.mock.received.lock().unwrap();
+            let last = &received[2]["request"];
+            assert_eq!(
+                last["contents"][0]["parts"][0]["text"],
+                "Synthetic compact summary"
+            );
+            assert_eq!(
+                last["contents"][1]["parts"],
+                replies[1]["response"]["candidates"][0]["content"]["parts"]
+            );
+            assert!(
+                last["contents"][2]
+                    .to_string()
+                    .contains("Truncated client tool result")
+            );
+            assert!(
+                last["systemInstruction"]
+                    .to_string()
+                    .contains("New inline compact reminder")
+            );
+            assert_eq!(received.len(), 3);
+        }
+    }
+}
+
+#[tokio::test]
+async fn empty_refused_and_truncated_native_completions_have_specific_errors() {
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            for (response, reason) in [
+                (
+                    json!({"response":{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}}),
+                    "no replayable output",
+                ),
+                (
+                    json!({"response":{"candidates":[{"content":{"parts":[{"text":""}]},"finishReason":"STOP"}]}}),
+                    "no replayable output",
+                ),
+                (
+                    json!({"response":{"candidates":[{"content":{"parts":[]},"finishReason":"MAX_TOKENS"}]}}),
+                    "truncated",
+                ),
+                (
+                    json!({"response":{"candidates":[{"content":{"parts":[]},"finishReason":"SAFETY"}]}}),
+                    "SAFETY",
+                ),
+                (
+                    json!({"response":{"candidates":[{"content":{"parts":[{"text":"partial refusal"}]},"finishReason":"SAFETY"}]}}),
+                    "SAFETY",
+                ),
+                (
+                    json!({"response":{"promptFeedback":{"blockReason":"SAFETY"}}}),
+                    "SAFETY",
+                ),
+            ] {
+                let fixture = Fixture::new("antigravity", vec![response]).await;
+                let (status, body) = fixture
+                    .post(
+                        kind,
+                        request(kind, &[], "antigravity"),
+                        Some("terminal-error"),
+                        stream,
+                    )
+                    .await;
+                assert_eq!(
+                    status,
+                    if stream { 200 } else { 502 },
+                    "{kind}/{stream}: {body}"
+                );
+                assert!(
+                    body.contains(reason),
+                    "{kind}/{stream}: expected {reason}: {body}"
+                );
+                assert!(
+                    !body.contains("size limit"),
+                    "an empty/refused completion is not a size error: {body}"
+                );
+                if stream {
+                    assert!(!body.contains("event: message_stop"));
+                    assert!(!body.contains("event: response.completed"));
+                    assert!(!body.contains("data: [DONE]"));
+                }
+                assert_eq!(
+                    fixture.mock.received.lock().unwrap().len(),
+                    1,
+                    "no automatic provider retry"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsupported_native_media_is_never_silently_removed_from_translated_output() {
+    for stream in [false, true] {
+        let native = json!({"response":{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"U1lOVEhFVElD"}}]},"finishReason":"STOP"}]}});
+        let fixture = Fixture::new("antigravity", vec![native]).await;
+        let (status, body) = fixture
+            .post(
+                "messages",
+                request("messages", &[], "antigravity"),
+                Some("native-media"),
+                stream,
+            )
+            .await;
+        assert_eq!(status, if stream { 200 } else { 502 });
+        assert!(body.contains("unsupported media"), "{body}");
+        assert!(!body.contains("event: message_stop"));
     }
 }

@@ -11,6 +11,7 @@ use std::{
 
 const MAX_TURN_BYTES: usize = 256 * 1024;
 type Fingerprint = [u8; 32];
+pub(crate) type TurnId = u128;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Scope {
@@ -21,6 +22,9 @@ pub(crate) struct Scope {
 
 /// A finalized native turn. Deliberately has no Debug or serialization support.
 pub(crate) struct RecordedTurn {
+    id: TurnId,
+    parent: Option<TurnId>,
+    depth: usize,
     scope: Scope,
     context: Fingerprint,
     visible: Fingerprint,
@@ -30,9 +34,44 @@ pub(crate) struct RecordedTurn {
     bytes: usize,
 }
 
+/// Recording failures describe native termination separately from cache capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingFailure {
+    Transport,
+    SizeLimit,
+    InvalidIdentity,
+    MissingCompletion,
+    Empty,
+    Truncated,
+    ProviderRefusal(&'static str),
+    MissingSession,
+}
+
+impl std::fmt::Display for RecordingFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Transport => {
+                "native Gemini history recording was interrupted by a transport or upstream error"
+            }
+            Self::SizeLimit => "signed Gemini history exceeds its native turn size limit",
+            Self::InvalidIdentity => {
+                "native Gemini output has an invalid or duplicate tool identity"
+            }
+            Self::MissingCompletion => "upstream response did not contain a Gemini completion",
+            Self::Empty => "upstream Gemini completion contains no replayable output",
+            Self::Truncated => {
+                "upstream Gemini completion was truncated before producing replayable output"
+            }
+            Self::ProviderRefusal(message) => message,
+            Self::MissingSession => "signed Gemini history requires a stable session identifier",
+        })
+    }
+}
+
 /// Call observe before converting every native event. Call abort on a transport
 /// error or disconnect, and finish only after a clean stream/body completion.
 pub(crate) struct Recorder {
+    parent: Option<TurnId>,
     scope: Scope,
     context: Fingerprint,
     parts: Vec<Value>,
@@ -40,7 +79,8 @@ pub(crate) struct Recorder {
     call_order: Vec<String>,
     parts_bytes: usize,
     terminal: bool,
-    invalid: bool,
+    failure: Option<RecordingFailure>,
+    truncated: bool,
 }
 
 impl Recorder {
@@ -50,6 +90,7 @@ impl Recorder {
             hash_content(&mut context, content);
         }
         Self {
+            parent: None,
             scope,
             context: context.finalize().into(),
             parts: Vec::new(),
@@ -57,8 +98,14 @@ impl Recorder {
             call_order: Vec::new(),
             parts_bytes: 2,
             terminal: false,
-            invalid: false,
+            failure: None,
+            truncated: false,
         }
+    }
+
+    pub(crate) fn with_parent(mut self, parent: Option<TurnId>) -> Self {
+        self.parent = parent;
+        self
     }
 
     pub(crate) fn observe(&mut self, event: &mut Value) {
@@ -79,6 +126,9 @@ impl Recorder {
         if body.get("error").is_some() {
             self.abort();
         }
+        if let Some(message) = crate::translate::gemini_refusal(body) {
+            self.reject(RecordingFailure::ProviderRefusal(message));
+        }
         let Some(candidate) = body
             .get_mut("candidates")
             .and_then(Value::as_array_mut)
@@ -91,6 +141,11 @@ impl Recorder {
             .or_else(|| candidate.get("finish_reason"))
             .and_then(Value::as_str)
             .is_some_and(|reason| !reason.is_empty() && reason != "FINISH_REASON_UNSPECIFIED");
+        self.truncated |= candidate
+            .get("finishReason")
+            .or_else(|| candidate.get("finish_reason"))
+            .and_then(Value::as_str)
+            == Some("MAX_TOKENS");
         if let Some(parts) = candidate
             .get_mut("content")
             .and_then(|content| content.get_mut("parts"))
@@ -106,7 +161,7 @@ impl Recorder {
                     } else {
                         native_id
                     };
-                    if !self.invalid {
+                    if self.failure.is_none() {
                         match id {
                             Some(id) if !id.is_empty() => {
                                 if self
@@ -114,18 +169,18 @@ impl Recorder {
                                     .insert(id.to_owned(), native_id.map(str::to_owned))
                                     .is_some()
                                 {
-                                    self.abort();
+                                    self.reject(RecordingFailure::InvalidIdentity);
                                 } else {
                                     self.call_order.push(id.to_owned());
                                 }
                             }
-                            _ => self.abort(),
+                            _ => self.reject(RecordingFailure::InvalidIdentity),
                         }
                     }
                 }
                 // Record the unmodified provider part before adding the client
                 // identity. Oversized parts are rejected before cloning them.
-                if !self.invalid {
+                if self.failure.is_none() {
                     self.push(part);
                 }
                 // Clients still need usable IDs after an abandoned recording
@@ -153,7 +208,7 @@ impl Recorder {
             // Its key/value are the only new bytes in the assembled object.
             let extra = serialized_size(&key) + serialized_size(&part[key]) + 2;
             if self.parts_bytes.saturating_add(extra) > MAX_TURN_BYTES {
-                self.abort();
+                self.reject(RecordingFailure::SizeLimit);
                 return;
             }
             last[key] = part[key].clone();
@@ -167,7 +222,7 @@ impl Recorder {
         {
             let extra = serialized_size(&part["text"]) - 2;
             if self.parts_bytes.saturating_add(extra) > MAX_TURN_BYTES {
-                self.abort();
+                self.reject(RecordingFailure::SizeLimit);
                 return;
             }
             if let Value::String(text) = &mut last["text"] {
@@ -181,31 +236,49 @@ impl Recorder {
                 .saturating_add(size + usize::from(!self.parts.is_empty()))
                 > MAX_TURN_BYTES
             {
-                self.abort();
+                self.reject(RecordingFailure::SizeLimit);
                 return;
             }
             self.parts_bytes += size + usize::from(!self.parts.is_empty());
             self.parts.push(part.clone());
         }
         if self.parts_bytes > MAX_TURN_BYTES {
-            self.abort();
+            self.reject(RecordingFailure::SizeLimit);
         }
     }
 
     pub(crate) fn abort(&mut self) {
-        self.invalid = true;
+        self.reject(RecordingFailure::Transport);
+    }
+
+    fn reject(&mut self, failure: RecordingFailure) {
+        self.failure.get_or_insert(failure);
         self.parts.clear();
         self.call_ids.clear();
         self.call_order.clear();
     }
 
-    pub(crate) fn finish(self) -> Option<RecordedTurn> {
-        if self.invalid
-            || !self.terminal
-            || self.parts.is_empty()
-            || self.scope.session.trim().is_empty()
-        {
-            return None;
+    pub(crate) fn validate_completion(&self) -> Result<(), RecordingFailure> {
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+        if !self.terminal {
+            return Err(RecordingFailure::MissingCompletion);
+        }
+        if self.parts.is_empty() {
+            return Err(if self.truncated {
+                RecordingFailure::Truncated
+            } else {
+                RecordingFailure::Empty
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<RecordedTurn, RecordingFailure> {
+        self.validate_completion()?;
+        if self.scope.session.trim().is_empty() {
+            return Err(RecordingFailure::MissingSession);
         }
         // Match the client's IDs without retaining a second copy of native
         // reasoning. Only this temporary visible projection uses client IDs.
@@ -231,9 +304,15 @@ impl Recorder {
             + self.call_ids.capacity() * 2 * (std::mem::size_of::<(String, Option<String>)>() + 1)
             // Reserve conservative space for the index's key, bucket slack and
             // allocation metadata, including the first small HashMap allocation.
-            + 4 * std::mem::size_of::<((Fingerprint, Fingerprint), RecordedTurn)>()
-            + 128;
-        Some(RecordedTurn {
+            + 4 * std::mem::size_of::<(TurnId, RecordedTurn)>()
+            + 4 * std::mem::size_of::<((Fingerprint, Fingerprint), Vec<TurnId>)>()
+            + 4 * std::mem::size_of::<(Fingerprint, Vec<TurnId>)>()
+            + 8 * std::mem::size_of::<TurnId>()
+            + 384;
+        Ok(RecordedTurn {
+            id: rand::random(),
+            parent: self.parent,
+            depth: 0,
             scope: self.scope,
             context: self.context,
             visible,
@@ -245,10 +324,47 @@ impl Recorder {
 }
 
 struct Conversation {
-    turns: HashMap<(Fingerprint, Fingerprint), RecordedTurn>,
+    turns: HashMap<TurnId, RecordedTurn>,
+    contexts: HashMap<(Fingerprint, Fingerprint), Vec<TurnId>>,
+    visible: HashMap<Fingerprint, Vec<TurnId>>,
     last_used: Instant,
     bytes: usize,
     in_flight: usize,
+}
+
+impl Conversation {
+    fn candidate(
+        &self,
+        context: Fingerprint,
+        visible: Fingerprint,
+    ) -> Result<Option<&RecordedTurn>, String> {
+        let ids = self
+            .contexts
+            .get(&(context, visible))
+            .or_else(|| self.visible.get(&visible));
+        match ids.map(Vec::as_slice) {
+            None => Ok(None),
+            Some([id]) => Ok(self.turns.get(id)),
+            Some(_) => Err("signed Gemini history has ambiguous native turn identity; start a new conversation".into()),
+        }
+    }
+
+    fn follows(&self, previous: TurnId, next: &RecordedTurn) -> bool {
+        let Some(previous) = self.turns.get(&previous) else {
+            return false;
+        };
+        if next.depth <= previous.depth {
+            return false;
+        }
+        let mut cursor = next;
+        while cursor.depth > previous.depth {
+            let Some(parent) = cursor.parent.and_then(|id| self.turns.get(&id)) else {
+                return false;
+            };
+            cursor = parent;
+        }
+        cursor.id == previous.id
+    }
 }
 
 pub(crate) struct ReplayCache {
@@ -280,22 +396,49 @@ impl ReplayCache {
         self.record_at(turn, Instant::now())
     }
 
-    fn record_at(&mut self, turn: RecordedTurn, now: Instant) -> bool {
+    fn record_at(&mut self, mut turn: RecordedTurn, now: Instant) -> bool {
         self.prune(now);
         if turn.scope.session.trim().is_empty()
             || serialized_size(&turn.parts) > self.max_turn_bytes
         {
             return false;
         }
-        let key = (turn.context, turn.visible);
         let conversation = self.conversations.get(&turn.scope);
-        let previous = conversation
-            .and_then(|conversation| conversation.turns.get(&key))
-            .map_or(0, |turn| turn.bytes);
+        if conversation.is_some_and(|conversation| conversation.turns.contains_key(&turn.id)) {
+            return false;
+        }
+        if let Some(parent) = turn.parent {
+            let Some(parent) =
+                conversation.and_then(|conversation| conversation.turns.get(&parent))
+            else {
+                return false;
+            };
+            let Some(depth) = parent.depth.checked_add(1) else {
+                return false;
+            };
+            turn.depth = depth;
+        }
+        let key = (turn.context, turn.visible);
+        // Identical completions may be retried; keep their existing immutable
+        // identity. Different native generations never replace a referenced node.
+        let duplicate = conversation
+            .and_then(|conversation| {
+                conversation.contexts.get(&key).map(|ids| {
+                    ids.iter().any(|id| {
+                        let old = &conversation.turns[id];
+                        old.parent == turn.parent
+                            && old.parts == turn.parts
+                            && old.call_ids == turn.call_ids
+                    })
+                })
+            })
+            .unwrap_or(false);
+        if duplicate {
+            self.conversations.get_mut(&turn.scope).unwrap().last_used = now;
+            return true;
+        }
         let overhead = conversation.map_or_else(|| conversation_bytes(&turn.scope), |_| 0);
-        let additional = turn.bytes.saturating_add(overhead).saturating_sub(previous);
-        // Never evict part of the conversation being extended. If the complete
-        // history cannot fit, refuse this completion and retain the old state.
+        let additional = turn.bytes.saturating_add(overhead);
         if !self.make_room(&turn.scope, additional) {
             return false;
         }
@@ -304,26 +447,36 @@ impl ReplayCache {
             .entry(turn.scope.clone())
             .or_insert_with(|| Conversation {
                 turns: HashMap::new(),
+                contexts: HashMap::new(),
+                visible: HashMap::new(),
                 last_used: now,
                 bytes: overhead,
                 in_flight: 0,
             });
-        conversation.bytes = conversation.bytes + turn.bytes - previous;
-        self.bytes = self.bytes + overhead + turn.bytes - previous;
-        conversation.turns.insert(key, turn);
-        // A generation can outlast the idle TTL while pinned. Its successful
-        // completion starts a fresh idle period; refused recordings never do.
+        conversation.bytes += turn.bytes;
+        self.bytes += overhead + turn.bytes;
+        conversation.contexts.entry(key).or_default().push(turn.id);
+        conversation
+            .visible
+            .entry(turn.visible)
+            .or_default()
+            .push(turn.id);
+        conversation.turns.insert(turn.id, turn);
         conversation.last_used = now;
         true
     }
 
     /// Pin a fully validated conversation until the upstream call ends. Other
     /// sessions cannot evict its prefix while its next turn is being produced.
-    pub(crate) fn begin(&mut self, scope: &Scope, request: &mut Value) -> Result<(), String> {
+    pub(crate) fn begin(
+        &mut self,
+        scope: &Scope,
+        request: &mut Value,
+    ) -> Result<Option<TurnId>, String> {
         let now = Instant::now();
-        self.restore_at(scope, request, now)?;
+        let parent = self.restore_at(scope, request, now)?;
         if scope.session.trim().is_empty() {
-            return Ok(());
+            return Ok(parent);
         }
         if !self.conversations.contains_key(scope) {
             let bytes = conversation_bytes(scope);
@@ -336,6 +489,8 @@ impl ReplayCache {
                 scope.clone(),
                 Conversation {
                     turns: HashMap::new(),
+                    contexts: HashMap::new(),
+                    visible: HashMap::new(),
                     last_used: now,
                     bytes,
                     in_flight: 0,
@@ -344,7 +499,7 @@ impl ReplayCache {
             self.bytes += bytes;
         }
         self.conversations.get_mut(scope).unwrap().in_flight += 1;
-        Ok(())
+        Ok(parent)
     }
 
     pub(crate) fn release(&mut self, scope: &Scope) {
@@ -360,7 +515,7 @@ impl ReplayCache {
     /// its TTL. Missing text turns require native replay just like tool turns.
     #[cfg(test)]
     pub(crate) fn restore(&mut self, scope: &Scope, request: &mut Value) -> Result<(), String> {
-        self.restore_at(scope, request, Instant::now())
+        self.restore_at(scope, request, Instant::now()).map(|_| ())
     }
 
     pub(crate) fn has_session(&self, model: &str, session: &str) -> bool {
@@ -412,16 +567,15 @@ impl ReplayCache {
             hash_content(&mut context, content);
         }
         let Some(key) = first else { return Ok(None) };
-        let scopes: Vec<_> = self
-            .conversations
-            .iter()
-            .filter(|(scope, conversation)| {
-                scope.model == model
-                    && scope.session == session
-                    && conversation.turns.contains_key(&key)
-            })
-            .map(|(scope, _)| scope.clone())
-            .collect();
+        let mut scopes = Vec::new();
+        for (scope, conversation) in &self.conversations {
+            if scope.model == model
+                && scope.session == session
+                && conversation.candidate(key.0, key.1)?.is_some()
+            {
+                scopes.push(scope.clone());
+            }
+        }
         if scopes.len() > 1 {
             return Err(
                 "signed Gemini history has ambiguous account ownership; start a new conversation"
@@ -440,7 +594,7 @@ impl ReplayCache {
         scope: &Scope,
         request: &mut Value,
         now: Instant,
-    ) -> Result<(), String> {
+    ) -> Result<Option<TurnId>, String> {
         self.restore_with_touch(scope, request, now, true)
     }
 
@@ -450,7 +604,7 @@ impl ReplayCache {
         request: &mut Value,
         now: Instant,
         touch: bool,
-    ) -> Result<(), String> {
+    ) -> Result<Option<TurnId>, String> {
         self.prune(now);
         let path = if request.get("contents").is_some() {
             "/contents"
@@ -465,6 +619,8 @@ impl ReplayCache {
         let mut replacements = Vec::new();
         let mut native_ids = HashMap::new();
         let mut response_ids = Vec::new();
+        let mut previous = None;
+        let mut unknown_native = false;
         for (index, content) in contents.iter().enumerate() {
             if content.get("role").and_then(Value::as_str) == Some("model") {
                 let parts = content
@@ -473,11 +629,24 @@ impl ReplayCache {
                     .ok_or("expected model parts array for signed-history replay")?;
                 let current_context: Fingerprint = context.clone().finalize().into();
                 let visible = fingerprint(&model_visible_parts(parts));
-                let hit = self
-                    .conversations
-                    .get(scope)
-                    .and_then(|conversation| conversation.turns.get(&(current_context, visible)));
+                let conversation = self.conversations.get(scope);
+                let hit = match conversation {
+                    Some(conversation) => conversation.candidate(current_context, visible)?,
+                    None => None,
+                };
                 if let Some(turn) = hit {
+                    if unknown_native {
+                        return Err("signed Gemini history cannot mix recorded and unrecorded native lineages".into());
+                    }
+                    if let Some(previous) = previous {
+                        if !conversation.unwrap().follows(previous, turn) {
+                            return Err(
+                                "signed Gemini history does not follow one ordered native lineage"
+                                    .into(),
+                            );
+                        }
+                    }
+                    previous = Some(turn.id);
                     replacements.push((index, turn.parts.clone()));
                     native_ids.extend(
                         turn.call_ids
@@ -485,6 +654,12 @@ impl ReplayCache {
                             .map(|(client, native)| (client.as_str(), native.as_deref())),
                     );
                 } else {
+                    // Legacy native signed history may pass unchanged, but it
+                    // cannot create a bridge between recorded branches.
+                    if previous.is_some() {
+                        return Err("signed Gemini history cannot mix recorded and unrecorded native lineages".into());
+                    }
+                    unknown_native = true;
                     let ids = parts.iter().filter_map(|part| {
                         part.pointer("/functionCall/id").and_then(Value::as_str)
                     });
@@ -550,7 +725,7 @@ impl ReplayCache {
                 conversation.last_used = now;
             }
         }
-        Ok(())
+        Ok(previous)
     }
 
     fn prune(&mut self, now: Instant) {
@@ -725,25 +900,32 @@ fn visible_parts(parts: &[Value]) -> Value {
 /// list. Match that projection while keeping the original native ordering in
 /// RecordedTurn. User parts retain their order in the preceding-history hash.
 fn model_visible_parts(parts: &[Value]) -> Value {
-    let Value::Array(parts) = visible_parts(parts) else {
-        unreachable!("visible parts are always an array");
-    };
     let mut text = String::new();
-    let mut other_parts = Vec::new();
-    for mut part in parts {
-        if let Some(delta) = part.get("text").and_then(Value::as_str) {
-            text.push_str(delta);
-            part.as_object_mut().unwrap().remove("text");
-            if part.as_object().unwrap().is_empty() {
-                continue;
+    let mut calls = Vec::new();
+    for part in parts {
+        // This is the translated wire projection, not a filtered native part.
+        if part["thought"] != true {
+            if let Some(delta) = part.get("text").and_then(Value::as_str) {
+                text.push_str(delta);
             }
         }
-        other_parts.push(part);
+        if let Some(call) = part.get("functionCall") {
+            calls.push(serde_json::json!({"functionCall":{
+                "id":call.get("id").cloned().unwrap_or(Value::Null),
+                "name":call["name"],"args":call["args"]
+            }}));
+        }
+        // Unsupported media must never become an invisible replay identity.
+        for field in ["inlineData", "fileData"] {
+            if let Some(value) = part.get(field) {
+                calls.push(serde_json::json!({(field):value}));
+            }
+        }
     }
     if !text.is_empty() {
-        other_parts.insert(0, serde_json::json!({"text":text}));
+        calls.insert(0, serde_json::json!({"text":text}));
     }
-    Value::Array(other_parts)
+    Value::Array(calls)
 }
 
 fn canonical(value: &Value) -> Value {

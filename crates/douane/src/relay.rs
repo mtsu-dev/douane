@@ -649,7 +649,7 @@ pub async fn forward(
                 account: account.id.clone(),
                 model: model.clone(),
                 // Bind the root instructions to the session. Inline instructions
-                // are validated at their historical positions in the replay hash.
+                // remain client-owned context and may change during compaction.
                 session: session
                     .as_ref()
                     .map(|session| replay_session(session, &history))
@@ -658,18 +658,19 @@ pub async fn forward(
             // Future context identity follows the client projection, whose
             // tool IDs differ from the original provider IDs restored below.
             let client_contents = history["contents"].as_array().cloned().unwrap_or_default();
-            if let Err(e) = state
+            let parent = match state
                 .antigravity_replay
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .begin(&scope, &mut history)
             {
-                return error(StatusCode::BAD_REQUEST, &e);
-            }
+                Ok(parent) => parent,
+                Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+            };
             let native_replay = NativeReplay {
                 state: state.clone(),
                 scope: scope.clone(),
-                recorder: Some(Recorder::new(scope, client_contents)),
+                recorder: Some(Recorder::new(scope, client_contents).with_parent(parent)),
                 terminal_output: None,
             };
             // Only model parts cross from the chronological cache projection
@@ -1048,6 +1049,12 @@ pub async fn forward(
                 replay.observe(&mut result);
             }
         }
+        if to == Dialect::Gemini {
+            if let Some(message) = translate::gemini_refusal(&result) {
+                call.fail(message);
+                return error(StatusCode::BAD_GATEWAY, message);
+            }
+        }
         if to == Dialect::Gemini && !gemini_finished(&result) {
             call.fail("upstream response did not contain a Gemini completion");
             return error(
@@ -1111,15 +1118,23 @@ impl NativeReplay {
         }
     }
     fn commit(&mut self) -> Result<(), String> {
+        self.recorder
+            .as_ref()
+            .ok_or("native Gemini history recording was already finalized")?
+            .validate_completion()
+            .map_err(|failure| failure.to_string())?;
         // Anonymous first calls retain their existing behavior; subsequent
         // unsigned history requires a stable session and fails at restore.
         if self.scope.session.trim().is_empty() {
             self.recorder.take();
             return Ok(());
         }
-        let turn = self.recorder.take().and_then(Recorder::finish).ok_or(
-            "signed Gemini history could not be recorded completely within its size limit",
-        )?;
+        let turn = self
+            .recorder
+            .take()
+            .ok_or("native Gemini history recording was already finalized")?
+            .finish()
+            .map_err(|failure| failure.to_string())?;
         if !self
             .state
             .antigravity_replay
@@ -1462,6 +1477,9 @@ impl Collected {
         }
         if to == Dialect::Gemini {
             let body = frame.get("response").unwrap_or(frame);
+            if let Some(message) = translate::gemini_refusal(body) {
+                return Err(message.into());
+            }
             if body.get("error").is_some() {
                 return Err("upstream reported a stream error".into());
             }
