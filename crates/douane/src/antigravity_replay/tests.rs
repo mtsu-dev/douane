@@ -579,3 +579,37 @@ fn model_wire_projection_does_not_normalize_user_image_and_text_order() {
     assert!(cache.restore(&scope(), &mut changed).is_err());
     assert_eq!(changed, original);
 }
+
+#[test]
+fn a_conversation_loses_its_first_signature_at_the_global_turn_limit() {
+    let mut cache = ReplayCache::default();
+    let mut history = request();
+    for turn in 0..=129 {
+        // Clients only retain visible parts; restoration must not accidentally
+        // leave opaque signatures in the next simulated client request.
+        let mut outgoing = history.clone();
+        let restored = cache.restore(&scope(), &mut outgoing);
+        if turn == 129 {
+            assert!(
+                restored.is_err(),
+                "the bounded cache cannot retain an unbounded conversation"
+            );
+            return;
+        }
+        restored.unwrap();
+        let id = format!("long_{turn}");
+        store(
+            &mut cache,
+            scope(),
+            &outgoing,
+            json!([signed_call(&id, turn)]),
+        );
+        append(&mut history, "model", json!([unsigned_call(&id, turn)]));
+        append(
+            &mut history,
+            "user",
+            json!([{"functionResponse":{"id":id,"name":"synthetic_tool","response":{"result":"ok"}}}]),
+        );
+    }
+    unreachable!();
+}

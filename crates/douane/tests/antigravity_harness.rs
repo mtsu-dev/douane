@@ -598,3 +598,101 @@ async fn other_google_routes_preserve_the_harness_system_text() {
     assert!(text.contains("You are Codex"));
     assert!(text.contains("billing-header"));
 }
+
+// Claude Code puts its environment and token reminders inside messages, even
+// though the root system prompt remains unchanged between requests.
+fn with_system_reminders(kind: &str, calls: &[String]) -> Value {
+    let mut body = request(kind, calls, "antigravity");
+    let key = if kind == "responses" {
+        "input"
+    } else {
+        "messages"
+    };
+    let history = body[key].as_array_mut().unwrap();
+    let first = if kind == "chat/completions" { 2 } else { 1 };
+    let environment = "Synthetic environment: preserve this instruction.";
+    let content = if calls.is_empty() {
+        json!([{"type":if kind == "responses" {"input_text"} else {"text"},"text":environment,"cache_control":{"type":"ephemeral"}}])
+    } else {
+        json!(environment)
+    };
+    history.insert(first, json!({"role":"system","content":content}));
+    let stride = if kind == "responses" { 3 } else { 2 };
+    for turn in 0..calls.len() {
+        let index = first + 1 + (turn + 1) * stride + turn;
+        history.insert(
+            index,
+            json!({"role":"system","content":format!("Synthetic token reminder {}", turn + 1)}),
+        );
+    }
+    body
+}
+
+#[tokio::test]
+async fn dynamic_system_reminders_keep_signed_history_in_every_dialect() {
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            let fixture = Fixture::new("antigravity", vec![reply(1), reply(2), reply(3)]).await;
+            let mut ids = Vec::new();
+            for turn in 0..3 {
+                let (status, body) = fixture
+                    .post(
+                        kind,
+                        with_system_reminders(kind, &ids),
+                        Some("dynamic-system"),
+                        stream,
+                    )
+                    .await;
+                assert_eq!(status, 200, "{kind}, stream={stream}, turn={turn}: {body}");
+                if turn < 2 {
+                    ids.push(call_id(kind, &body, stream));
+                }
+            }
+            {
+                let received = fixture.mock.received.lock().unwrap();
+                let last = &received[2]["request"];
+                let system = last["systemInstruction"]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["text"].as_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(system.contains("Synthetic environment: preserve this instruction."));
+                assert!(system.contains("Synthetic token reminder 1"));
+                assert!(system.contains("Synthetic token reminder 2"));
+                assert!(
+                    last["contents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|c| c["role"] != "system")
+                );
+                for turn in 0..2 {
+                    assert_eq!(
+                        last["contents"][1 + turn * 2]["parts"][3]["thoughtSignature"],
+                        format!("SYNTHETIC_CALL_{}", turn + 1)
+                    );
+                }
+            }
+            // Rewriting a reminder that preceded an already signed call must
+            // still refuse the entire request before reaching the provider.
+            let key = if kind == "responses" {
+                "input"
+            } else {
+                "messages"
+            };
+            let first = if kind == "chat/completions" { 2 } else { 1 };
+            let stride = if kind == "responses" { 3 } else { 2 };
+            for index in [first, first + 1 + stride] {
+                let mut changed = with_system_reminders(kind, &ids);
+                changed[key][index]["content"] = json!("Changed historical instruction");
+                let (status, body) = fixture
+                    .post(kind, changed, Some("dynamic-system"), stream)
+                    .await;
+                assert_eq!(status, 400, "{kind}, index={index}: {body}");
+                assert_eq!(fixture.mock.received.lock().unwrap().len(), 3);
+            }
+        }
+    }
+}

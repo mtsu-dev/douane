@@ -15,7 +15,28 @@ pub fn request(body: &Value, from: Dialect, to: Dialect) -> Result<Value, String
     if from == to {
         return Ok(body.clone());
     }
-    let chat = match from {
+    let chat = request_to_chat(body, from)?;
+    match to {
+        Dialect::Chat => Ok(chat),
+        Dialect::Messages => chat_to_messages(&chat),
+        Dialect::Responses => chat_to_responses(&chat),
+        Dialect::Gemini => chat_to_gemini(&chat, false),
+    }
+}
+
+/// The provider still receives every instruction in systemInstruction. Cache
+/// identity also needs their original positions: an appended reminder must not
+/// retroactively invalidate a signature, but editing an earlier one must.
+/// This projection stays in memory and is never sent upstream.
+pub(crate) fn antigravity_history(body: &Value, from: Dialect) -> Result<Value, String> {
+    if from == Dialect::Gemini {
+        return Ok(body.clone());
+    }
+    chat_to_gemini(&request_to_chat(body, from)?, true)
+}
+
+fn request_to_chat(body: &Value, from: Dialect) -> Result<Value, String> {
+    Ok(match from {
         Dialect::Chat => body.clone(),
         Dialect::Messages => serde_json::from_slice(
             &crate::wire::request_to_openai(
@@ -29,13 +50,7 @@ pub fn request(body: &Value, from: Dialect, to: Dialect) -> Result<Value, String
         Dialect::Gemini => {
             return Err("native Gemini input is not supported on this endpoint".into());
         }
-    };
-    match to {
-        Dialect::Chat => Ok(chat),
-        Dialect::Messages => chat_to_messages(&chat),
-        Dialect::Responses => chat_to_responses(&chat),
-        Dialect::Gemini => chat_to_gemini(&chat),
-    }
+    })
 }
 
 /// Claude Code opens its system prompt with an `x-anthropic-billing-header:`
@@ -401,9 +416,10 @@ fn chat_to_messages(body: &Value) -> Result<Value, String> {
     Ok(out)
 }
 
-fn chat_to_gemini(body: &Value) -> Result<Value, String> {
+fn chat_to_gemini(body: &Value, chronological_systems: bool) -> Result<Value, String> {
     let mut contents: Vec<Value> = vec![];
     let mut system = vec![];
+    let mut in_history = false;
     let mut call_names = BTreeMap::new();
     for m in body["messages"]
         .as_array()
@@ -411,9 +427,15 @@ fn chat_to_gemini(body: &Value) -> Result<Value, String> {
     {
         let role = m["role"].as_str().unwrap_or("user");
         if matches!(role, "system" | "developer") {
-            system.push(json!({"text":text(&m["content"])}));
+            let part = json!({"text":text(&m["content"])});
+            if chronological_systems && in_history {
+                contents.push(json!({"role":role,"parts":[part]}));
+            } else {
+                system.push(part);
+            }
             continue;
         }
+        in_history = true;
         let mut parts = vec![];
         if role == "tool" {
             let id = m["tool_call_id"].as_str().unwrap_or("");

@@ -510,6 +510,11 @@ pub async fn forward(
         };
         let mut replay = if account.provider == SubscriptionProvider::Antigravity {
             crate::antigravity_system::normalize_system(&mut translated);
+            let mut history = match translate::antigravity_history(&value, from) {
+                Ok(history) => history,
+                Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+            };
+            crate::antigravity_system::normalize_system(&mut history);
             let (capabilities, output_limit) = state
                 .models
                 .read()
@@ -538,13 +543,13 @@ pub async fn forward(
             let scope = Scope {
                 account: account.id.clone(),
                 model: model.clone(),
-                // Billing metadata has already been removed. A different system
-                // prompt must not inherit hidden parts from an earlier prompt.
+                // Bind the root instructions to the session. Inline instructions
+                // are validated at their historical positions in the replay hash.
                 session: session
                     .as_ref()
                     .map(|session| {
-                        let system = serde_json::to_vec(&translated["systemInstruction"])
-                            .unwrap_or_default();
+                        let system =
+                            serde_json::to_vec(&history["systemInstruction"]).unwrap_or_default();
                         format!("{session}:{}", hex::encode(Sha256::digest(system)))
                     })
                     .unwrap_or_default(),
@@ -553,18 +558,42 @@ pub async fn forward(
                 .antigravity_replay
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .restore(&scope, &mut translated)
+                .restore(&scope, &mut history)
             {
                 return error(StatusCode::BAD_REQUEST, &e);
+            }
+            // Only model parts cross from the chronological cache projection
+            // into the provider request. Instructions retain their system role.
+            let mut restored_models = history["contents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|content| content["role"] == "model");
+            if let Some(contents) = translated["contents"].as_array_mut() {
+                for content in contents
+                    .iter_mut()
+                    .filter(|content| content["role"] == "model")
+                {
+                    let Some(restored) = restored_models.next() else {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "signed-history model projection does not match native contents",
+                        );
+                    };
+                    content["parts"] = restored["parts"].clone();
+                }
+            }
+            if restored_models.next().is_some() {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "signed-history model projection does not match native contents",
+                );
             }
             Some(NativeReplay {
                 state: state.clone(),
                 recorder: Some(Recorder::new(
                     scope,
-                    translated["contents"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default(),
+                    history["contents"].as_array().cloned().unwrap_or_default(),
                 )),
             })
         } else {
