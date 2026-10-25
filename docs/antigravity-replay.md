@@ -1,0 +1,53 @@
+# Antigravity signed history
+
+Translated clients return visible assistant text and tool calls. They do not
+retain every native thought, signature or part boundary. Douane records those
+native parts in memory and restores them before forwarding the next request.
+
+Replay requires the same account, model, session, root instructions, preceding
+history and visible output. Inline system and developer reminders remain at
+their historical positions in a private validation projection. The provider
+still receives their complete text in `systemInstruction`. Appending a reminder
+does not invalidate earlier turns; editing a reminder preceding a recorded turn
+does invalidate that turn.
+
+## Retention
+
+The cache retains whole scopes rather than independently expiring individual
+turns. Each scope indexes turns by preceding context and visible output.
+The memory budget remains 8 MiB, including conservative allocation/index
+overhead, and each native turn remains limited to 256 KiB of serialized parts.
+There is no independent turn-count limit.
+
+A fully validated restore or successfully recorded native completion renews the
+scope's one-hour idle TTL. A generation that outlasts the TTL while pinned
+therefore remains replayable after completion. A failed restore, changed session
+or refused recording does not renew an existing scope. Capacity pressure evicts
+whole idle scopes in least-recently-used order.
+Active upstream calls pin their scope, including concurrent calls in the same
+scope, until completion or cancellation. An extension that cannot fit alongside
+its own prefix fails without deleting that prefix. If pinned scopes occupy the
+available budget, new scopes or responses fail explicitly.
+
+JSON responses report a replay recording failure as HTTP 502. Translated SSE
+responses report an error event and withhold the successful completion event
+until recording succeeds. Missing unsigned text history is rejected locally,
+just like missing unsigned tool history, before contacting the provider.
+
+The cache is process-local. A restart, idle expiry or whole-scope eviction can
+require a new conversation. No private reasoning is persisted, added to client
+payloads or written to diagnostics. This change does not provide durable replay
+or change client compaction settings.
+
+## Offline checks
+
+```sh
+cargo test -p douane --lib antigravity_replay::tests --locked --jobs 2
+cargo test -p douane --test antigravity_harness --locked --jobs 2
+```
+
+The cache tests cover two interleaved 160-turn conversations, atomic eviction,
+sliding expiry, rejected restores, concurrent pins and capacity refusal. The
+public HTTP harness covers tool cycles and text correction with dynamic system
+reminders across Messages, Chat and Responses over JSON and SSE, including
+recording failures before successful completion.

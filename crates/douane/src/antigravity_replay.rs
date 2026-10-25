@@ -4,7 +4,7 @@
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{self, Write},
     time::{Duration, Instant},
 };
@@ -12,7 +12,7 @@ use std::{
 const MAX_TURN_BYTES: usize = 256 * 1024;
 type Fingerprint = [u8; 32];
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Scope {
     pub(crate) account: String,
     pub(crate) model: String,
@@ -180,7 +180,9 @@ impl Recorder {
                 .iter()
                 .map(|id| id.capacity() + 64)
                 .sum::<usize>()
-            + std::mem::size_of::<RecordedTurn>()
+            // Reserve conservative space for the index's key, bucket slack and
+            // allocation metadata, including the first small HashMap allocation.
+            + 4 * std::mem::size_of::<((Fingerprint, Fingerprint), RecordedTurn)>()
             + 128;
         Some(RecordedTurn {
             scope: self.scope,
@@ -193,87 +195,132 @@ impl Recorder {
     }
 }
 
-struct Entry {
-    turn: RecordedTurn,
-    recorded_at: Instant,
+struct Conversation {
+    turns: HashMap<(Fingerprint, Fingerprint), RecordedTurn>,
+    last_used: Instant,
+    bytes: usize,
+    in_flight: usize,
 }
 
 pub(crate) struct ReplayCache {
-    entries: VecDeque<Entry>,
+    conversations: BTreeMap<Scope, Conversation>,
     bytes: usize,
     max_bytes: usize,
     max_turn_bytes: usize,
-    max_turns: usize,
     ttl: Duration,
 }
 
 impl Default for ReplayCache {
     fn default() -> Self {
-        Self::with_limits(
-            8 * 1024 * 1024,
-            MAX_TURN_BYTES,
-            128,
-            Duration::from_secs(3600),
-        )
+        Self::with_limits(8 * 1024 * 1024, MAX_TURN_BYTES, Duration::from_secs(3600))
     }
 }
 
 impl ReplayCache {
-    pub(crate) fn with_limits(
-        max_bytes: usize,
-        max_turn_bytes: usize,
-        max_turns: usize,
-        ttl: Duration,
-    ) -> Self {
+    pub(crate) fn with_limits(max_bytes: usize, max_turn_bytes: usize, ttl: Duration) -> Self {
         Self {
-            entries: VecDeque::new(),
+            conversations: BTreeMap::new(),
             bytes: 0,
             max_bytes,
             max_turn_bytes,
-            max_turns,
             ttl,
         }
     }
 
     pub(crate) fn record(&mut self, turn: RecordedTurn) -> bool {
-        self.prune(Instant::now());
-        let native_size = serialized_size(&turn.parts);
+        self.record_at(turn, Instant::now())
+    }
+
+    fn record_at(&mut self, turn: RecordedTurn, now: Instant) -> bool {
+        self.prune(now);
         if turn.scope.session.trim().is_empty()
-            || self.max_turns == 0
-            || native_size > self.max_turn_bytes
-            || turn.bytes > self.max_bytes
+            || serialized_size(&turn.parts) > self.max_turn_bytes
         {
             return false;
         }
-        // A retry at the same context replaces its previous signatures rather
-        // than accumulating ambiguous alternative entries.
-        if let Some(index) = self.entries.iter().position(|entry| {
-            entry.turn.scope == turn.scope
-                && entry.turn.context == turn.context
-                && entry.turn.visible == turn.visible
-        }) {
-            let old = self.entries.remove(index).unwrap();
-            self.bytes -= old.turn.bytes;
+        let key = (turn.context, turn.visible);
+        let conversation = self.conversations.get(&turn.scope);
+        let previous = conversation
+            .and_then(|conversation| conversation.turns.get(&key))
+            .map_or(0, |turn| turn.bytes);
+        let overhead = conversation.map_or_else(|| conversation_bytes(&turn.scope), |_| 0);
+        let additional = turn.bytes.saturating_add(overhead).saturating_sub(previous);
+        // Never evict part of the conversation being extended. If the complete
+        // history cannot fit, refuse this completion and retain the old state.
+        if !self.make_room(&turn.scope, additional) {
+            return false;
         }
-        while !self.entries.is_empty()
-            && (self.entries.len() >= self.max_turns
-                || self.bytes.saturating_add(turn.bytes) > self.max_bytes)
-        {
-            self.remove_oldest();
-        }
-        self.bytes += turn.bytes;
-        self.entries.push_back(Entry {
-            turn,
-            recorded_at: Instant::now(),
-        });
+        let conversation = self
+            .conversations
+            .entry(turn.scope.clone())
+            .or_insert_with(|| Conversation {
+                turns: HashMap::new(),
+                last_used: now,
+                bytes: overhead,
+                in_flight: 0,
+            });
+        conversation.bytes = conversation.bytes + turn.bytes - previous;
+        self.bytes = self.bytes + overhead + turn.bytes - previous;
+        conversation.turns.insert(key, turn);
+        // A generation can outlast the idle TTL while pinned. Its successful
+        // completion starts a fresh idle period; refused recordings never do.
+        conversation.last_used = now;
         true
     }
 
-    /// Validate the complete visible history before changing any parts. Calls
-    /// without replayable signatures fail locally, including expired/missing
-    /// turns. A stable session is required for all cache access.
+    /// Pin a fully validated conversation until the upstream call ends. Other
+    /// sessions cannot evict its prefix while its next turn is being produced.
+    pub(crate) fn begin(&mut self, scope: &Scope, request: &mut Value) -> Result<(), String> {
+        let now = Instant::now();
+        self.restore_at(scope, request, now)?;
+        if scope.session.trim().is_empty() {
+            return Ok(());
+        }
+        if !self.conversations.contains_key(scope) {
+            let bytes = conversation_bytes(scope);
+            if !self.make_room(scope, bytes) {
+                return Err(
+                    "signed Gemini history cache has no capacity for this conversation".into(),
+                );
+            }
+            self.conversations.insert(
+                scope.clone(),
+                Conversation {
+                    turns: HashMap::new(),
+                    last_used: now,
+                    bytes,
+                    in_flight: 0,
+                },
+            );
+            self.bytes += bytes;
+        }
+        self.conversations.get_mut(scope).unwrap().in_flight += 1;
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self, scope: &Scope) {
+        if let Some(conversation) = self.conversations.get_mut(scope) {
+            conversation.in_flight = conversation.in_flight.saturating_sub(1);
+            if conversation.in_flight == 0 && conversation.turns.is_empty() {
+                self.remove(scope);
+            }
+        }
+    }
+
+    /// Validate the complete history before replacing any parts or renewing
+    /// its TTL. Missing text turns require native replay just like tool turns.
+    #[cfg(test)]
     pub(crate) fn restore(&mut self, scope: &Scope, request: &mut Value) -> Result<(), String> {
-        self.prune(Instant::now());
+        self.restore_at(scope, request, Instant::now())
+    }
+
+    fn restore_at(
+        &mut self,
+        scope: &Scope,
+        request: &mut Value,
+        now: Instant,
+    ) -> Result<(), String> {
+        self.prune(now);
         let path = if request.get("contents").is_some() {
             "/contents"
         } else {
@@ -293,38 +340,40 @@ impl ReplayCache {
                     .ok_or("expected model parts array for signed-history replay")?;
                 let current_context: Fingerprint = context.clone().finalize().into();
                 let visible = fingerprint(&model_visible_parts(parts));
-                let hit = (!scope.session.trim().is_empty())
-                    .then(|| {
-                        self.entries.iter().rev().find(|entry| {
-                            entry.turn.scope == *scope
-                                && entry.turn.context == current_context
-                                && entry.turn.visible == visible
-                        })
-                    })
-                    .flatten();
-                if let Some(entry) = hit {
-                    replacements.push((index, entry.turn.parts.clone()));
+                let hit = self
+                    .conversations
+                    .get(scope)
+                    .and_then(|conversation| conversation.turns.get(&(current_context, visible)));
+                if let Some(turn) = hit {
+                    replacements.push((index, turn.parts.clone()));
                 } else {
                     let ids = parts.iter().filter_map(|part| {
-                        part.get("functionCall")
-                            .and_then(|call| call.get("id"))
-                            .and_then(Value::as_str)
+                        part.pointer("/functionCall/id").and_then(Value::as_str)
                     });
                     if ids.into_iter().any(|id| {
-                        self.entries
-                            .iter()
-                            .any(|entry| entry.turn.call_ids.contains(id))
+                        self.conversations.values().any(|conversation| {
+                            conversation
+                                .turns
+                                .values()
+                                .any(|turn| turn.call_ids.contains(id))
+                        })
                     }) {
                         return Err("signed Gemini tool history does not match its recorded credential, model, session or preceding context".into());
                     }
-                    if parts.iter().any(|part| part.get("functionCall").is_some())
-                        && !calls_are_signed(parts)
-                    {
-                        return Err(if scope.session.trim().is_empty() {
-                            "signed Gemini tool history requires a stable session identifier"
+                    let tools = parts.iter().any(|part| part.get("functionCall").is_some());
+                    if !calls_are_signed(parts) || (!tools && !parts.iter().any(has_signature)) {
+                        let kind = if tools {
+                            "signed Gemini tool history"
                         } else {
-                            "signed Gemini tool history is unavailable for this credential, model and session; start a new conversation after cache expiry or restart"
-                        }.into());
+                            "signed Gemini history"
+                        };
+                        return Err(if scope.session.trim().is_empty() {
+                            format!("{kind} requires a stable session identifier")
+                        } else {
+                            format!(
+                                "{kind} is unavailable for this credential, model and session; start a new conversation after cache expiry or restart"
+                            )
+                        });
                     }
                 }
             }
@@ -337,24 +386,72 @@ impl ReplayCache {
         for (index, parts) in replacements {
             contents[index]["parts"] = Value::Array(parts);
         }
+        if let Some(conversation) = self.conversations.get_mut(scope) {
+            conversation.last_used = now;
+        }
         Ok(())
     }
 
     fn prune(&mut self, now: Instant) {
-        while self
-            .entries
-            .front()
-            .is_some_and(|entry| now.saturating_duration_since(entry.recorded_at) >= self.ttl)
-        {
-            self.remove_oldest();
+        let expired: Vec<_> = self
+            .conversations
+            .iter()
+            .filter(|(_, conversation)| {
+                conversation.in_flight == 0
+                    && now.saturating_duration_since(conversation.last_used) >= self.ttl
+            })
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        for scope in expired {
+            self.remove(&scope);
         }
     }
 
-    fn remove_oldest(&mut self) {
-        if let Some(entry) = self.entries.pop_front() {
-            self.bytes -= entry.turn.bytes;
+    fn make_room(&mut self, scope: &Scope, additional: usize) -> bool {
+        let required = self
+            .bytes
+            .saturating_add(additional)
+            .saturating_sub(self.max_bytes);
+        if required == 0 {
+            return true;
+        }
+        let mut victims: Vec<_> = self
+            .conversations
+            .iter()
+            .filter(|(candidate, conversation)| *candidate != scope && conversation.in_flight == 0)
+            .map(|(scope, conversation)| {
+                (scope.clone(), conversation.last_used, conversation.bytes)
+            })
+            .collect();
+        victims.sort_by_key(|(_, last_used, _)| *last_used);
+        if victims.iter().map(|(_, _, bytes)| bytes).sum::<usize>() < required {
+            return false;
+        }
+        let mut freed = 0;
+        for (victim, _, bytes) in victims {
+            self.remove(&victim);
+            freed += bytes;
+            if freed >= required {
+                break;
+            }
+        }
+        true
+    }
+
+    fn remove(&mut self, scope: &Scope) {
+        if let Some(conversation) = self.conversations.remove(scope) {
+            self.bytes -= conversation.bytes;
         }
     }
+}
+
+fn conversation_bytes(scope: &Scope) -> usize {
+    std::mem::size_of::<Conversation>()
+        + std::mem::size_of::<Scope>()
+        + scope.account.len()
+        + scope.model.len()
+        + scope.session.len()
+        + 256
 }
 
 fn has_signature(part: &Value) -> bool {

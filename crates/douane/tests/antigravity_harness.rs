@@ -168,6 +168,8 @@ impl Fixture {
             Router::new()
                 .route("/v1internal:generateContent", post(native))
                 .route("/v1internal:streamGenerateContent", post(native_stream))
+                // Full replay histories can exceed Axum's 2 MiB mock default.
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024))
                 .with_state(mock.clone()),
         )
         .await;
@@ -597,4 +599,224 @@ async fn other_google_routes_preserve_the_harness_system_text() {
         .unwrap();
     assert!(text.contains("You are Codex"));
     assert!(text.contains("billing-header"));
+}
+
+// Claude Code puts its environment and token reminders inside messages, even
+// though the root system prompt remains unchanged between requests.
+fn with_system_reminders(kind: &str, calls: &[String]) -> Value {
+    let mut body = request(kind, calls, "antigravity");
+    let key = if kind == "responses" {
+        "input"
+    } else {
+        "messages"
+    };
+    let history = body[key].as_array_mut().unwrap();
+    let first = if kind == "chat/completions" { 2 } else { 1 };
+    let environment = "Synthetic environment: preserve this instruction.";
+    let content = if calls.is_empty() {
+        json!([{"type":if kind == "responses" {"input_text"} else {"text"},"text":environment,"cache_control":{"type":"ephemeral"}}])
+    } else {
+        json!(environment)
+    };
+    history.insert(first, json!({"role":"system","content":content}));
+    let stride = if kind == "responses" { 3 } else { 2 };
+    for turn in 0..calls.len() {
+        let index = first + 1 + (turn + 1) * stride + turn;
+        history.insert(
+            index,
+            json!({"role":"system","content":format!("Synthetic token reminder {}", turn + 1)}),
+        );
+    }
+    body
+}
+
+#[tokio::test]
+async fn dynamic_system_reminders_keep_signed_history_in_every_dialect() {
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            let fixture = Fixture::new("antigravity", vec![reply(1), reply(2), reply(3)]).await;
+            let mut ids = Vec::new();
+            for turn in 0..3 {
+                let (status, body) = fixture
+                    .post(
+                        kind,
+                        with_system_reminders(kind, &ids),
+                        Some("dynamic-system"),
+                        stream,
+                    )
+                    .await;
+                assert_eq!(status, 200, "{kind}, stream={stream}, turn={turn}: {body}");
+                if turn < 2 {
+                    ids.push(call_id(kind, &body, stream));
+                }
+            }
+            {
+                let received = fixture.mock.received.lock().unwrap();
+                let last = &received[2]["request"];
+                let system = last["systemInstruction"]["parts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["text"].as_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(system.contains("Synthetic environment: preserve this instruction."));
+                assert!(system.contains("Synthetic token reminder 1"));
+                assert!(system.contains("Synthetic token reminder 2"));
+                assert!(
+                    last["contents"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|c| c["role"] != "system")
+                );
+                for turn in 0..2 {
+                    assert_eq!(
+                        last["contents"][1 + turn * 2]["parts"][3]["thoughtSignature"],
+                        format!("SYNTHETIC_CALL_{}", turn + 1)
+                    );
+                }
+            }
+            // Rewriting a reminder that preceded an already signed call must
+            // still refuse the entire request before reaching the provider.
+            let key = if kind == "responses" {
+                "input"
+            } else {
+                "messages"
+            };
+            let first = if kind == "chat/completions" { 2 } else { 1 };
+            let stride = if kind == "responses" { 3 } else { 2 };
+            for index in [first, first + 1 + stride] {
+                let mut changed = with_system_reminders(kind, &ids);
+                changed[key][index]["content"] = json!("Changed historical instruction");
+                let (status, body) = fixture
+                    .post(kind, changed, Some("dynamic-system"), stream)
+                    .await;
+                assert_eq!(status, 400, "{kind}, index={index}: {body}");
+                assert_eq!(fixture.mock.received.lock().unwrap().len(), 3);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn text_correction_with_new_system_reminders_restores_hidden_native_parts() {
+    let signed = json!([
+        {"thought":true,"text":"synthetic private reasoning","thoughtSignature":"SYNTHETIC_THOUGHT"},
+        {"text":"first answer","thoughtSignature":"SYNTHETIC_TEXT"}
+    ]);
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            let mut first = reply(3);
+            first["response"]["candidates"][0]["content"]["parts"] = signed.clone();
+            let fixture = Fixture::new("antigravity", vec![first, reply(3)]).await;
+            let (status, body) = fixture
+                .post(
+                    kind,
+                    with_system_reminders(kind, &[]),
+                    Some("text-correction"),
+                    stream,
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            let mut next = with_system_reminders(kind, &[]);
+            let key = if kind == "responses" {
+                "input"
+            } else {
+                "messages"
+            };
+            next[key].as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":"first answer"}),
+                json!({"role":"user","content":"Please return valid JSON."}),
+                json!({"role":"system","content":"Synthetic token reminder 1"}),
+            ]);
+            let (status, body) = fixture
+                .post(kind, next, Some("text-correction"), stream)
+                .await;
+            assert_eq!(status, 200, "{body}");
+            let received = fixture.mock.received.lock().unwrap();
+            assert_eq!(received[1]["request"]["contents"][1]["parts"], signed);
+        }
+    }
+}
+
+#[tokio::test]
+async fn unreplayable_native_turn_is_an_error_before_successful_completion() {
+    for stream in [false, true] {
+        let mut oversized = reply(3);
+        oversized["response"]["candidates"][0]["content"]["parts"] =
+            json!([{"text":"x".repeat(256 * 1024 + 1),"thoughtSignature":"SYNTHETIC_OVERSIZED"}]);
+        let fixture = Fixture::new("antigravity", vec![oversized]).await;
+        let (status, body) = fixture
+            .post(
+                "messages",
+                request("messages", &[], "antigravity"),
+                Some("over-capacity"),
+                stream,
+            )
+            .await;
+        if stream {
+            assert_eq!(status, 200);
+            assert!(
+                body.contains("event: error"),
+                "unrecordable native output must be an explicit error"
+            );
+            assert!(
+                !body.contains("event: message_stop"),
+                "a recording failure must never look like success"
+            );
+        } else {
+            assert_eq!(
+                status, 502,
+                "unrecordable native output must be an explicit error"
+            );
+            assert!(body.contains("signed Gemini history"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn full_conversation_budget_refuses_the_current_completion_explicitly() {
+    for stream in [false, true] {
+        let replies = (0..80).map(|turn| {
+            let mut native = reply(3);
+            native["response"]["candidates"][0]["content"]["parts"] = json!([
+                {"thought":true,"text":"x".repeat(192 * 1024),"thoughtSignature":"SYNTHETIC_HIDDEN"},
+                {"text":format!("answer {turn}"),"thoughtSignature":"SYNTHETIC_TEXT"}
+            ]);
+            native
+        }).collect();
+        let fixture = Fixture::new("antigravity", replies).await;
+        let mut history = with_system_reminders("messages", &[]);
+        let mut refused = false;
+        for turn in 0..80 {
+            let (status, body) = fixture
+                .post(
+                    "messages",
+                    history.clone(),
+                    Some("full-conversation"),
+                    stream,
+                )
+                .await;
+            if body.contains("byte budget") {
+                assert_eq!(status, if stream { 200 } else { 502 });
+                if stream {
+                    assert!(body.contains("event: error"));
+                    assert!(!body.contains("event: message_stop"));
+                }
+                refused = true;
+                break;
+            }
+            assert_eq!(status, 200, "{body}");
+            assert!(!body.contains("event: error"), "{body}");
+            history["messages"].as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":format!("answer {turn}")}),
+                json!({"role":"user","content":"Continue the synthetic conversation."}),
+            ]);
+        }
+        assert!(
+            refused,
+            "the unchanged 8 MiB budget must refuse this conversation before losing its prefix"
+        );
+    }
 }
