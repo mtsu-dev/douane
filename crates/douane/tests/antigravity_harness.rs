@@ -6,7 +6,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU16, Ordering},
     },
     time::Duration,
 };
@@ -18,6 +18,7 @@ struct Mock {
     replies: Mutex<VecDeque<Value>>,
     force_stream: AtomicBool,
     empty_stream_sentinels: AtomicBool,
+    refusal_status: AtomicU16,
 }
 
 struct Fixture {
@@ -56,6 +57,16 @@ async fn native(
         return native_stream(State(mock), Json(body)).await;
     }
     mock.received.lock().unwrap().push(body);
+    if let Ok(status) =
+        axum::http::StatusCode::from_u16(mock.refusal_status.load(Ordering::Relaxed))
+    {
+        return (
+            status,
+            [("retry-after", "7")],
+            Json(json!({"error":{"status":"RESOURCE_EXHAUSTED","message":"synthetic limit"}})),
+        )
+            .into_response();
+    }
     Json(
         mock.replies
             .lock()
@@ -71,6 +82,16 @@ async fn native_stream(
     Json(body): Json<Value>,
 ) -> axum::response::Response {
     mock.received.lock().unwrap().push(body);
+    if let Ok(status) =
+        axum::http::StatusCode::from_u16(mock.refusal_status.load(Ordering::Relaxed))
+    {
+        return (
+            status,
+            [("retry-after", "7")],
+            Json(json!({"error":{"status":"RESOURCE_EXHAUSTED","message":"synthetic limit"}})),
+        )
+            .into_response();
+    }
     let reply = mock
         .replies
         .lock()
@@ -924,5 +945,217 @@ async fn full_conversation_budget_refuses_the_current_completion_explicitly() {
             refused,
             "the unchanged 8 MiB budget must refuse this conversation before losing its prefix"
         );
+    }
+}
+
+#[tokio::test]
+async fn replay_owner_waits_through_rate_limits_without_switching_accounts() {
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            let fixture = Fixture::new("antigravity", vec![reply(1), reply(3)]).await;
+            let owner = fixture.state.accounts.list().await[0].id.clone();
+            let (status, body) = fixture
+                .post(
+                    kind,
+                    request(kind, &[], "antigravity"),
+                    Some("rate-owner"),
+                    stream,
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            let id = call_id(kind, &body, stream);
+            let alternate = Arc::new(Mock::default());
+            let (upstream, task) = serve(
+                Router::new()
+                    .route("/v1internal:generateContent", post(native))
+                    .route("/v1internal:streamGenerateContent", post(native_stream))
+                    .with_state(alternate.clone()),
+            )
+            .await;
+            let imported = fixture.state.accounts.import(json!({"type":"antigravity","access_token":"synthetic-alternate","base_url":upstream,"models":["synthetic-thinking","claude-synthetic"]}),None).await.unwrap();
+            let other = imported.id.clone();
+            fixture.state.refresh_models().await;
+            fixture.mock.refusal_status.store(429, Ordering::Relaxed);
+            let follow = request(kind, &[id], "antigravity");
+            let send = || {
+                fixture
+                    .client
+                    .post(format!("{}/v1/{kind}", fixture.url))
+                    .header("x-opencode-session-id", "rate-owner")
+                    .json(&{
+                        let mut value = follow.clone();
+                        value["stream"] = json!(stream);
+                        value
+                    })
+            };
+            for attempt in 0..2 {
+                let response = send().send().await.unwrap();
+                let status = response.status();
+                let retry = response.headers().get("retry-after").cloned();
+                let body = response.text().await.unwrap();
+                assert_eq!(
+                    status, 429,
+                    "{kind} stream={stream} attempt={attempt}: {body}"
+                );
+                assert!(retry.unwrap().to_str().unwrap().parse::<u64>().unwrap() > 0);
+                assert!(!body.contains("does not match"));
+                assert_eq!(alternate.received.lock().unwrap().len(), 0);
+                assert_eq!(fixture.mock.received.lock().unwrap().len(), 2);
+            }
+            // A fresh conversation can still use the other eligible account.
+            let (status, body) = fixture
+                .post(
+                    kind,
+                    request(kind, &[], "antigravity"),
+                    Some("fresh-rate-session"),
+                    stream,
+                )
+                .await;
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(alternate.received.lock().unwrap().len(), 1);
+            fixture.mock.refusal_status.store(0, Ordering::Relaxed);
+            fixture
+                .state
+                .accounts
+                .cooldown(&owner, 0, "synthetic cooldown elapsed")
+                .await
+                .unwrap();
+            // An unrelated scheduler pin must not move already recorded history.
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert("x-opencode-session-id", "rate-owner".parse().unwrap());
+            let session = douane::affinity::session_key(&headers, &json!({})).unwrap();
+            fixture
+                .state
+                .affinity
+                .lock()
+                .unwrap()
+                .bind("antigravity", &session, &other);
+            let response = send().send().await.unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(status, 200, "{body}");
+            assert_eq!(fixture.mock.received.lock().unwrap().len(), 3);
+            assert_eq!(alternate.received.lock().unwrap().len(), 1);
+            task.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn replay_owner_cooldown_never_bypasses_access_or_revocation() {
+    let fixture = Fixture::new("antigravity", vec![reply(1)]).await;
+    let owner = fixture.state.accounts.list().await[0].id.clone();
+    let (status, body) = fixture
+        .post(
+            "messages",
+            request("messages", &[], "antigravity"),
+            Some("owner-access"),
+            false,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let id = call_id("messages", &body, false);
+    let follow = request("messages", &[id], "antigravity");
+    fixture
+        .state
+        .accounts
+        .cooldown(&owner, 60, "synthetic cooldown")
+        .await
+        .unwrap();
+    fixture
+        .state
+        .accounts
+        .set_enabled(&owner, false)
+        .await
+        .unwrap();
+    let (status, body) = fixture
+        .post("messages", follow.clone(), Some("owner-access"), false)
+        .await;
+    assert_eq!(status, 503, "disabled owner: {body}");
+    fixture
+        .state
+        .accounts
+        .set_enabled(&owner, true)
+        .await
+        .unwrap();
+    let client = fixture.state.clients.list()[0].id.clone();
+    fixture
+        .state
+        .clients
+        .update(
+            &client,
+            douane::clients::ClientPatch {
+                access: Some(douane::clients::Access {
+                    all: false,
+                    pools: Default::default(),
+                    accounts: Default::default(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let (status, body) = fixture
+        .post("messages", follow.clone(), Some("owner-access"), false)
+        .await;
+    assert_eq!(status, 503, "denied owner: {body}");
+    fixture
+        .state
+        .clients
+        .update(
+            &client,
+            douane::clients::ClientPatch {
+                access: Some(Default::default()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    fixture.state.accounts.delete(&owner).await.unwrap();
+    let (status, body) = fixture
+        .post("messages", follow, Some("owner-access"), false)
+        .await;
+    assert_eq!(status, 503, "deleted owner: {body}");
+    assert_eq!(fixture.mock.received.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn replay_owner_refusals_never_fall_back_to_another_account() {
+    for refused in [401, 404, 503] {
+        let fixture = Fixture::new("antigravity", vec![reply(1)]).await;
+        let (status, body) = fixture
+            .post(
+                "messages",
+                request("messages", &[], "antigravity"),
+                Some("owner-refusal"),
+                false,
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let id = call_id("messages", &body, false);
+        let alternate = Arc::new(Mock::default());
+        let (upstream, task) = serve(
+            Router::new()
+                .route("/v1internal:generateContent", post(native))
+                .with_state(alternate.clone()),
+        )
+        .await;
+        fixture.state.accounts.import(json!({"type":"antigravity","access_token":"synthetic-fallback","base_url":upstream,"models":["synthetic-thinking"]}),None).await.unwrap();
+        fixture.state.refresh_models().await;
+        fixture
+            .mock
+            .refusal_status
+            .store(refused, Ordering::Relaxed);
+        let (status, body) = fixture
+            .post(
+                "messages",
+                request("messages", &[id], "antigravity"),
+                Some("owner-refusal"),
+                false,
+            )
+            .await;
+        assert_eq!(status, refused, "{body}");
+        assert!(!body.contains("does not match"));
+        assert_eq!(fixture.mock.received.lock().unwrap().len(), 2);
+        assert!(alternate.received.lock().unwrap().is_empty());
+        task.abort();
     }
 }

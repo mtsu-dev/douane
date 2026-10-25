@@ -384,11 +384,92 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
     out
 }
 
+fn replay_session(session: &str, history: &Value) -> String {
+    let system = serde_json::to_vec(&history["systemInstruction"]).unwrap_or_default();
+    format!("{session}:{}", hex::encode(Sha256::digest(system)))
+}
+
+fn replay_rate_limit(seconds: u64) -> Response {
+    let mut response = error(
+        StatusCode::TOO_MANY_REQUESTS,
+        "the recorded Antigravity account is temporarily unavailable; retry this conversation after Retry-After",
+    );
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        seconds.max(1).to_string().parse().unwrap(),
+    );
+    response
+}
+
+/// Account selection may rotate new sessions, but native history cannot move
+/// between subscriptions. Lookup does not authorize or refresh the owner.
+async fn replay_owner(
+    state: &AppState,
+    body: &Value,
+    headers: &HeaderMap,
+    from: Dialect,
+) -> Result<Option<String>, String> {
+    let Some(session) = crate::affinity::session_key(headers, body) else {
+        return Ok(None);
+    };
+    let Some(requested) = body["model"].as_str() else {
+        return Ok(None);
+    };
+    let model = if let Some(model) = requested.strip_prefix("antigravity/") {
+        model
+    } else {
+        if let Some((prefix, _)) = requested.split_once('/') {
+            if SubscriptionProvider::parse(prefix).is_some()
+                || state.accounts.routes().await.contains(prefix)
+            {
+                return Ok(None);
+            }
+        }
+        let config = state.config.read().await;
+        let provider = headers
+            .get("x-douane-provider")
+            .and_then(|v| v.to_str().ok())
+            .or(config.settings.default_provider.as_deref());
+        if provider.is_some_and(|provider| {
+            SubscriptionProvider::parse(provider) != Some(SubscriptionProvider::Antigravity)
+        }) {
+            return Ok(None);
+        }
+        requested
+    };
+    if !state
+        .antigravity_replay
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .has_session(model, &session)
+    {
+        return Ok(None);
+    }
+    let mut history = translate::antigravity_history(body, from)?;
+    crate::antigravity_system::normalize_system(&mut history);
+    let session = replay_session(&session, &history);
+    state
+        .antigravity_replay
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .owner(model, &session, &history)
+}
+
 pub(crate) async fn choose(
     state: &AppState,
     body: &Value,
     headers: &HeaderMap,
     client: Option<&crate::clients::Client>,
+) -> Result<(String, Vec<AccountCredential>, Option<String>), String> {
+    choose_for_replay(state, body, headers, client, None).await
+}
+
+async fn choose_for_replay(
+    state: &AppState,
+    body: &Value,
+    headers: &HeaderMap,
+    client: Option<&crate::clients::Client>,
+    owner: Option<&str>,
 ) -> Result<(String, Vec<AccountCredential>, Option<String>), String> {
     let model = body["model"]
         .as_str()
@@ -396,13 +477,14 @@ pub(crate) async fn choose(
         .ok_or("model is required")?;
     let session = crate::affinity::session_key(headers, body);
     let (upstream, accounts) = state
-        .candidates_for(
+        .candidates_for_replay(
             model,
             headers
                 .get("x-douane-provider")
                 .and_then(|v| v.to_str().ok()),
             session.as_deref(),
             client,
+            owner,
         )
         .await?;
     Ok((upstream, accounts, session))
@@ -442,7 +524,18 @@ pub async fn forward(
         }
     }
     let stream = value["stream"].as_bool().unwrap_or(false);
-    let (model, candidates, session) = match choose(&state, &value, &headers, client.as_ref()).await
+    let owner = match replay_owner(&state, &value, &headers, from).await {
+        Ok(owner) => owner,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+    };
+    let (model, candidates, session) = match choose_for_replay(
+        &state,
+        &value,
+        &headers,
+        client.as_ref(),
+        owner.as_deref(),
+    )
+    .await
     {
         Ok(v) => v,
         Err(e) => return error(refusal_status(&e), &e),
@@ -462,6 +555,18 @@ pub async fn forward(
     // Google's reason for the last refusal, so a client sees more than a status.
     let mut last_reason: Option<String> = None;
     for candidate in candidates {
+        if owner.is_some() {
+            if let Some(until) = candidate
+                .cooldown_until
+                .as_deref()
+                .and_then(crate::subscriptions::parse_timestamp)
+            {
+                let remaining = until - time::OffsetDateTime::now_utc();
+                if remaining.is_positive() {
+                    return replay_rate_limit(remaining.whole_seconds() as u64 + 1);
+                }
+            }
+        }
         let mut account = match state.oauth.credential(&candidate.id).await {
             Ok(a) => a,
             Err(_) => {
@@ -547,11 +652,7 @@ pub async fn forward(
                 // are validated at their historical positions in the replay hash.
                 session: session
                     .as_ref()
-                    .map(|session| {
-                        let system =
-                            serde_json::to_vec(&history["systemInstruction"]).unwrap_or_default();
-                        format!("{session}:{}", hex::encode(Sha256::digest(system)))
-                    })
+                    .map(|session| replay_session(session, &history))
                     .unwrap_or_default(),
             };
             // Future context identity follows the client projection, whose
@@ -852,6 +953,9 @@ pub async fn forward(
                     .accounts
                     .cooldown(&account.id, wait, "upstream temporarily unavailable")
                     .await;
+                if owner.is_some() && last_status == StatusCode::TOO_MANY_REQUESTS {
+                    return replay_rate_limit(wait);
+                }
                 if let (true, Some(response)) = (
                     native && account.provider != SubscriptionProvider::Meta,
                     response,

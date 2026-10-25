@@ -349,11 +349,93 @@ impl ReplayCache {
         self.restore_at(scope, request, Instant::now())
     }
 
+    pub(crate) fn has_session(&self, model: &str, session: &str) -> bool {
+        self.conversations.keys().any(|scope| {
+            scope.model == model
+                && scope
+                    .session
+                    .strip_prefix(session)
+                    .is_some_and(|suffix| suffix.starts_with(':'))
+        })
+    }
+
+    /// Locate the original account without changing the history or its idle
+    /// lifetime. A matching first turn identifies candidates, not authorization:
+    /// the relay still applies account access, quota and reserve policies.
+    pub(crate) fn owner(
+        &mut self,
+        model: &str,
+        session: &str,
+        request: &Value,
+    ) -> Result<Option<String>, String> {
+        self.owner_at(model, session, request, Instant::now())
+    }
+
+    fn owner_at(
+        &mut self,
+        model: &str,
+        session: &str,
+        request: &Value,
+        now: Instant,
+    ) -> Result<Option<String>, String> {
+        self.prune(now);
+        let Some(contents) = request.get("contents").and_then(Value::as_array) else {
+            return Err("expected native Gemini contents array for signed-history replay".into());
+        };
+        let mut context = history_hasher();
+        let mut first = None;
+        for content in contents {
+            if content["role"] == "model" {
+                let parts = content["parts"]
+                    .as_array()
+                    .ok_or("expected model parts array for signed-history replay")?;
+                first = Some((
+                    context.finalize().into(),
+                    fingerprint(&model_visible_parts(parts)),
+                ));
+                break;
+            }
+            hash_content(&mut context, content);
+        }
+        let Some(key) = first else { return Ok(None) };
+        let scopes: Vec<_> = self
+            .conversations
+            .iter()
+            .filter(|(scope, conversation)| {
+                scope.model == model
+                    && scope.session == session
+                    && conversation.turns.contains_key(&key)
+            })
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        if scopes.len() > 1 {
+            return Err(
+                "signed Gemini history has ambiguous account ownership; start a new conversation"
+                    .into(),
+            );
+        }
+        let Some(scope) = scopes.into_iter().next() else {
+            return Ok(None);
+        };
+        self.restore_with_touch(&scope, &mut request.clone(), now, false)?;
+        Ok(Some(scope.account))
+    }
+
     fn restore_at(
         &mut self,
         scope: &Scope,
         request: &mut Value,
         now: Instant,
+    ) -> Result<(), String> {
+        self.restore_with_touch(scope, request, now, true)
+    }
+
+    fn restore_with_touch(
+        &mut self,
+        scope: &Scope,
+        request: &mut Value,
+        now: Instant,
+        touch: bool,
     ) -> Result<(), String> {
         self.prune(now);
         let path = if request.get("contents").is_some() {
@@ -449,8 +531,10 @@ impl ReplayCache {
                 response.remove("id");
             }
         }
-        if let Some(conversation) = self.conversations.get_mut(scope) {
-            conversation.last_used = now;
+        if touch {
+            if let Some(conversation) = self.conversations.get_mut(scope) {
+                conversation.last_used = now;
+            }
         }
         Ok(())
     }

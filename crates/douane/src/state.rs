@@ -608,6 +608,18 @@ impl AppState {
         session: Option<&str>,
         client: Option<&crate::clients::Client>,
     ) -> Result<(String, Vec<AccountCredential>), String> {
+        self.candidates_for_replay(requested, provider_hint, session, client, None)
+            .await
+    }
+
+    pub(crate) async fn candidates_for_replay(
+        &self,
+        requested: &str,
+        provider_hint: Option<&str>,
+        session: Option<&str>,
+        client: Option<&crate::clients::Client>,
+        owner: Option<&str>,
+    ) -> Result<(String, Vec<AccountCredential>), String> {
         let config = self.config.read().await.clone();
         if config.disabled_models.contains(requested) {
             return Err("model is disabled".into());
@@ -667,6 +679,9 @@ impl AppState {
         let mut held_back: Option<(String, i64)> = None;
         for (provider, route) in pools {
             let pool = route.as_deref().unwrap_or(provider.as_str());
+            if owner.is_some() && provider != SubscriptionProvider::Antigravity {
+                continue;
+            }
             if config.disabled_models.contains(&format!("{pool}/{model}")) {
                 continue;
             }
@@ -676,9 +691,12 @@ impl AppState {
             let mut candidates = vec![];
             for a in self
                 .accounts
-                .eligible_in(provider, route.as_deref(), Some(model))
+                .eligible_in_for_replay(provider, route.as_deref(), Some(model), owner)
                 .await
             {
+                if owner.is_some_and(|owner| a.id != owner) {
+                    continue;
+                }
                 if client.is_some_and(|c| !c.access.allows(&a)) {
                     continue;
                 }
@@ -1696,5 +1714,47 @@ mod tests {
             assert!(!state.reserve_reached(&edited).await, "{invalid}");
             assert_eq!(edited.summary().reserve_percent, None);
         }
+    }
+    #[tokio::test]
+    async fn replay_owner_in_cooldown_still_obeys_reserves_and_disabled_models() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let owner=state.accounts.import(json!({"type":"antigravity","access_token":"synthetic-reserve","models":["synthetic"]}),None).await.unwrap();
+        state
+            .accounts
+            .cooldown(&owner.id, 60, "synthetic cooldown")
+            .await
+            .unwrap();
+        let pick = || {
+            state.candidates_for_replay("antigravity/synthetic", None, None, None, Some(&owner.id))
+        };
+        assert_eq!(pick().await.unwrap().1[0].id, owner.id);
+        let mut snapshot = weekly(&owner.id, "2099-01-08T00:00:00Z");
+        snapshot.provider = SubscriptionProvider::Antigravity;
+        state.quotas.insert_for_test(snapshot).await;
+        state
+            .accounts
+            .update(&owner.id, None, None, Some(Some(70.0)), None)
+            .await
+            .unwrap();
+        assert!(
+            pick().await.is_err(),
+            "cooldown ownership cannot spend the reserved quota"
+        );
+        state
+            .accounts
+            .update(&owner.id, None, None, Some(None), None)
+            .await
+            .unwrap();
+        state
+            .config
+            .write()
+            .await
+            .disabled_models
+            .insert("antigravity/synthetic".into());
+        assert_eq!(pick().await.err().unwrap(), "model is disabled");
     }
 }

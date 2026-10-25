@@ -843,3 +843,104 @@ fn missing_or_expired_plain_text_history_is_refused_instead_of_sent_unsigned() {
         "restart must fail explicitly"
     );
 }
+
+#[test]
+fn owner_lookup_validates_all_history_without_touching_ttl_or_request() {
+    let mut cache = ReplayCache::default();
+    let first = request();
+    store(
+        &mut cache,
+        scope(),
+        &first,
+        json!([signed_call("owner_call", 1)]),
+    );
+    let mut follow = first;
+    append(
+        &mut follow,
+        "model",
+        json!([unsigned_call("owner_call", 1)]),
+    );
+    append(&mut follow, "user", json!([{"text":"result"}]));
+    let before = follow.clone();
+    let t0 = cache.conversations[&scope()].last_used;
+    let now = t0 + Duration::from_secs(300);
+    assert_eq!(
+        cache
+            .owner_at(&scope().model, &scope().session, &follow, now)
+            .unwrap(),
+        Some(scope().account)
+    );
+    assert_eq!(follow, before);
+    assert_eq!(cache.conversations[&scope()].last_used, t0);
+    // A valid first turn must not authorize an unrecorded later turn.
+    append(
+        &mut follow,
+        "model",
+        json!([unsigned_call("unrecorded", 2)]),
+    );
+    assert!(
+        cache
+            .owner_at(&scope().model, &scope().session, &follow, now)
+            .is_err()
+    );
+    assert_eq!(cache.conversations[&scope()].last_used, t0);
+    assert_eq!(
+        cache
+            .owner_at(
+                &scope().model,
+                &scope().session,
+                &before,
+                t0 + Duration::from_secs(3600)
+            )
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn identical_text_history_on_two_accounts_has_no_arbitrary_owner() {
+    let mut cache = ReplayCache::default();
+    let initial = request();
+    let parts = json!([{"text":"identical","thoughtSignature":"SYNTHETIC"}]);
+    store(&mut cache, scope(), &initial, parts.clone());
+    let mut other = scope();
+    other.account = "other-account".into();
+    store(&mut cache, other, &initial, parts);
+    let mut follow = initial;
+    append(&mut follow, "model", json!([{"text":"identical"}]));
+    let before: Vec<_> = cache.conversations.values().map(|c| c.last_used).collect();
+    assert!(
+        cache
+            .owner(&scope().model, &scope().session, &follow)
+            .unwrap_err()
+            .contains("ambiguous")
+    );
+    assert_eq!(
+        before,
+        cache
+            .conversations
+            .values()
+            .map(|c| c.last_used)
+            .collect::<Vec<_>>()
+    );
+    let mut changed = follow.clone();
+    changed["contents"][0]["parts"][0]["text"] = json!("changed");
+    assert_eq!(
+        cache
+            .owner(&scope().model, &scope().session, &changed)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        cache
+            .owner("different-model", &scope().session, &follow)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        cache
+            .owner(&scope().model, "different-session", &follow)
+            .unwrap(),
+        None
+    );
+}

@@ -21,6 +21,23 @@ still receives their complete text in `systemInstruction`. Appending a reminder
 does not invalidate earlier turns; editing a reminder preceding a recorded turn
 does invalidate that turn.
 
+## Account ownership and rate limits
+
+A recorded conversation stays on its original account, even when the scheduler
+would prefer another account. Owner lookup validates the full history without
+renewing its idle TTL. Ambiguous ownership is rejected explicitly. Normal
+account access, disabled-model, reserve and share checks still apply.
+
+If that account returns HTTP 429, Douane preserves HTTP 429 and sends a
+`Retry-After` header. Further requests during its cooldown return the remaining
+retry delay without contacting any account. Once the cooldown ends, the same
+conversation resumes on its original account. Other upstream refusals also
+stay on that account. A disabled, removed or forbidden owner remains refused;
+history never migrates to an unauthorized account.
+
+New conversations retain the configured scheduling and failover policies.
+Ownership is ephemeral with the replay cache and is not a new persistent pin.
+
 ## Retention
 
 The cache retains whole scopes rather than independently expiring individual
@@ -60,4 +77,5 @@ The cache tests cover two interleaved 160-turn conversations, atomic eviction,
 sliding expiry, rejected restores, concurrent pins and capacity refusal. The
 public HTTP harness covers tool cycles and text correction with dynamic system
 reminders across Messages, Chat and Responses over JSON and SSE, including
-recording failures before successful completion.
+recording failures before successful completion, account-bound rate-limit recovery,
+access revocation and upstream refusals without cross-account failover.
