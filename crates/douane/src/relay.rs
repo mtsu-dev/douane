@@ -558,10 +558,19 @@ pub async fn forward(
                 .antigravity_replay
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .restore(&scope, &mut history)
+                .begin(&scope, &mut history)
             {
                 return error(StatusCode::BAD_REQUEST, &e);
             }
+            let native_replay = NativeReplay {
+                state: state.clone(),
+                scope: scope.clone(),
+                recorder: Some(Recorder::new(
+                    scope,
+                    history["contents"].as_array().cloned().unwrap_or_default(),
+                )),
+                terminal_output: None,
+            };
             // Only model parts cross from the chronological cache projection
             // into the provider request. Instructions retain their system role.
             let mut restored_models = history["contents"]
@@ -589,13 +598,7 @@ pub async fn forward(
                     "signed-history model projection does not match native contents",
                 );
             }
-            Some(NativeReplay {
-                state: state.clone(),
-                recorder: Some(Recorder::new(
-                    scope,
-                    history["contents"].as_array().cloned().unwrap_or_default(),
-                )),
-            })
+            Some(native_replay)
         } else {
             None
         };
@@ -925,10 +928,13 @@ pub async fn forward(
                 return error(StatusCode::BAD_GATEWAY, &e);
             }
         };
-        call.complete = true;
         if let Some(replay) = &mut replay {
-            replay.commit();
+            if let Err(e) = replay.commit() {
+                call.fail(&e);
+                return error(StatusCode::BAD_GATEWAY, &e);
+            }
         }
+        call.complete = true;
         let mut answer = Json(result).into_response();
         answer.headers_mut().extend(passed);
         return answer;
@@ -953,7 +959,9 @@ pub async fn forward(
 /// Keep opaque native parts in bounded memory only after a clean completion.
 struct NativeReplay {
     state: Arc<AppState>,
+    scope: Scope,
     recorder: Option<Recorder>,
+    terminal_output: Option<String>,
 }
 impl NativeReplay {
     fn observe(&mut self, event: &mut Value) {
@@ -961,14 +969,35 @@ impl NativeReplay {
             recorder.observe(event);
         }
     }
-    fn commit(&mut self) {
-        if let Some(turn) = self.recorder.take().and_then(Recorder::finish) {
-            self.state
-                .antigravity_replay
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .record(turn);
+    fn commit(&mut self) -> Result<(), String> {
+        // Anonymous first calls retain their existing behavior; subsequent
+        // unsigned history requires a stable session and fails at restore.
+        if self.scope.session.trim().is_empty() {
+            self.recorder.take();
+            return Ok(());
         }
+        let turn = self.recorder.take().and_then(Recorder::finish).ok_or(
+            "signed Gemini history could not be recorded completely within its size limit",
+        )?;
+        if !self
+            .state
+            .antigravity_replay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record(turn)
+        {
+            return Err("signed Gemini history cache cannot retain the complete conversation within its byte budget".into());
+        }
+        Ok(())
+    }
+}
+impl Drop for NativeReplay {
+    fn drop(&mut self) {
+        self.state
+            .antigravity_replay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(&self.scope);
     }
 }
 
@@ -1417,8 +1446,26 @@ fn stream_response(
                                     replay.observe(&mut event);
                                 }
                                 call.observe(&event);
+                                let defer = replay.as_ref().is_some_and(|replay| {
+                                    gemini_finished(&event) || replay.terminal_output.is_some()
+                                });
                                 if let Some(b) = bridge.as_mut() {
                                     match b.feed(event) {
+                                        Ok(s) if defer => {
+                                            let held = replay
+                                                .as_mut()
+                                                .unwrap()
+                                                .terminal_output
+                                                .get_or_insert_default();
+                                            if held.len().saturating_add(s.len()) > 32 * 1024 * 1024
+                                            {
+                                                failure = Some(
+                                                    "upstream response exceeds size limit".into(),
+                                                );
+                                                break;
+                                            }
+                                            held.push_str(&s);
+                                        }
                                         Ok(s) => translated.push_str(&s),
                                         Err(e) => {
                                             failure = Some(e);
@@ -1464,6 +1511,13 @@ fn stream_response(
                             }
                             let tail = (|| -> Result<String, String> {
                                 let mut output = String::new();
+                                // Completion stays private until decoding and
+                                // native-history storage have both succeeded.
+                                if let Some(replay) = &mut replay {
+                                    output.push_str(
+                                        &replay.terminal_output.take().unwrap_or_default(),
+                                    );
+                                }
                                 for mut event in ending? {
                                     if meta
                                         && crate::subscriptions::meta::subscription_event(&event)
@@ -1482,16 +1536,16 @@ fn stream_response(
                                     output.push_str(&b.feed(event)?);
                                 }
                                 output.push_str(&b.finish()?);
+                                if call.call.error.is_none() {
+                                    if let Some(replay) = &mut replay {
+                                        replay.commit()?;
+                                    }
+                                }
                                 Ok(output)
                             })();
                             match tail {
                                 Ok(t) => {
                                     call.complete = true;
-                                    if call.call.error.is_none() {
-                                        if let Some(replay) = &mut replay {
-                                            replay.commit();
-                                        }
-                                    }
                                     Ok((!t.is_empty()).then(|| Bytes::from(t)))
                                 }
                                 Err(e) => Err(e),

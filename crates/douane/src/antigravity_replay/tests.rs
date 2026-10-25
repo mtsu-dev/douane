@@ -319,7 +319,7 @@ fn signed_plain_text_requires_matching_context_and_scope() {
     wrong_context["contents"][0]["parts"][0]["text"] = json!("other question");
     append(&mut wrong_context, "model", json!([{"text":"hello world"}]));
     let original = wrong_context.clone();
-    cache.restore(&scope(), &mut wrong_context).unwrap();
+    assert!(cache.restore(&scope(), &mut wrong_context).is_err());
     assert_eq!(wrong_context, original);
     let mut wrong_scope = initial;
     append(&mut wrong_scope, "model", json!([{"text":"hello world"}]));
@@ -332,7 +332,7 @@ fn signed_plain_text_requires_matching_context_and_scope() {
             },
             &mut wrong_scope,
         )
-        .unwrap();
+        .unwrap_err();
     assert_eq!(wrong_scope, original);
 }
 
@@ -364,62 +364,191 @@ fn oversized_native_output_is_discarded_before_recording() {
     assert!(recorder.finish().is_none());
     let mut recorder = Recorder::new(scope(), contents(&request()));
     recorder.observe(&mut json!({"candidates":[{"content":{"parts":[signed_call("too_large_for_cache",1)]},"finishReason":"STOP"}]}));
-    let mut cache = ReplayCache::with_limits(1024, 8, 10, Duration::from_secs(60));
+    let mut cache = ReplayCache::with_limits(1024, 8, Duration::from_secs(60));
     assert!(!cache.record(recorder.finish().unwrap()));
 }
 
+fn turn_for(scope: Scope, request: &Value, text: &str) -> RecordedTurn {
+    let mut recorder = Recorder::new(scope, contents(request));
+    recorder.observe(&mut json!({"candidates":[{"content":{"parts":[{"text":text,"thoughtSignature":"SYNTHETIC"}]},"finishReason":"STOP"}]}));
+    recorder.finish().unwrap()
+}
+
+fn text_history(text: &str) -> Value {
+    let mut history = request();
+    append(&mut history, "model", json!([{"text":text}]));
+    history
+}
+
 #[test]
-fn cache_turn_count_and_byte_budget_evict_oldest_turns() {
-    let initial = request();
-    let mut cache = ReplayCache::with_limits(8192, 4096, 1, Duration::from_secs(60));
-    store(
-        &mut cache,
+fn byte_budget_evicts_whole_least_recently_used_conversations() {
+    let now = Instant::now();
+    let scopes = [
         scope(),
-        &initial,
-        json!([signed_call("old", 1)]),
+        Scope {
+            session: "second-session".into(),
+            ..scope()
+        },
+        Scope {
+            session: "third-session".into(),
+            ..scope()
+        },
+    ];
+    let turns = ["first", "second"].map(|text| turn_for(scopes[0].clone(), &request(), text));
+    let budget =
+        turns.iter().map(|turn| turn.bytes).sum::<usize>() + conversation_bytes(&scopes[0]);
+    let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
+    for turn in turns {
+        assert!(cache.record_at(turn, now));
+    }
+    assert!(cache.record_at(turn_for(scopes[1].clone(), &request(), "new"), now));
+    assert!(
+        !cache.conversations.contains_key(&scopes[0]),
+        "no old tail may survive eviction"
     );
-    store(
-        &mut cache,
-        scope(),
-        &initial,
-        json!([signed_call("new", 2)]),
+    assert!(
+        cache
+            .restore_at(&scopes[0], &mut text_history("first"), now)
+            .is_err()
     );
-    let mut replay = initial.clone();
-    append(&mut replay, "model", json!([unsigned_call("old", 1)]));
-    let original = replay.clone();
-    assert!(cache.restore(&scope(), &mut replay).is_err());
-    assert_eq!(replay, original);
-    let mut replay = initial.clone();
-    append(&mut replay, "model", json!([unsigned_call("new", 2)]));
-    cache.restore(&scope(), &mut replay).unwrap();
-    assert_eq!(
-        replay["contents"][1]["parts"][0]["thoughtSignature"],
-        "SYNTHETIC_SIGNATURE"
+    assert!(
+        cache
+            .restore_at(&scopes[0], &mut text_history("second"), now)
+            .is_err()
     );
-    let mut cache = ReplayCache::with_limits(2500, 1024, 10, Duration::from_secs(60));
-    store(
-        &mut cache,
-        scope(),
-        &initial,
-        json!([{"text":"first","thoughtSignature":"x".repeat(600)}]),
+    assert!(cache.bytes <= budget);
+
+    // Give three one-turn conversations enough room for exactly two. A valid
+    // restore makes the older conversation newer than the second one.
+    let budget = scopes
+        .iter()
+        .map(|scope| turn_for(scope.clone(), &request(), "same").bytes + conversation_bytes(scope))
+        .max()
+        .unwrap()
+        * 2;
+    let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
+    assert!(cache.record_at(turn_for(scopes[0].clone(), &request(), "same"), now));
+    assert!(cache.record_at(
+        turn_for(scopes[1].clone(), &request(), "same"),
+        now + Duration::from_secs(1)
+    ));
+    cache
+        .restore_at(
+            &scopes[0],
+            &mut text_history("same"),
+            now + Duration::from_secs(2),
+        )
+        .unwrap();
+    assert!(cache.record_at(
+        turn_for(scopes[2].clone(), &request(), "same"),
+        now + Duration::from_secs(3)
+    ));
+    assert!(cache.conversations.contains_key(&scopes[0]));
+    assert!(!cache.conversations.contains_key(&scopes[1]));
+}
+
+#[test]
+fn extending_a_full_conversation_is_refused_without_losing_its_prefix() {
+    let first = turn_for(scope(), &request(), "first");
+    let budget = first.bytes + conversation_bytes(&scope());
+    let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
+    assert!(cache.record(first));
+    let before = cache.bytes;
+    assert!(!cache.record(turn_for(scope(), &text_history("first"), "second")));
+    assert_eq!(cache.bytes, before);
+    assert_eq!(cache.conversations[&scope()].turns.len(), 1);
+    cache.restore(&scope(), &mut text_history("first")).unwrap();
+}
+
+#[test]
+fn active_calls_pin_their_whole_conversation_and_release_on_cancellation() {
+    let first = turn_for(scope(), &request(), "first");
+    let budget = first.bytes + conversation_bytes(&scope());
+    let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
+    assert!(cache.record(first));
+    cache.begin(&scope(), &mut text_history("first")).unwrap();
+    cache.begin(&scope(), &mut text_history("first")).unwrap();
+    let other = Scope {
+        session: "another-session".into(),
+        ..scope()
+    };
+    assert!(!cache.record(turn_for(other.clone(), &request(), "other")));
+    cache.release(&scope());
+    assert!(!cache.record(turn_for(other.clone(), &request(), "other")));
+    cache.release(&scope());
+    assert!(cache.record(turn_for(other.clone(), &request(), "other")));
+    assert!(!cache.conversations.contains_key(&scope()));
+    let mut empty = ReplayCache::default();
+    empty.begin(&scope(), &mut request()).unwrap();
+    empty.release(&scope());
+    assert_eq!(empty.bytes, 0);
+    assert!(empty.conversations.is_empty());
+}
+
+#[test]
+fn ttl_slides_only_after_a_fully_valid_restore() {
+    let now = Instant::now();
+    let mut cache = ReplayCache::with_limits(65536, 4096, Duration::from_secs(10));
+    assert!(cache.record_at(turn_for(scope(), &request(), "first"), now));
+    cache
+        .restore_at(
+            &scope(),
+            &mut text_history("first"),
+            now + Duration::from_secs(9),
+        )
+        .unwrap();
+    cache
+        .restore_at(
+            &scope(),
+            &mut text_history("first"),
+            now + Duration::from_secs(18),
+        )
+        .unwrap();
+    assert!(cache.record_at(
+        turn_for(scope(), &request(), "second"),
+        now + Duration::from_secs(19)
+    ));
+    let other = Scope {
+        session: "changed-session".into(),
+        ..scope()
+    };
+    assert!(
+        cache
+            .restore_at(
+                &other,
+                &mut text_history("first"),
+                now + Duration::from_secs(26)
+            )
+            .is_err()
     );
-    store(
-        &mut cache,
-        scope(),
-        &initial,
-        json!([{"text":"second","thoughtSignature":"x".repeat(600)}]),
+    let mut partially_valid = text_history("first");
+    append(&mut partially_valid, "model", json!([{"text":"altered"}]));
+    assert!(
+        cache
+            .restore_at(
+                &scope(),
+                &mut partially_valid,
+                now + Duration::from_secs(27)
+            )
+            .is_err()
     );
-    let mut replay = initial;
-    append(&mut replay, "model", json!([{"text":"first"}]));
-    let original = replay.clone();
-    cache.restore(&scope(), &mut replay).unwrap();
-    assert_eq!(replay, original);
+    assert!(
+        cache
+            .restore_at(
+                &scope(),
+                &mut text_history("first"),
+                now + Duration::from_secs(28)
+            )
+            .is_err(),
+        "failed restore and record must not renew TTL"
+    );
+    assert_eq!(cache.bytes, 0);
 }
 
 #[test]
 fn expired_turns_are_not_replayed() {
     let initial = request();
-    let mut cache = ReplayCache::with_limits(8192, 4096, 10, Duration::ZERO);
+    let mut cache = ReplayCache::with_limits(8192, 4096, Duration::ZERO);
     store(
         &mut cache,
         scope(),
@@ -581,35 +710,67 @@ fn model_wire_projection_does_not_normalize_user_image_and_text_order() {
 }
 
 #[test]
-fn a_conversation_loses_its_first_signature_at_the_global_turn_limit() {
+fn long_concurrent_conversations_keep_every_signed_turn_below_the_byte_budget() {
     let mut cache = ReplayCache::default();
-    let mut history = request();
-    for turn in 0..=129 {
-        // Clients only retain visible parts; restoration must not accidentally
-        // leave opaque signatures in the next simulated client request.
-        let mut outgoing = history.clone();
-        let restored = cache.restore(&scope(), &mut outgoing);
-        if turn == 129 {
-            assert!(
-                restored.is_err(),
-                "the bounded cache cannot retain an unbounded conversation"
+    let scopes = [
+        scope(),
+        Scope {
+            session: "second-session".into(),
+            ..scope()
+        },
+    ];
+    let mut histories = [request(), request()];
+    for turn in 0..160 {
+        for (index, history) in histories.iter_mut().enumerate() {
+            let mut outgoing = history.clone();
+            cache
+                .restore(&scopes[index], &mut outgoing)
+                .expect("active history must remain replayable beyond 129 total turns");
+            let id = format!("long_{index}_{turn}");
+            store(
+                &mut cache,
+                scopes[index].clone(),
+                &outgoing,
+                json!([signed_call(&id, turn)]),
             );
-            return;
+            append(history, "model", json!([unsigned_call(&id, turn)]));
+            append(
+                history,
+                "user",
+                json!([{"functionResponse":{"id":id,"name":"synthetic_tool","response":{"result":"ok"}}}]),
+            );
         }
-        restored.unwrap();
-        let id = format!("long_{turn}");
-        store(
-            &mut cache,
-            scope(),
-            &outgoing,
-            json!([signed_call(&id, turn)]),
-        );
-        append(&mut history, "model", json!([unsigned_call(&id, turn)]));
-        append(
-            &mut history,
-            "user",
-            json!([{"functionResponse":{"id":id,"name":"synthetic_tool","response":{"result":"ok"}}}]),
-        );
     }
-    unreachable!();
+    for (index, history) in histories.iter_mut().enumerate() {
+        cache.restore(&scopes[index], history).unwrap();
+        assert!(cache.bytes <= 8 * 1024 * 1024);
+    }
+}
+
+#[test]
+fn missing_or_expired_plain_text_history_is_refused_instead_of_sent_unsigned() {
+    let initial = request();
+    let mut cache = ReplayCache::with_limits(8192, 4096, Duration::ZERO);
+    store(
+        &mut cache,
+        scope(),
+        &initial,
+        json!([{"thought":true,"text":"private"},{"text":"first answer","thoughtSignature":"SYNTHETIC_TEXT"}]),
+    );
+    let mut history = initial;
+    append(&mut history, "model", json!([{"text":"first answer"}]));
+    append(
+        &mut history,
+        "user",
+        json!([{"text":"Please return valid JSON."}]),
+    );
+    let original = history.clone();
+    assert!(cache.restore(&scope(), &mut history).is_err());
+    assert_eq!(history, original);
+    assert!(
+        ReplayCache::default()
+            .restore(&scope(), &mut history)
+            .is_err(),
+        "restart must fail explicitly"
+    );
 }
