@@ -158,17 +158,20 @@ Google can still refuse a request; its sanitized reason and retry delay remain
 visible.
 
 Native signed model parts are kept in memory and restored after tool results.
-Replay is scoped to the account, model, session, normalized system instructions
-and preceding visible history. Hidden reasoning and opaque signatures never
-enter the ledger or disk. Chat Completions exposes returned thought text as
-`reasoning_content`; other dialects do not fabricate signed thinking blocks.
+Replay is scoped to the account, model, session and normalized root
+instructions. Complete visible model output and its recorded lineage must
+match; a client may compact its prefix or edit its own results and inline
+reminders. Hidden reasoning and opaque signatures never enter the ledger or
+disk. Chat Completions exposes returned thought text as `reasoning_content`;
+other dialects do not fabricate signed thinking blocks.
 
-The replay cache holds at most 128 turns and 8 MiB for one hour, with a 256 KiB
-native-turn limit. Interrupted, invalid or oversized turns are not recorded.
-Unsigned tool history without a matching entry is refused locally, including
-after restart, expiry, account/model changes or compaction that alters the
-recorded context. Start a new conversation in that case. Acceptance by a live
-Google account remains separate from the local compatibility tests.
+The replay cache has an 8 MiB budget and a one-hour idle lifetime, with a
+256 KiB native-turn limit and no independent turn-count limit. Interrupted,
+invalid or oversized turns are not recorded. Missing, ambiguous, altered or
+cross-scope model history is refused locally, including after restart or
+expiry. Provider refusals and empty completions produce explicit errors.
+See [signed history](docs/antigravity-replay.md) for retention and compaction
+rules. Acceptance by a live Google account remains separate from offline tests.
 
 Each Antigravity account lists its own models (`fetchAvailableModels`), and
 plans differ: Claude Opus and Sonnet 5.5 are offered to some Google AI Pro

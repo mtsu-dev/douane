@@ -24,9 +24,10 @@ pub fn request(body: &Value, from: Dialect, to: Dialect) -> Result<Value, String
     }
 }
 
-/// The provider still receives every instruction in systemInstruction. Cache
-/// identity also needs their original positions: an appended reminder must not
-/// retroactively invalidate a signature, but editing an earlier one must.
+/// The provider receives every current instruction in systemInstruction.
+/// Chronological positions preserve strict context matches when possible;
+/// compaction may edit inline reminders. Only root instructions belong to the
+/// immutable replay scope.
 /// This projection stays in memory and is never sent upstream.
 pub(crate) fn antigravity_history(body: &Value, from: Dialect) -> Result<Value, String> {
     if from == Dialect::Gemini {
@@ -553,6 +554,34 @@ fn chat_to_gemini(body: &Value, chronological_systems: bool) -> Result<Value, St
     Ok(out)
 }
 
+/// Only enum classifications enter errors. Provider free text may contain
+/// project identifiers or user content and must never reach diagnostics.
+pub(crate) fn gemini_refusal(event: &Value) -> Option<&'static str> {
+    let body = event.get("response").unwrap_or(event);
+    let blocked = body
+        .pointer("/promptFeedback/blockReason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty() && *reason != "BLOCK_REASON_UNSPECIFIED");
+    let finished = body
+        .pointer("/candidates/0/finishReason")
+        .or_else(|| body.pointer("/candidates/0/finish_reason"))
+        .and_then(Value::as_str)
+        .filter(|reason| {
+            !matches!(
+                *reason,
+                "" | "FINISH_REASON_UNSPECIFIED" | "STOP" | "MAX_TOKENS"
+            )
+        });
+    Some(match blocked.or(finished)? {
+        "SAFETY" => "upstream Gemini provider refused completion (SAFETY)",
+        "RECITATION" => "upstream Gemini provider refused completion (RECITATION)",
+        "MALFORMED_FUNCTION_CALL" => {
+            "upstream Gemini provider refused completion (MALFORMED_FUNCTION_CALL)"
+        }
+        _ => "upstream Gemini provider refused completion",
+    })
+}
+
 pub fn response(
     body: &Value,
     from: Dialect,
@@ -562,6 +591,11 @@ pub fn response(
 ) -> Result<Value, String> {
     if from == to {
         return Ok(body.clone());
+    }
+    if from == Dialect::Gemini {
+        if let Some(message) = gemini_refusal(body) {
+            return Err(message.into());
+        }
     }
     let chat = to_chat_response(body, from, model)?;
     match to {
@@ -647,6 +681,9 @@ fn to_chat_response(body: &Value, from: Dialect, model: &str) -> Result<Value, S
                 .and_then(Value::as_array)
             {
                 for p in parts {
+                    if p.get("inlineData").is_some() || p.get("fileData").is_some() {
+                        return Err("translated Gemini output contains unsupported media".into());
+                    }
                     if p["thought"] == true {
                         reasoning.push_str(p["text"].as_str().unwrap_or(""));
                     } else {
@@ -1229,6 +1266,7 @@ impl Bridge {
                 "message_delta"=>{self.output=v["usage"]["output_tokens"].as_u64().unwrap_or(self.output);chunks.push(self.chunk(json!({}),v["delta"]["stop_reason"].as_str().map(|reason|match reason{"tool_use"=>"tool_calls","max_tokens"=>"length",_=>"stop"})));},_=>{},
             },
             Dialect::Gemini=>{
+                if let Some(message)=gemini_refusal(&v){return Err(message.into());}
                 let b=v.get("response").unwrap_or(&v);
                 self.input=b["usageMetadata"]["promptTokenCount"].as_u64().unwrap_or(self.input);self.output=b["usageMetadata"]["candidatesTokenCount"].as_u64().unwrap_or(self.output);
                 self.cached=b["usageMetadata"]["cachedContentTokenCount"].as_u64().unwrap_or(self.cached);

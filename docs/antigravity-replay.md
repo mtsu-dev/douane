@@ -20,12 +20,25 @@ and signature byte, including the signature field's spelling. It never merges
 across a signed block, a thought boundary or mismatched auxiliary metadata.
 Nonempty signed text and signatures without a text field remain separate parts.
 
-Replay requires the same account, model, session, root instructions, preceding
-history and visible output. Inline system and developer reminders remain at
-their historical positions in a private validation projection. The provider
-still receives their complete text in `systemInstruction`. Appending a reminder
-does not invalidate earlier turns; editing a reminder preceding a recorded turn
-does invalidate that turn.
+Replay requires the same account, model, session and normalized root
+instructions. A strict preceding-context match is preferred. When compaction
+changes that context, replay requires one unique match for the complete visible
+model output in that scope: text and ordered call IDs, names and arguments.
+Provider auxiliary metadata that translation never exposes does not enter this
+identity. Original native parts retain that metadata unchanged.
+
+Every recorded generation has an immutable identity and one validated parent.
+Retained model turns must follow one ordered lineage; reordered turns, sibling
+branches, ambiguous matches and altered model outputs are rejected. Repeated
+generations never overwrite nodes that existing descendants reference. Parent
+links and indexes use linear memory within the existing cache budget.
+
+The authenticated client may remove a prefix or edit its own user text, tool
+results and inline system/developer reminders. Their new values are forwarded
+exactly, with no old context silently reinserted. Root instructions remain
+immutable. This replaces the earlier policy that rejected edits to preceding
+inline reminders. No summary marker, tool ID alone or parsed summary text grants
+replay access.
 
 ## Account ownership and rate limits
 
@@ -47,7 +60,8 @@ Ownership is ephemeral with the replay cache and is not a new persistent pin.
 ## Retention
 
 The cache retains whole scopes rather than independently expiring individual
-turns. Each scope indexes turns by preceding context and visible output.
+turns. Each scope indexes immutable generations by preceding context and
+complete visible output.
 The memory budget remains 8 MiB, including conservative allocation/index
 overhead, and each native turn remains limited to 256 KiB of serialized parts.
 There is no independent turn-count limit.
@@ -67,6 +81,13 @@ responses report an error event and withhold the successful completion event
 until recording succeeds. Missing unsigned text history is rejected locally,
 just like missing unsigned tool history, before contacting the provider.
 
+Native recording distinguishes transport/interruption, missing completion,
+empty output, truncation without output, provider refusal and turn-size errors.
+A SAFETY or other refused completion is an error even when it contains partial
+text; it never produces a successful SSE completion. Token counters alone do
+not determine whether output exists. Unsupported native media is rejected by
+both translated JSON and SSE responses.
+
 The cache is process-local. A restart, idle expiry or whole-scope eviction can
 require a new conversation. No private reasoning is persisted, added to client
 payloads or written to diagnostics. This change does not provide durable replay
@@ -85,4 +106,6 @@ public HTTP harness covers tool cycles and text correction with dynamic system
 reminders across Messages, Chat and Responses over JSON and SSE, including
 reasoning deltas whose signature arrives in a final empty-text frame,
 recording failures before successful completion, account-bound rate-limit recovery,
-access revocation and upstream refusals without cross-account failover.
+access revocation and upstream refusals without cross-account failover. It also
+covers compacted suffixes, edited tool results, native auxiliary metadata and
+empty/refused/truncated terminations across all three client dialects.

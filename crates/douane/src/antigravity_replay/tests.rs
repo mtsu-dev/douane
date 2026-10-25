@@ -26,7 +26,10 @@ fn unsigned_call(id: &str, arg: i64) -> Value {
 }
 
 fn store(cache: &mut ReplayCache, scope: Scope, request: &Value, parts: Value) -> Value {
-    let mut recorder = Recorder::new(scope, contents(request));
+    let parent = cache
+        .restore_at(&scope, &mut request.clone(), Instant::now())
+        .unwrap();
+    let mut recorder = Recorder::new(scope, contents(request)).with_parent(parent);
     let mut event = json!({"response":{"candidates":[{"content":{"role":"model","parts":parts},"finishReason":"STOP"}]}});
     recorder.observe(&mut event);
     let turn = recorder
@@ -263,7 +266,7 @@ fn closing_signature_obeys_the_exact_serialized_turn_budget() {
             assert_eq!(json!(turn.unwrap().parts), json!([part]));
         } else {
             assert!(
-                turn.is_none(),
+                turn.is_err(),
                 "an oversized signature closure must abandon recording"
             );
         }
@@ -411,7 +414,7 @@ fn altered_call_arguments_name_id_or_order_never_inherit_signatures() {
 }
 
 #[test]
-fn preceding_user_context_and_tool_results_are_part_of_the_identity() {
+fn client_owned_context_and_tool_results_may_change_with_exact_model_output() {
     let initial = request();
     let mut cache = ReplayCache::default();
     store(
@@ -423,7 +426,8 @@ fn preceding_user_context_and_tool_results_are_part_of_the_identity() {
     let mut replay = initial.clone();
     replay["contents"][0]["parts"][0]["text"] = json!("changed context");
     append(&mut replay, "model", json!([unsigned_call("known", 1)]));
-    assert!(cache.restore(&scope(), &mut replay).is_err());
+    cache.restore(&scope(), &mut replay).unwrap();
+    assert_eq!(replay["contents"][0]["parts"][0]["text"], "changed context");
     let mut second_context = initial;
     append(
         &mut second_context,
@@ -449,9 +453,11 @@ fn preceding_user_context_and_tool_results_are_part_of_the_identity() {
         "model",
         json!([unsigned_call("second_known", 2)]),
     );
-    let original = second_context.clone();
-    assert!(cache.restore(&scope(), &mut second_context).is_err());
-    assert_eq!(second_context, original);
+    cache.restore(&scope(), &mut second_context).unwrap();
+    assert_eq!(
+        second_context["contents"][2]["parts"][0]["functionResponse"]["response"]["result"],
+        "changed"
+    );
 }
 
 #[test]
@@ -487,7 +493,7 @@ fn credential_model_and_session_scopes_cannot_exchange_signed_turns() {
 }
 
 #[test]
-fn signed_plain_text_requires_matching_context_and_scope() {
+fn signed_plain_text_allows_client_context_changes_but_requires_matching_scope() {
     let initial = request();
     let mut cache = ReplayCache::default();
     let native = json!([{"thought":true,"text":"private reasoning"},{"text":"hello ","thoughtSignature":"SYNTHETIC_TEXT"},{"text":"world"}]);
@@ -503,9 +509,11 @@ fn signed_plain_text_requires_matching_context_and_scope() {
     let mut wrong_context = initial.clone();
     wrong_context["contents"][0]["parts"][0]["text"] = json!("other question");
     append(&mut wrong_context, "model", json!([{"text":"hello world"}]));
-    let original = wrong_context.clone();
-    assert!(cache.restore(&scope(), &mut wrong_context).is_err());
-    assert_eq!(wrong_context, original);
+    cache.restore(&scope(), &mut wrong_context).unwrap();
+    assert_eq!(
+        wrong_context["contents"][0]["parts"][0]["text"],
+        "other question"
+    );
     let mut wrong_scope = initial;
     append(&mut wrong_scope, "model", json!([{"text":"hello world"}]));
     let original = wrong_scope.clone();
@@ -526,19 +534,19 @@ fn interrupted_and_error_streams_never_finalize_a_turn() {
     let mut recorder = Recorder::new(scope(), contents(&request()));
     let mut event = json!({"candidates":[{"content":{"parts":[signed_call("partial",1)]}}]});
     recorder.observe(&mut event);
-    assert!(recorder.finish().is_none(), "missing terminal finishReason");
+    assert!(recorder.finish().is_err(), "missing terminal finishReason");
     let mut recorder = Recorder::new(scope(), contents(&request()));
     event["candidates"][0]["finishReason"] = json!("STOP");
     recorder.observe(&mut event);
     recorder.abort();
     assert!(
-        recorder.finish().is_none(),
+        recorder.finish().is_err(),
         "transport disconnect after terminal"
     );
     let mut recorder = Recorder::new(scope(), contents(&request()));
     recorder.observe(&mut event);
     recorder.observe(&mut json!({"error":{"message":"synthetic stream failure"}}));
-    assert!(recorder.finish().is_none());
+    assert!(recorder.finish().is_err());
 }
 
 #[test]
@@ -546,7 +554,7 @@ fn oversized_native_output_is_discarded_before_recording() {
     let mut recorder = Recorder::new(scope(), contents(&request()));
     let mut event = json!({"candidates":[{"content":{"parts":[{"text":"x".repeat(256*1024+1),"thoughtSignature":"SYNTHETIC_LARGE"}]},"finishReason":"STOP"}]});
     recorder.observe(&mut event);
-    assert!(recorder.finish().is_none());
+    assert!(recorder.finish().is_err());
     let mut recorder = Recorder::new(scope(), contents(&request()));
     recorder.observe(&mut json!({"candidates":[{"content":{"parts":[signed_call("too_large_for_cache",1)]},"finishReason":"STOP"}]}));
     let mut cache = ReplayCache::with_limits(1024, 8, Duration::from_secs(60));
@@ -679,9 +687,11 @@ fn a_successful_long_running_generation_renews_idle_ttl_after_release() {
     assert!(cache.record_at(turn_for(scope(), &request(), "first"), started));
     let mut history = text_history("first");
     append(&mut history, "user", json!([{"text":"Continue."}]));
-    cache.begin(&scope(), &mut history).unwrap();
+    let parent = cache.begin(&scope(), &mut history).unwrap();
     let completed = started + Duration::from_secs(2 * 3600);
-    assert!(cache.record_at(turn_for(scope(), &history, "second"), completed));
+    let mut second = turn_for(scope(), &history, "second");
+    second.parent = parent;
+    assert!(cache.record_at(second, completed));
     cache.release(&scope());
     append(&mut history, "model", json!([{"text":"second"}]));
     cache.restore_at(&scope(), &mut history, completed + Duration::from_secs(1))
@@ -781,7 +791,7 @@ fn missing_sessions_assign_ids_but_never_store_or_restore_history() {
             .as_str()
             .is_some()
     );
-    assert!(recorder.finish().is_none());
+    assert!(recorder.finish().is_err());
     let mut cache = ReplayCache::default();
     let mut replay = initial;
     cache.restore(&anonymous, &mut replay).unwrap();
@@ -807,7 +817,7 @@ fn existing_duplicate_upstream_ids_are_not_rewritten_or_recorded() {
         event["candidates"][0]["content"]["parts"][1]["functionCall"]["id"],
         "duplicate"
     );
-    assert!(recorder.finish().is_none());
+    assert!(recorder.finish().is_err());
 }
 
 #[test]
@@ -881,7 +891,7 @@ fn wire_text_first_projection_restores_interleaved_native_parts_exactly() {
 }
 
 #[test]
-fn model_wire_projection_does_not_normalize_user_image_and_text_order() {
+fn client_user_parts_keep_their_new_order_after_native_restore() {
     let initial = json!({"contents":[{"role":"user","parts":[
         {"text":"before "},
         {"inlineData":{"mimeType":"image/png","data":"U1lOVEhFVElD"}},
@@ -909,8 +919,8 @@ fn model_wire_projection_does_not_normalize_user_image_and_text_order() {
         json!([{"text":"visible"},unsigned_call("image_context",1)]),
     );
     let original = changed.clone();
-    assert!(cache.restore(&scope(), &mut changed).is_err());
-    assert_eq!(changed, original);
+    cache.restore(&scope(), &mut changed).unwrap();
+    assert_eq!(changed["contents"][0], original["contents"][0]);
 }
 
 #[test]
@@ -1007,6 +1017,21 @@ fn owner_lookup_validates_all_history_without_touching_ttl_or_request() {
     );
     assert_eq!(follow, before);
     assert_eq!(cache.conversations[&scope()].last_used, t0);
+    let mut compacted = follow.clone();
+    compacted["contents"][0]["parts"][0]["text"] = json!("client compacted summary");
+    let compacted_before = compacted.clone();
+    assert_eq!(
+        cache
+            .owner_at(&scope().model, &scope().session, &compacted, now)
+            .unwrap(),
+        Some(scope().account)
+    );
+    assert_eq!(compacted, compacted_before);
+    assert_eq!(
+        cache.conversations[&scope()].last_used,
+        t0,
+        "fallback owner lookup must not renew TTL"
+    );
     // A valid first turn must not authorize an unrecorded later turn.
     append(
         &mut follow,
@@ -1060,11 +1085,11 @@ fn identical_text_history_on_two_accounts_has_no_arbitrary_owner() {
     );
     let mut changed = follow.clone();
     changed["contents"][0]["parts"][0]["text"] = json!("changed");
-    assert_eq!(
+    assert!(
         cache
             .owner(&scope().model, &scope().session, &changed)
-            .unwrap(),
-        None
+            .unwrap_err()
+            .contains("ambiguous")
     );
     assert_eq!(
         cache
@@ -1078,4 +1103,211 @@ fn identical_text_history_on_two_accounts_has_no_arbitrary_owner() {
             .unwrap(),
         None
     );
+}
+
+#[test]
+fn compacted_suffix_restores_native_parts_without_rewriting_client_context() {
+    let mut cache = ReplayCache::default();
+    let initial = request();
+    store(
+        &mut cache,
+        scope(),
+        &initial,
+        json!([signed_call("first", 1)]),
+    );
+    let mut second = initial.clone();
+    append(&mut second, "model", json!([unsigned_call("first", 1)]));
+    append(
+        &mut second,
+        "user",
+        json!([{"functionResponse":{"id":"first","name":"synthetic_tool","response":{"result":"original result"}}}]),
+    );
+    let native = json!([{"thought":true,"text":"private thought","thoughtSignature":"SYNTHETIC_THOUGHT"}, signed_call("second", 2)]);
+    store(&mut cache, scope(), &second, native.clone());
+    let mut compacted = json!({"contents":[{"role":"user","parts":[{"text":"client summary"}]},{"role":"system","parts":[{"text":"new compact reminder"}]}]});
+    append(&mut compacted, "model", json!([unsigned_call("second", 2)]));
+    append(
+        &mut compacted,
+        "user",
+        json!([{"functionResponse":{"id":"second","name":"synthetic_tool","response":{"result":"intact retained result"}}}]),
+    );
+    let original = compacted.clone();
+    cache.restore(&scope(), &mut compacted).unwrap();
+    assert_eq!(compacted["contents"][2]["parts"], native);
+    for index in [0, 1, 3] {
+        assert_eq!(compacted["contents"][index], original["contents"][index]);
+    }
+    let mut altered_output = original;
+    altered_output["contents"][2]["parts"][0]["functionCall"]["args"]["n"] = json!(999);
+    let unchanged = altered_output.clone();
+    assert!(cache.restore(&scope(), &mut altered_output).is_err());
+    assert_eq!(altered_output, unchanged);
+}
+
+#[test]
+fn native_auxiliary_fields_never_enter_the_client_visible_identity() {
+    let mut cache = ReplayCache::default();
+    let initial = request();
+    let native = json!([
+        {"text":"visible","synthetic_metadata":{"marker":1}},
+        {"functionCall":{"id":"native_call","name":"synthetic_tool","args":{"n":1},"synthetic_metadata":{"marker":2}},"synthetic_metadata":{"marker":3},"thoughtSignature":"SYNTHETIC"}
+    ]);
+    store(&mut cache, scope(), &initial, native.clone());
+    let mut next = initial;
+    append(
+        &mut next,
+        "model",
+        json!([{"text":"visible"},unsigned_call("native_call",1)]),
+    );
+    cache.restore(&scope(), &mut next).unwrap();
+    assert_eq!(next["contents"][1]["parts"], native);
+}
+
+#[test]
+fn compacted_history_rejects_ambiguous_visible_output_and_mixed_branches() {
+    let mut cache = ReplayCache::default();
+    let root_a = request();
+    let mut root_b = request();
+    root_b["contents"][0]["parts"][0]["text"] = json!("another branch");
+    for root in [&root_a, &root_b] {
+        store(
+            &mut cache,
+            scope(),
+            root,
+            json!([{"text":"same answer","thoughtSignature":"SYNTHETIC"}]),
+        );
+    }
+    // Full context remains the priority when visible text is shared by branches.
+    for root in [&root_a, &root_b] {
+        let mut strict = root.clone();
+        append(&mut strict, "model", json!([{"text":"same answer"}]));
+        cache.restore(&scope(), &mut strict).unwrap();
+    }
+    let mut compacted = json!({"contents":[{"role":"user","parts":[{"text":"summary"}]}]});
+    append(&mut compacted, "model", json!([{"text":"same answer"}]));
+    let unchanged = compacted.clone();
+    assert!(
+        cache
+            .restore(&scope(), &mut compacted)
+            .unwrap_err()
+            .contains("ambiguous")
+    );
+    assert_eq!(compacted, unchanged);
+
+    let mut cache = ReplayCache::default();
+    store(
+        &mut cache,
+        scope(),
+        &root_a,
+        json!([signed_call("branch_a", 1)]),
+    );
+    store(
+        &mut cache,
+        scope(),
+        &root_b,
+        json!([signed_call("branch_b", 2)]),
+    );
+    let mut mixed = json!({"contents":[{"role":"user","parts":[{"text":"summary"}]}]});
+    append(&mut mixed, "model", json!([unsigned_call("branch_a", 1)]));
+    append(&mut mixed, "user", json!([{"text":"result"}]));
+    append(&mut mixed, "model", json!([unsigned_call("branch_b", 2)]));
+    let unchanged = mixed.clone();
+    assert!(cache.restore(&scope(), &mut mixed).is_err());
+    assert_eq!(mixed, unchanged);
+}
+
+#[test]
+fn immutable_generations_keep_existing_descendant_ancestry() {
+    let mut cache = ReplayCache::default();
+    let root = request();
+    store(
+        &mut cache,
+        scope(),
+        &root,
+        json!([signed_call("ancestor", 1)]),
+    );
+    let mut branch = root.clone();
+    append(&mut branch, "model", json!([unsigned_call("ancestor", 1)]));
+    append(&mut branch, "user", json!([{"text":"next"}]));
+    store(
+        &mut cache,
+        scope(),
+        &branch,
+        json!([signed_call("descendant", 2)]),
+    );
+    let descendant = cache
+        .restore_at(
+            &scope(),
+            &mut {
+                let mut h = request();
+                append(&mut h, "model", json!([unsigned_call("descendant", 2)]));
+                h
+            },
+            Instant::now(),
+        )
+        .unwrap()
+        .unwrap();
+    let ancestor = cache.conversations[&scope()].turns[&descendant]
+        .parent
+        .unwrap();
+    let mut regenerated = signed_call("ancestor", 1);
+    regenerated["thoughtSignature"] = json!("SYNTHETIC_NEW_GENERATION");
+    store(&mut cache, scope(), &root, json!([regenerated]));
+    assert_eq!(cache.conversations[&scope()].turns.len(), 3);
+    assert!(cache.conversations[&scope()].turns.contains_key(&ancestor));
+    let mut suffix = json!({"contents":[{"role":"user","parts":[{"text":"summary"}]}]});
+    append(
+        &mut suffix,
+        "model",
+        json!([unsigned_call("descendant", 2)]),
+    );
+    append(&mut suffix, "user", json!([{"text":"continue"}]));
+    store(
+        &mut cache,
+        scope(),
+        &suffix,
+        json!([signed_call("next_generation", 3)]),
+    );
+    append(
+        &mut suffix,
+        "model",
+        json!([unsigned_call("next_generation", 3)]),
+    );
+    cache.restore(&scope(), &mut suffix).unwrap();
+}
+
+#[test]
+fn concurrent_siblings_and_reordered_ancestors_cannot_be_spliced() {
+    let mut cache = ReplayCache::default();
+    let root = request();
+    store(&mut cache, scope(), &root, json!([signed_call("root", 0)]));
+    let mut fork = root.clone();
+    append(&mut fork, "model", json!([unsigned_call("root", 0)]));
+    append(
+        &mut fork,
+        "user",
+        json!([{"text":"same concurrent request"}]),
+    );
+    store(&mut cache, scope(), &fork, json!([signed_call("left", 1)]));
+    store(&mut cache, scope(), &fork, json!([signed_call("right", 2)]));
+    for calls in [[("left", 1), ("right", 2)], [("left", 1), ("root", 0)]] {
+        let mut mixed = request();
+        for (id, n) in calls {
+            append(&mut mixed, "model", json!([unsigned_call(id, n)]));
+            append(&mut mixed, "user", json!([{"text":"result"}]));
+        }
+        let original = mixed.clone();
+        assert!(
+            cache
+                .restore(&scope(), &mut mixed)
+                .unwrap_err()
+                .contains("lineage")
+        );
+        assert_eq!(mixed, original);
+    }
+    for (id, n) in [("left", 1), ("right", 2)] {
+        let mut valid = fork.clone();
+        append(&mut valid, "model", json!([unsigned_call(id, n)]));
+        cache.restore(&scope(), &mut valid).unwrap();
+    }
 }
