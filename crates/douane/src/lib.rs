@@ -110,6 +110,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/health", get(management::health))
         .route("/v1/models", get(management::public_models))
+        .route("/muse-code/models", get(management::muse_models))
+        .route("/muse-code/responses", post(relay::forward))
         .route("/v1/quotas", get(management::public_quotas))
         .route("/v1/messages", post(relay::forward))
         .route("/v1/messages/count_tokens", post(relay::forward))

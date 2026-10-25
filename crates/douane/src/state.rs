@@ -39,6 +39,9 @@ pub struct Model {
     /// (`/v1/messages`, `/responses`, `/chat/completions`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub endpoints: Vec<String>,
+    /// Native provider catalog fields required by its own client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 fn yes() -> bool {
     true
@@ -74,6 +77,7 @@ impl Default for Model {
             thinking: None,
             route: None,
             endpoints: vec![],
+            metadata: None,
         }
     }
 }
@@ -331,7 +335,12 @@ impl AppState {
                     });
                 if !base.is_empty() {
                     let root = base.trim_end_matches('/');
-                    let url = if root.ends_with("/v1") {
+                    let url = if account.provider == SubscriptionProvider::Meta {
+                        format!(
+                            "{}/muse-code/models",
+                            root.strip_suffix("/v1").unwrap_or(root)
+                        )
+                    } else if root.ends_with("/v1") {
                         format!("{root}/models")
                     } else {
                         format!("{root}/v1/models")
@@ -376,17 +385,25 @@ impl AppState {
                         available = data
                             .iter()
                             .filter_map(|m| {
+                                let native = (account.provider == SubscriptionProvider::Meta)
+                                    .then(|| &m["metadata"]["muse-code"])
+                                    .filter(|v| v.is_object());
                                 Some(Model {
                                     id: m["id"].as_str()?.into(),
                                     name: m["name"].as_str().or_else(|| m["id"].as_str())?.into(),
                                     provider: account.provider,
                                     context_length: m["context_length"]
                                         .as_u64()
-                                        .or_else(|| m["context_window"].as_u64()),
-                                    max_output_tokens: None,
+                                        .or_else(|| m["context_window"].as_u64())
+                                        .or_else(|| {
+                                            native.and_then(|v| v["limit"]["context"].as_u64())
+                                        }),
+                                    max_output_tokens: native
+                                        .and_then(|v| v["limit"]["output"].as_u64()),
                                     enabled: true,
                                     upstream_id: String::new(),
                                     thinking: m.get("thinking").cloned(),
+                                    metadata: native.map(|v| json!({"muse-code":v})),
                                     ..Model::default()
                                 })
                             })

@@ -58,6 +58,9 @@ struct DeviceFlow {
 pub struct OAuthManager {
     client: reqwest::Client,
     meta_client: reqwest::Client,
+    /// Mint replies include quotas before the first inference. Keep only that
+    /// observation until QuotaService consumes it, never the minted key/body.
+    meta_usage: Mutex<BTreeMap<String, (time::OffsetDateTime, Value)>>,
     store: Arc<AccountStore>,
     pending: Mutex<BTreeMap<String, Pending>>,
     codex_token_url: String,
@@ -85,6 +88,7 @@ impl OAuthManager {
                 .user_agent("muse-code/1.0.2")
                 .build()
                 .expect("Meta HTTP client"),
+            meta_usage: Mutex::new(BTreeMap::new()),
             client,
             store,
             pending: Mutex::new(BTreeMap::new()),
@@ -478,9 +482,11 @@ impl OAuthManager {
                 .dca_token
                 .as_deref()
                 .ok_or(SubscriptionError::NoRefreshToken)?;
+            let observed = time::OffsetDateTime::now_utc();
             let value = super::meta::mint(&self.meta_client, &self.meta_mint_url, dca).await?;
             super::meta::apply_minted(&mut account, &value)?;
             self.store.update_credential(account).await?;
+            self.remember_meta_usage(id, &value, observed).await;
             return self.store.get(id).await.ok_or(SubscriptionError::NotFound);
         }
         let refresh_token = account
@@ -592,8 +598,9 @@ impl OAuthManager {
 
     async fn meta_account(&self, token: Value) -> Result<AccountSummary, SubscriptionError> {
         let dca = text(&token, &["access_token"]).ok_or(SubscriptionError::InvalidResponse)?;
+        let observed = time::OffsetDateTime::now_utc();
         let minted = super::meta::mint(&self.meta_client, &self.meta_mint_url, &dca).await?;
-        let mut value = minted;
+        let mut value = minted.clone();
         value["type"] = json!("meta");
         value["dca_token"] = json!(dca);
         if let Some(expires) = token["expires_in"].as_i64().filter(|n| *n > 0) {
@@ -601,7 +608,26 @@ impl OAuthManager {
                 time::OffsetDateTime::now_utc() + time::Duration::seconds(expires)
             ));
         }
-        self.store.import(value, None).await
+        let account = self.store.import(value, None).await?;
+        self.remember_meta_usage(&account.id, &minted, observed)
+            .await;
+        Ok(account)
+    }
+
+    async fn remember_meta_usage(&self, id: &str, minted: &Value, observed: time::OffsetDateTime) {
+        if let Some(usage) = minted.get("subs_usage").filter(|value| value.is_object()) {
+            self.meta_usage.lock().await.insert(
+                id.into(),
+                (
+                    observed,
+                    json!({"type":"response.subscription_usage", "subscription":usage}),
+                ),
+            );
+        }
+    }
+
+    pub(crate) async fn take_meta_usage(&self, id: &str) -> Option<(time::OffsetDateTime, Value)> {
+        self.meta_usage.lock().await.remove(id)
     }
 
     async fn xai_discovery(&self) -> Result<(String, String), SubscriptionError> {
@@ -1345,6 +1371,94 @@ mod tests {
                 .unwrap()
                 .access_token,
             "private-key-1"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn meta_quota_bootstraps_from_mint_and_refreshes_without_inference() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mints = Arc::new(AtomicUsize::new(0));
+        let calls = mints.clone();
+        let app = Router::new().route("/mint", post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+            let calls = calls.clone();
+            async move {
+                assert_eq!(body["dca_token"], "dca:private");
+                assert_eq!(body["onboard"], false);
+                assert_eq!(headers["x-api-version"], "1.0.0");
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n == 2 {
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"private-error"})));
+                }
+                (StatusCode::OK, Json(json!({
+                    "api_key":format!("private-key-{n}"), "is_subs_active":true,
+                    "require_payment":false, "subs_tier_name":"Power Usage", "subs_tier_id":"power",
+                    "subs_usage":{"weekly":{"used_percent":20+n,"resets_at":1893456000},
+                                  "window":{"used_percent":40+n,"resets_at":1893440000,"window_duration_mins":300}}
+                })))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/mint", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(dir.path()).unwrap());
+        let mut manager = OAuthManager::new(reqwest::Client::new(), store.clone());
+        manager.meta_mint_url = endpoint;
+        let account = manager
+            .meta_account(json!({"access_token":"dca:private"}))
+            .await
+            .unwrap();
+        let service = super::super::quota::QuotaService::with_oauth(
+            reqwest::Client::new(),
+            store.clone(),
+            Arc::new(manager),
+        );
+        let first = service.refresh(&account.id).await.unwrap();
+        assert_eq!(
+            first.windows.len(),
+            2,
+            "a newly connected account needs no inference to show quotas"
+        );
+        assert_eq!(first.windows[0].remaining_percent, Some(80.0));
+        assert_eq!(first.windows[1].id, "five-hour");
+        assert_eq!(first.windows[1].remaining_percent, Some(60.0));
+        assert_eq!(
+            mints.load(Ordering::SeqCst),
+            1,
+            "reuse login's quota observation"
+        );
+        let refreshed = service.refresh(&account.id).await.unwrap();
+        assert_eq!(refreshed.windows[0].remaining_percent, Some(79.0));
+        assert_eq!(refreshed.windows[1].remaining_percent, Some(59.0));
+        assert_eq!(
+            store.get(&account.id).await.unwrap().access_token,
+            "private-key-1"
+        );
+        assert_eq!(mints.load(Ordering::SeqCst), 2);
+        let failed = service.refresh(&account.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&failed.windows).unwrap(),
+            serde_json::to_value(&refreshed.windows).unwrap()
+        );
+        assert_eq!(failed.updated_at, refreshed.updated_at);
+        assert!(failed.error.as_deref().is_some_and(|e| e.contains("503")));
+        let public = serde_json::to_string(&failed).unwrap();
+        assert!(
+            !public.contains("private-key")
+                && !public.contains("dca:")
+                && !public.contains("private-error")
+        );
+        let recovered = service.refresh(&account.id).await.unwrap();
+        assert_eq!(recovered.windows[0].remaining_percent, Some(77.0));
+        assert!(recovered.error.is_none());
+        let reopened = super::super::quota::QuotaService::new(reqwest::Client::new(), store);
+        assert_eq!(
+            serde_json::to_value(reopened.get(&account.id).await.unwrap().windows).unwrap(),
+            serde_json::to_value(recovered.windows).unwrap()
         );
         server.abort();
     }
