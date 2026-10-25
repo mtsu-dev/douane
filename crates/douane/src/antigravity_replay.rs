@@ -262,6 +262,9 @@ impl ReplayCache {
         conversation.bytes = conversation.bytes + turn.bytes - previous;
         self.bytes = self.bytes + overhead + turn.bytes - previous;
         conversation.turns.insert(key, turn);
+        // A generation can outlast the idle TTL while pinned. Its successful
+        // completion starts a fresh idle period; refused recordings never do.
+        conversation.last_used = now;
         true
     }
 

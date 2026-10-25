@@ -19,9 +19,11 @@ The memory budget remains 8 MiB, including conservative allocation/index
 overhead, and each native turn remains limited to 256 KiB of serialized parts.
 There is no independent turn-count limit.
 
-A fully validated restore renews the scope's one-hour idle TTL. A failed
-restore, changed session or newly recorded response does not renew an existing
-scope. Capacity pressure evicts whole idle scopes in least-recently-used order.
+A fully validated restore or successfully recorded native completion renews the
+scope's one-hour idle TTL. A generation that outlasts the TTL while pinned
+therefore remains replayable after completion. A failed restore, changed session
+or refused recording does not renew an existing scope. Capacity pressure evicts
+whole idle scopes in least-recently-used order.
 Active upstream calls pin their scope, including concurrent calls in the same
 scope, until completion or cancellation. An extension that cannot fit alongside
 its own prefix fails without deleting that prefix. If pinned scopes occupy the

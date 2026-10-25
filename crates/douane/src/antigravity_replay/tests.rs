@@ -454,8 +454,10 @@ fn extending_a_full_conversation_is_refused_without_losing_its_prefix() {
     let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
     assert!(cache.record(first));
     let before = cache.bytes;
+    let last_used = cache.conversations[&scope()].last_used;
     assert!(!cache.record(turn_for(scope(), &text_history("first"), "second")));
     assert_eq!(cache.bytes, before);
+    assert_eq!(cache.conversations[&scope()].last_used, last_used);
     assert_eq!(cache.conversations[&scope()].turns.len(), 1);
     cache.restore(&scope(), &mut text_history("first")).unwrap();
 }
@@ -486,7 +488,24 @@ fn active_calls_pin_their_whole_conversation_and_release_on_cancellation() {
 }
 
 #[test]
-fn ttl_slides_only_after_a_fully_valid_restore() {
+fn a_successful_long_running_generation_renews_idle_ttl_after_release() {
+    let started = Instant::now();
+    let mut cache = ReplayCache::default();
+    assert!(cache.record_at(turn_for(scope(), &request(), "first"), started));
+    let mut history = text_history("first");
+    append(&mut history, "user", json!([{"text":"Continue."}]));
+    cache.begin(&scope(), &mut history).unwrap();
+    let completed = started + Duration::from_secs(2 * 3600);
+    assert!(cache.record_at(turn_for(scope(), &history, "second"), completed));
+    cache.release(&scope());
+    append(&mut history, "model", json!([{"text":"second"}]));
+    cache.restore_at(&scope(), &mut history, completed + Duration::from_secs(1))
+        .expect("a completed generation must remain replayable even when it ran longer than the idle TTL");
+    assert_eq!(cache.conversations[&scope()].turns.len(), 2);
+}
+
+#[test]
+fn rejected_restores_and_recordings_do_not_renew_idle_ttl() {
     let now = Instant::now();
     let mut cache = ReplayCache::with_limits(65536, 4096, Duration::from_secs(10));
     assert!(cache.record_at(turn_for(scope(), &request(), "first"), now));
@@ -504,8 +523,8 @@ fn ttl_slides_only_after_a_fully_valid_restore() {
             now + Duration::from_secs(18),
         )
         .unwrap();
-    assert!(cache.record_at(
-        turn_for(scope(), &request(), "second"),
+    assert!(!cache.record_at(
+        turn_for(scope(), &request(), &"x".repeat(4096)),
         now + Duration::from_secs(19)
     ));
     let other = Scope {
@@ -540,7 +559,7 @@ fn ttl_slides_only_after_a_fully_valid_restore() {
                 now + Duration::from_secs(28)
             )
             .is_err(),
-        "failed restore and record must not renew TTL"
+        "failed restore and rejected record must not renew TTL"
     );
     assert_eq!(cache.bytes, 0);
 }
