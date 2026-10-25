@@ -554,6 +554,9 @@ pub async fn forward(
                     })
                     .unwrap_or_default(),
             };
+            // Future context identity follows the client projection, whose
+            // tool IDs differ from the original provider IDs restored below.
+            let client_contents = history["contents"].as_array().cloned().unwrap_or_default();
             if let Err(e) = state
                 .antigravity_replay
                 .lock()
@@ -565,10 +568,7 @@ pub async fn forward(
             let native_replay = NativeReplay {
                 state: state.clone(),
                 scope: scope.clone(),
-                recorder: Some(Recorder::new(
-                    scope,
-                    history["contents"].as_array().cloned().unwrap_or_default(),
-                )),
+                recorder: Some(Recorder::new(scope, client_contents)),
                 terminal_output: None,
             };
             // Only model parts cross from the chronological cache projection
@@ -596,6 +596,43 @@ pub async fn forward(
                 return error(
                     StatusCode::BAD_REQUEST,
                     "signed-history model projection does not match native contents",
+                );
+            }
+            // Only tool-result IDs cross from the restored user projection;
+            // preserve every client result value, text and instruction.
+            let mut restored_responses = history["contents"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|content| content["parts"].as_array())
+                .flatten()
+                .filter_map(|part| part.get("functionResponse"));
+            if let Some(contents) = translated["contents"].as_array_mut() {
+                for response in contents
+                    .iter_mut()
+                    .filter_map(|content| content["parts"].as_array_mut())
+                    .flatten()
+                    .filter_map(|part| part.get_mut("functionResponse"))
+                {
+                    let Some(restored) = restored_responses.next() else {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "signed-history tool-result projection does not match native contents",
+                        );
+                    };
+                    if let Some(object) = response.as_object_mut() {
+                        if let Some(id) = restored.get("id") {
+                            object.insert("id".into(), id.clone());
+                        } else {
+                            object.remove("id");
+                        }
+                    }
+                }
+            }
+            if restored_responses.next().is_some() {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "signed-history tool-result projection does not match native contents",
                 );
             }
             Some(native_replay)
