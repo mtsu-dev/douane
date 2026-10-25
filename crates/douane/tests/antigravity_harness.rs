@@ -647,6 +647,76 @@ async fn three_native_sse_frames_replay_without_empty_text_sentinels() {
 }
 
 #[tokio::test]
+async fn streamed_thought_signature_survives_two_tool_cycles() {
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            let mut expected = Vec::new();
+            let replies = (1..=3).map(|turn| {
+                let mut value = reply(turn);
+                if turn < 3 {
+                    let call = json!({"functionCall":{
+                        "name":"synthetic_tool","args":{"n":turn},"id":format!("toolu_thought_{turn}")
+                    }});
+                    value["response"]["candidates"][0]["content"]["parts"] = json!([
+                        {"thought":true,"text":"synthetic "},
+                        {"thought":true,"text":format!("reasoning {turn}")},
+                        {"thought":true,"text":"","thoughtSignature":format!("SYNTHETIC_CLOSING_{turn}")},
+                        {"text":format!("before{turn} ")},
+                        call.clone(),
+                        {"text":format!("after{turn}")}
+                    ]);
+                    expected.push(json!([
+                        {"thought":true,"text":format!("synthetic reasoning {turn}"),"thoughtSignature":format!("SYNTHETIC_CLOSING_{turn}")},
+                        {"text":format!("before{turn} ")}, call,
+                        {"text":format!("after{turn}")}
+                    ]));
+                }
+                value
+            }).collect();
+            let fixture = Fixture::new("antigravity", replies).await;
+            fixture.mock.force_stream.store(true, Ordering::Relaxed);
+            fixture
+                .mock
+                .empty_stream_sentinels
+                .store(true, Ordering::Relaxed);
+            let mut ids = Vec::new();
+            for turn in 1..=3 {
+                let (status, body) = fixture
+                    .post(
+                        kind,
+                        request(kind, &ids, "antigravity"),
+                        Some("closing-signature"),
+                        stream,
+                    )
+                    .await;
+                assert_eq!(status, 200, "{kind}, stream={stream}, turn={turn}: {body}");
+                if turn < 3 {
+                    ids.push(call_id(kind, &body, stream));
+                } else {
+                    assert!(body.contains("DONE"));
+                }
+            }
+            assert_eq!(ids, ["toolu_thought_1", "toolu_thought_2"]);
+            let received = fixture.mock.received.lock().unwrap();
+            for request_index in 1..3 {
+                for native_turn in 1..=request_index {
+                    assert_eq!(
+                        received[request_index]["request"]["contents"][native_turn * 2 - 1]["parts"],
+                        expected[native_turn - 1],
+                        "{kind}, stream={stream}: a closing signature belongs to the preceding thought block"
+                    );
+                    assert_eq!(
+                        received[request_index]["request"]["contents"][native_turn * 2]["parts"][0]
+                            ["functionResponse"]["id"],
+                        format!("toolu_thought_{native_turn}")
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn interrupted_native_stream_never_commits_a_signed_tool_turn() {
     let mut incomplete = reply(1);
     incomplete["response"]["candidates"][0]
@@ -830,7 +900,12 @@ async fn text_correction_with_new_system_reminders_restores_hidden_native_parts(
     for kind in ["messages", "chat/completions", "responses"] {
         for stream in [false, true] {
             let mut first = reply(3);
-            first["response"]["candidates"][0]["content"]["parts"] = signed.clone();
+            first["response"]["candidates"][0]["content"]["parts"] = json!([
+                {"thought":true,"text":"synthetic private "},
+                {"thought":true,"text":"reasoning"},
+                {"thought":true,"text":"","thoughtSignature":"SYNTHETIC_THOUGHT"},
+                {"text":"first answer","thoughtSignature":"SYNTHETIC_TEXT"}
+            ]);
             let fixture = Fixture::new("antigravity", vec![first, reply(3)]).await;
             fixture.mock.force_stream.store(true, Ordering::Relaxed);
             fixture
