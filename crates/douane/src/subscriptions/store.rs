@@ -715,6 +715,19 @@ impl AccountStore {
         route: Option<&str>,
         model: Option<&str>,
     ) -> Vec<AccountCredential> {
+        self.eligible_in_for_replay(provider, route, model, None)
+            .await
+    }
+
+    /// A history owner may be returned during cooldown so the relay can report
+    /// its retry delay. All other eligibility checks still apply.
+    pub(crate) async fn eligible_in_for_replay(
+        &self,
+        provider: SubscriptionProvider,
+        route: Option<&str>,
+        model: Option<&str>,
+        owner: Option<&str>,
+    ) -> Vec<AccountCredential> {
         self.accounts
             .read()
             .await
@@ -722,7 +735,9 @@ impl AccountStore {
             .filter(|account| {
                 account.provider == provider
                     && account.route.as_deref() == route
-                    && matches!(account.summary().status.as_str(), "ready" | "error")
+                    && (matches!(account.summary().status.as_str(), "ready" | "error")
+                        || (owner == Some(account.id.as_str())
+                            && account.summary().status == "cooldown"))
                     && model.is_none_or(|model| {
                         (account.models.is_empty() || account.models.iter().any(|m| m == model))
                             && !account.model_exhaustion.iter().any(|(family, reset)| {
