@@ -12,7 +12,13 @@ client's chronological projection before native restoration.
 
 Some SSE responses wrap tool calls with boundary deltas consisting only of
 `{"text":""}`. Those deltas are omitted from replay history. Empty text with a
-signature, thought flag or any other field remains intact, as does whitespace.
+signature, thought flag or any other field is never discarded, nor is whitespace.
+
+A final empty-text signature delta closes the preceding unsigned text block
+when all other metadata match exactly. The assembled block keeps every text
+and signature byte, including the signature field's spelling. It never merges
+across a signed block, a thought boundary or mismatched auxiliary metadata.
+Nonempty signed text and signatures without a text field remain separate parts.
 
 Replay requires the same account, model, session, root instructions, preceding
 history and visible output. Inline system and developer reminders remain at
@@ -77,5 +83,6 @@ The cache tests cover two interleaved 160-turn conversations, atomic eviction,
 sliding expiry, rejected restores, concurrent pins and capacity refusal. The
 public HTTP harness covers tool cycles and text correction with dynamic system
 reminders across Messages, Chat and Responses over JSON and SSE, including
+reasoning deltas whose signature arrives in a final empty-text frame,
 recording failures before successful completion, account-bound rate-limit recovery,
 access revocation and upstream refusals without cross-account failover.

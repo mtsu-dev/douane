@@ -146,6 +146,20 @@ impl Recorder {
         }) {
             return;
         }
+        if let Some(last) = self.parts.last_mut()
+            && let Some(key) = closing_signature(last, part)
+        {
+            // A streamed signature closes the preceding unsigned text block.
+            // Its key/value are the only new bytes in the assembled object.
+            let extra = serialized_size(&key) + serialized_size(&part[key]) + 2;
+            if self.parts_bytes.saturating_add(extra) > MAX_TURN_BYTES {
+                self.abort();
+                return;
+            }
+            last[key] = part[key].clone();
+            self.parts_bytes += extra;
+            return;
+        }
         if let Some(last) = self
             .parts
             .last_mut()
@@ -624,6 +638,35 @@ fn calls_are_signed(parts: &[Value]) -> bool {
 
 fn detached_signature(part: &Value) -> bool {
     has_signature(part) && part.get("functionCall").is_none() && part.get("text").is_none()
+}
+
+fn closing_signature(left: &Value, right: &Value) -> Option<&'static str> {
+    let (left, right) = (left.as_object()?, right.as_object()?);
+    if left.get("text").and_then(Value::as_str).is_none()
+        || right.get("text").and_then(Value::as_str) != Some("")
+        || [
+            "thoughtSignature",
+            "thought_signature",
+            "functionCall",
+            "functionResponse",
+        ]
+        .iter()
+        .any(|key| left.contains_key(*key))
+        || right.len() != left.len() + 1
+        || !left
+            .iter()
+            .all(|(key, value)| key == "text" || right.get(key) == Some(value))
+    {
+        return None;
+    }
+    ["thoughtSignature", "thought_signature"]
+        .into_iter()
+        .find(|key| {
+            right
+                .get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
 }
 
 fn mergeable_text(left: &Value, right: &Value) -> bool {

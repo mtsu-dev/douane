@@ -136,6 +136,141 @@ fn streamed_interleaved_thoughts_and_detached_signatures_keep_order() {
 }
 
 #[test]
+fn streamed_thought_signature_closes_the_preceding_unsigned_block() {
+    for key in ["thoughtSignature", "thought_signature"] {
+        let initial = request();
+        let mut recorder = Recorder::new(scope(), contents(&initial));
+        for delta in ["synthetic ", "thought ", "with unicode é\n"] {
+            let mut event = json!({"response":{"candidates":[{"content":{"parts":[
+                {"thought":true,"text":delta}
+            ]}}]}});
+            recorder.observe(&mut event);
+        }
+        let mut closing = json!({"thought":true,"text":""});
+        closing[key] = json!("SYNTHETIC_SIGNATURE");
+        let call = json!({"functionCall":{"name":"Bash","args":{"command":"printf fixture"},"id":"toolu_fixture"}});
+        let mut event = json!({"response":{"candidates":[{"content":{"parts":[
+            closing, call.clone()
+        ]},"finishReason":"STOP"}]}});
+        let original = event.clone();
+        recorder.observe(&mut event);
+        assert_eq!(event, original, "assembly must not mutate streamed events");
+        let mut cache = ReplayCache::default();
+        assert!(cache.record(recorder.finish().unwrap()));
+        let mut replay = initial;
+        append(&mut replay, "model", json!([call.clone()]));
+        append(
+            &mut replay,
+            "user",
+            json!([{"functionResponse":{
+                "name":"Bash","id":"toolu_fixture","response":{"result":"fixture"}
+            }}]),
+        );
+        cache.restore(&scope(), &mut replay).unwrap();
+        let mut thought = json!({"thought":true,"text":"synthetic thought with unicode é\n"});
+        thought[key] = json!("SYNTHETIC_SIGNATURE");
+        assert_eq!(replay["contents"][1]["parts"], json!([thought, call]));
+    }
+}
+
+#[test]
+fn closing_signatures_preserve_signed_boundaries_and_incompatible_metadata() {
+    let unsigned = json!({"thought":true,"text":"reasoning"});
+    let closing = json!({"thought":true,"text":"","thoughtSignature":"SYNTHETIC_CLOSING"});
+    for (left, right) in [
+        (
+            json!({"thought":true,"text":"reasoning","thoughtSignature":"SYNTHETIC_PRIOR"}),
+            closing.clone(),
+        ),
+        (
+            json!({"thought":true,"text":"reasoning","thought_signature":"SYNTHETIC_PRIOR"}),
+            closing.clone(),
+        ),
+        (json!({"text":"visible"}), closing.clone()),
+        (json!({"thought":false,"text":"visible"}), closing.clone()),
+        (
+            json!({"thought":true,"text":"reasoning","metadata":{"block":1}}),
+            closing.clone(),
+        ),
+        (
+            unsigned.clone(),
+            json!({"thought":true,"text":"","thoughtSignature":"SYNTHETIC_CLOSING","metadata":{"block":1}}),
+        ),
+        (
+            unsigned.clone(),
+            json!({"text":"","thoughtSignature":"SYNTHETIC_CLOSING"}),
+        ),
+        (
+            unsigned.clone(),
+            json!({"thought":true,"text":"separate signed block","thoughtSignature":"SYNTHETIC_CLOSING"}),
+        ),
+        (
+            unsigned.clone(),
+            json!({"thought":true,"thoughtSignature":"SYNTHETIC_DETACHED"}),
+        ),
+        (
+            unsigned.clone(),
+            json!({"thought":true,"text":"","thoughtSignature":""}),
+        ),
+        (
+            unsigned.clone(),
+            json!({"thought":true,"text":"","thoughtSignature":"SYNTHETIC_CAMEL","thought_signature":"SYNTHETIC_SNAKE"}),
+        ),
+        (
+            unsigned.clone(),
+            json!({"thought":true,"text":"","thoughtSignature":12}),
+        ),
+    ] {
+        let expected = json!([left, right]);
+        let mut recorder = Recorder::new(scope(), contents(&request()));
+        let mut event =
+            json!({"candidates":[{"content":{"parts":expected},"finishReason":"STOP"}]});
+        recorder.observe(&mut event);
+        assert_eq!(json!(recorder.finish().unwrap().parts), expected);
+    }
+
+    // Identical auxiliary metadata survives; it must not be dropped to force a match.
+    let mut recorder = Recorder::new(scope(), contents(&request()));
+    let mut event = json!({"candidates":[{"content":{"parts":[
+        {"thought":true,"text":"reasoning","metadata":{"block":1}},
+        {"thought":true,"text":"","metadata":{"block":1},"thoughtSignature":"SYNTHETIC_CLOSING"},
+        {"thought":true,"text":"next block"}
+    ]},"finishReason":"STOP"}]});
+    recorder.observe(&mut event);
+    assert_eq!(
+        json!(recorder.finish().unwrap().parts),
+        json!([
+            {"thought":true,"text":"reasoning","metadata":{"block":1},"thoughtSignature":"SYNTHETIC_CLOSING"},
+            {"thought":true,"text":"next block"}
+        ])
+    );
+}
+
+#[test]
+fn closing_signature_obeys_the_exact_serialized_turn_budget() {
+    for overflow in [0, 1] {
+        let mut part = json!({"thought":true,"text":"","thoughtSignature":"SYNTHETIC_CLOSING"});
+        let overhead = serialized_size(&json!([part.clone()]));
+        part["text"] = json!("x".repeat(MAX_TURN_BYTES - overhead + overflow));
+        let mut recorder = Recorder::new(scope(), contents(&request()));
+        let mut event = json!({"candidates":[{"content":{"parts":[
+            {"thought":true,"text":part["text"]},
+            {"thought":true,"text":"","thoughtSignature":"SYNTHETIC_CLOSING"}
+        ]},"finishReason":"STOP"}]});
+        recorder.observe(&mut event);
+        let turn = recorder.finish();
+        if overflow == 0 {
+            assert_eq!(json!(turn.unwrap().parts), json!([part]));
+        } else {
+            assert!(
+                turn.is_none(),
+                "an oversized signature closure must abandon recording"
+            );
+        }
+    }
+}
+
+#[test]
 fn duplicate_parallel_calls_get_distinct_ids_and_replay_by_id() {
     let mut cache = ReplayCache::default();
     let initial = request();
