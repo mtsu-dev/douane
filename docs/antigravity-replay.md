@@ -4,6 +4,16 @@ Translated clients return visible assistant text and tool calls. They do not
 retain every native thought, signature or part boundary. Douane records those
 native parts in memory and restores them before forwarding the next request.
 
+Client-only tool IDs never enter the stored native parts. Replay keeps a
+mapping from each client ID to the provider's original ID, including its
+absence, and applies that identity to the corresponding tool result. Native
+IDs supplied by the provider stay unchanged. Context fingerprints use the
+client's chronological projection before native restoration.
+
+Some SSE responses wrap tool calls with boundary deltas consisting only of
+`{"text":""}`. Those deltas are omitted from replay history. Empty text with a
+signature, thought flag or any other field remains intact, as does whitespace.
+
 Replay requires the same account, model, session, root instructions, preceding
 history and visible output. Inline system and developer reminders remain at
 their historical positions in a private validation projection. The provider

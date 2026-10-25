@@ -104,15 +104,6 @@ fn streamed_interleaved_thoughts_and_detached_signatures_keep_order() {
         {"thought":true,"text":"another thought"},
         {"functionCall":{"name":"synthetic_tool","args":{"n":2}}}
     ]},"finishReason":"STOP"}]}});
-    recorder.observe(&mut first);
-    recorder.observe(&mut last);
-    let id1 = first["candidates"][0]["content"]["parts"][2]["functionCall"]["id"]
-        .as_str()
-        .expect("ID injected before conversion");
-    let id2 = last["response"]["candidates"][0]["content"]["parts"][1]["functionCall"]["id"]
-        .as_str()
-        .unwrap();
-    assert_ne!(id1, id2);
     let mut expected = first["candidates"][0]["content"]["parts"]
         .as_array()
         .unwrap()
@@ -123,6 +114,15 @@ fn streamed_interleaved_thoughts_and_detached_signatures_keep_order() {
             .unwrap()
             .clone(),
     );
+    recorder.observe(&mut first);
+    recorder.observe(&mut last);
+    let id1 = first["candidates"][0]["content"]["parts"][2]["functionCall"]["id"]
+        .as_str()
+        .expect("ID injected before conversion");
+    let id2 = last["response"]["candidates"][0]["content"]["parts"][1]["functionCall"]["id"]
+        .as_str()
+        .unwrap();
+    assert_ne!(id1, id2);
     let mut cache = ReplayCache::default();
     assert!(cache.record(recorder.finish().unwrap()));
     let mut replay = initial;
@@ -139,33 +139,55 @@ fn streamed_interleaved_thoughts_and_detached_signatures_keep_order() {
 fn duplicate_parallel_calls_get_distinct_ids_and_replay_by_id() {
     let mut cache = ReplayCache::default();
     let initial = request();
-    let native = store(
-        &mut cache,
-        scope(),
-        &initial,
-        json!([
-            {"functionCall":{"name":"same","args":{"x":1}},"thoughtSignature":"SYNTHETIC_1"},
-            {"functionCall":{"name":"same","args":{"x":1}},"thoughtSignature":"SYNTHETIC_2"},
-            {"functionCall":{"id":"upstream_id","name":"same","args":{"x":1}},"thoughtSignature":"SYNTHETIC_3"}
-        ]),
-    );
+    let native = json!([
+        {"functionCall":{"name":"same","args":{"x":1}},"thoughtSignature":"SYNTHETIC_1"},
+        {"functionCall":{"name":"same","args":{"x":1}},"thoughtSignature":"SYNTHETIC_2"},
+        {"functionCall":{"id":"upstream_id","name":"same","args":{"x":1}},"thoughtSignature":"SYNTHETIC_3"}
+    ]);
+    let client = store(&mut cache, scope(), &initial, native.clone());
     assert_ne!(
-        native[0]["functionCall"]["id"],
-        native[1]["functionCall"]["id"]
+        client[0]["functionCall"]["id"],
+        client[1]["functionCall"]["id"]
     );
-    assert_eq!(native[2]["functionCall"]["id"], "upstream_id");
+    assert_eq!(client[2]["functionCall"]["id"], "upstream_id");
     let mut replay = initial;
     append(
         &mut replay,
         "model",
         json!([
-            {"functionCall":native[0]["functionCall"]},
-            {"functionCall":native[1]["functionCall"]},
-            {"functionCall":native[2]["functionCall"]}
+            {"functionCall":client[0]["functionCall"]},
+            {"functionCall":client[1]["functionCall"]},
+            {"functionCall":client[2]["functionCall"]}
         ]),
+    );
+    // Results arrive in a different order: bind each one by client identity,
+    // preserving the provider's own ID and removing only generated IDs.
+    for index in [2, 0, 1] {
+        append(
+            &mut replay,
+            "user",
+            json!([{"functionResponse":{
+                "id":client[index]["functionCall"]["id"],"name":"same","response":{"result":index}
+            }}]),
+        );
+    }
+    let original = replay.clone();
+    let mut altered = original.clone();
+    altered["contents"][1]["parts"][0]["functionCall"]["args"]["x"] = json!(99);
+    let unchanged = altered.clone();
+    assert!(cache.restore(&scope(), &mut altered).is_err());
+    assert_eq!(
+        altered, unchanged,
+        "failed replay must not rewrite result IDs"
     );
     cache.restore(&scope(), &mut replay).unwrap();
     assert_eq!(replay["contents"][1]["parts"], native);
+    for (offset, index) in [2, 0, 1].into_iter().enumerate() {
+        let result = &replay["contents"][offset + 2]["parts"][0]["functionResponse"];
+        assert_eq!(result.get("id"), native[index]["functionCall"].get("id"));
+        assert_eq!(result["response"]["result"], index);
+        assert_eq!(result["name"], "same");
+    }
 }
 
 #[test]
@@ -199,6 +221,34 @@ fn merging_deltas_preserves_signed_text_boundaries_and_thought_flags() {
             {"thought_signature":"SYNTHETIC_DETACHED"}
         ])
     );
+}
+
+#[test]
+fn only_pure_empty_text_sentinels_are_removed_from_native_history() {
+    let initial = request();
+    let kept = json!([
+        {"text":"","thoughtSignature":"SYNTHETIC_EMPTY"},
+        {"text":"","thought_signature":"SYNTHETIC_SNAKE"},
+        {"text":"","thought":true},
+        {"text":"","metadata":{"synthetic":true}},
+        {"text":" "},
+        {"text":"visible","thoughtSignature":"SYNTHETIC_VISIBLE"}
+    ]);
+    let mut parts = kept.as_array().unwrap().clone();
+    parts.insert(0, json!({"text":""}));
+    parts.push(json!({"text":""}));
+    let mut cache = ReplayCache::default();
+    store(&mut cache, scope(), &initial, json!(parts));
+    let mut replay = initial;
+    append(
+        &mut replay,
+        "model",
+        json!([
+            {"text":" visible"},{"metadata":{"synthetic":true}}
+        ]),
+    );
+    cache.restore(&scope(), &mut replay).unwrap();
+    assert_eq!(replay["contents"][1]["parts"], kept);
 }
 
 #[test]

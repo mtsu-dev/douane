@@ -17,6 +17,7 @@ struct Mock {
     received: Mutex<Vec<Value>>,
     replies: Mutex<VecDeque<Value>>,
     force_stream: AtomicBool,
+    empty_stream_sentinels: AtomicBool,
 }
 
 struct Fixture {
@@ -80,13 +81,23 @@ async fn native_stream(
         .as_array()
         .unwrap();
     let mut data = String::new();
+    let sentinels = mock.empty_stream_sentinels.load(Ordering::Relaxed);
+    if sentinels {
+        data.push_str(&format!(
+            "data: {}\n\n",
+            json!({"response":{"candidates":[{"content":{"parts":[{"text":""}]}}]}})
+        ));
+    }
     for part in parts {
         let event =
             json!({"response":{"candidates":[{"content":{"role":"model","parts":[part]}}]}});
         data.push_str(&format!("data: {event}\n\n"));
     }
     if let Some(reason) = reply.pointer("/response/candidates/0/finishReason") {
-        let event = json!({"response":{"candidates":[{"finishReason":reason}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}}});
+        let mut event = json!({"response":{"candidates":[{"finishReason":reason}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}}});
+        if sentinels {
+            event["response"]["candidates"][0]["content"] = json!({"parts":[{"text":""}]});
+        }
         data.push_str(&format!("data: {event}\n\n"));
     }
     if let Some(error) = reply.get("tail_error") {
@@ -460,65 +471,155 @@ fn call_id(kind: &str, body: &str, stream: bool) -> String {
 async fn two_signed_tool_cycles_survive_every_client_dialect_and_transport() {
     for kind in ["chat/completions", "messages", "responses"] {
         for stream in [false, true] {
-            let fixture = Fixture::new("antigravity", vec![reply(1), reply(2), reply(3)]).await;
-            let mut ids = vec![];
+            for native_ids in [false, true] {
+                let mut native_replies = vec![reply(1), reply(2), reply(3)];
+                if native_ids {
+                    for (index, reply) in native_replies[..2].iter_mut().enumerate() {
+                        reply["response"]["candidates"][0]["content"]["parts"][3]["functionCall"]
+                            ["id"] = json!(format!("provider_call_{index}"));
+                    }
+                }
+                let fixture = Fixture::new("antigravity", native_replies.clone()).await;
+                let mut ids = vec![];
+                for turn in 1..=3 {
+                    let (status, body) = fixture
+                        .post(
+                            kind,
+                            request(kind, &ids, "antigravity"),
+                            Some("synthetic-session"),
+                            stream,
+                        )
+                        .await;
+                    assert_eq!(status, 200, "{kind} stream={stream}: {body}");
+                    if turn < 3 {
+                        ids.push(call_id(kind, &body, stream));
+                    } else {
+                        assert!(body.contains("DONE"));
+                    }
+                    // Thought text may be reasoning_content, but must never become assistant content.
+                    if !stream && kind == "chat/completions" {
+                        let value: Value = serde_json::from_str(&body).unwrap();
+                        assert!(
+                            !value["choices"][0]["message"]["content"]
+                                .as_str()
+                                .unwrap_or("")
+                                .contains("synthetic hidden")
+                        );
+                    }
+                }
+                assert_ne!(ids[0], ids[1]);
+                if native_ids {
+                    assert_eq!(ids, ["provider_call_0", "provider_call_1"]);
+                }
+                let received = fixture.mock.received.lock().unwrap();
+                assert!(
+                    received[0]["request"]["systemInstruction"]["parts"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("C\u{200b}odex")
+                );
+                assert!(
+                    !received[0]["request"]["systemInstruction"]["parts"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .contains("billing-header")
+                );
+                for request_index in 1..3 {
+                    for native_turn in 1..=request_index {
+                        let parts = &received[request_index]["request"]["contents"]
+                            [native_turn * 2 - 1]["parts"];
+                        assert_eq!(
+                            parts,
+                            &native_replies[native_turn - 1]["response"]["candidates"][0]["content"]
+                                ["parts"],
+                            "{kind} stream={stream}: signed native parts must be unchanged"
+                        );
+                        let response = &received[request_index]["request"]["contents"]
+                            [native_turn * 2]["parts"][0]["functionResponse"];
+                        assert_eq!(
+                            response.get("id"),
+                            native_replies[native_turn - 1]["response"]["candidates"][0]["content"]
+                                ["parts"][3]["functionCall"]
+                                .get("id"),
+                            "{kind} stream={stream}: provider result identity must match the original call"
+                        );
+                        assert_eq!(response["name"], "synthetic_tool");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn three_native_sse_frames_replay_without_empty_text_sentinels() {
+    for kind in ["messages", "chat/completions", "responses"] {
+        for stream in [false, true] {
+            let native_replies: Vec<_> = (1..=3).map(|turn| {
+                let mut value = reply(turn);
+                if turn < 3 {
+                    value["response"]["candidates"][0]["content"]["parts"] = json!([
+                        {"functionCall":{"name":"synthetic_tool","args":{"n":turn},"id":format!("toolu_fixture_{turn}")}}
+                    ]);
+                }
+                value
+            }).collect();
+            let fixture = Fixture::new("antigravity", native_replies.clone()).await;
+            fixture.mock.force_stream.store(true, Ordering::Relaxed);
+            fixture
+                .mock
+                .empty_stream_sentinels
+                .store(true, Ordering::Relaxed);
+            let mut ids = Vec::new();
             for turn in 1..=3 {
+                let mut value = request(kind, &ids, "antigravity");
+                let key = if kind == "responses" {
+                    "input"
+                } else {
+                    "messages"
+                };
+                let history = value[key].as_array_mut().unwrap();
+                if kind == "responses" {
+                    history.retain(|entry| entry["role"] != "assistant");
+                } else {
+                    for entry in history
+                        .iter_mut()
+                        .filter(|entry| entry["role"] == "assistant")
+                    {
+                        if kind == "messages" {
+                            entry["content"]
+                                .as_array_mut()
+                                .unwrap()
+                                .retain(|part| part["type"] != "text");
+                        } else {
+                            entry["content"] = Value::Null;
+                        }
+                    }
+                }
                 let (status, body) = fixture
-                    .post(
-                        kind,
-                        request(kind, &ids, "antigravity"),
-                        Some("synthetic-session"),
-                        stream,
-                    )
+                    .post(kind, value, Some("three-sse-frames"), stream)
                     .await;
-                assert_eq!(status, 200, "{kind} stream={stream}: {body}");
+                assert_eq!(status, 200, "{kind}, stream={stream}, turn={turn}: {body}");
                 if turn < 3 {
                     ids.push(call_id(kind, &body, stream));
                 } else {
                     assert!(body.contains("DONE"));
                 }
-                // Thought text may be reasoning_content, but must never become assistant content.
-                if !stream && kind == "chat/completions" {
-                    let value: Value = serde_json::from_str(&body).unwrap();
-                    assert!(
-                        !value["choices"][0]["message"]["content"]
-                            .as_str()
-                            .unwrap_or("")
-                            .contains("synthetic hidden")
+            }
+            let received = fixture.mock.received.lock().unwrap();
+            for request_index in 1..3 {
+                for native_turn in 1..=request_index {
+                    assert_eq!(
+                        received[request_index]["request"]["contents"][native_turn * 2 - 1]["parts"],
+                        native_replies[native_turn - 1]["response"]["candidates"][0]["content"]["parts"],
+                        "{kind}, stream={stream}: empty SSE sentinels are not historical text parts"
+                    );
+                    assert_eq!(
+                        received[request_index]["request"]["contents"][native_turn * 2]["parts"][0]
+                            ["functionResponse"]["id"],
+                        format!("toolu_fixture_{native_turn}")
                     );
                 }
-            }
-            assert_ne!(ids[0], ids[1]);
-            let received = fixture.mock.received.lock().unwrap();
-            assert!(
-                received[0]["request"]["systemInstruction"]["parts"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("C\u{200b}odex")
-            );
-            assert!(
-                !received[0]["request"]["systemInstruction"]["parts"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("billing-header")
-            );
-            for (index, id) in ids.iter().enumerate() {
-                let parts = &received[2]["request"]["contents"][1 + index * 2]["parts"];
-                assert_eq!(parts[0]["thought"], true);
-                assert_eq!(
-                    parts[1]["thoughtSignature"],
-                    format!("SYNTHETIC_THOUGHT_{}", index + 1)
-                );
-                assert_eq!(parts[3]["functionCall"]["id"], *id);
-                assert_eq!(
-                    parts[3]["thoughtSignature"],
-                    format!("SYNTHETIC_CALL_{}", index + 1)
-                );
-                assert_eq!(
-                    received[2]["request"]["contents"][2 + index * 2]["parts"][0]["functionResponse"]
-                        ["id"],
-                    *id
-                );
             }
         }
     }
@@ -710,6 +811,11 @@ async fn text_correction_with_new_system_reminders_restores_hidden_native_parts(
             let mut first = reply(3);
             first["response"]["candidates"][0]["content"]["parts"] = signed.clone();
             let fixture = Fixture::new("antigravity", vec![first, reply(3)]).await;
+            fixture.mock.force_stream.store(true, Ordering::Relaxed);
+            fixture
+                .mock
+                .empty_stream_sentinels
+                .store(true, Ordering::Relaxed);
             let (status, body) = fixture
                 .post(
                     kind,

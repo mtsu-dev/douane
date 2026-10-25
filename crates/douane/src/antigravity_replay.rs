@@ -4,7 +4,7 @@
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     io::{self, Write},
     time::{Duration, Instant},
 };
@@ -25,7 +25,8 @@ pub(crate) struct RecordedTurn {
     context: Fingerprint,
     visible: Fingerprint,
     parts: Vec<Value>,
-    call_ids: HashSet<String>,
+    /// Client identity maps to the provider identity, including its absence.
+    call_ids: HashMap<String, Option<String>>,
     bytes: usize,
 }
 
@@ -35,7 +36,8 @@ pub(crate) struct Recorder {
     scope: Scope,
     context: Fingerprint,
     parts: Vec<Value>,
-    call_ids: HashSet<String>,
+    call_ids: HashMap<String, Option<String>>,
+    call_order: Vec<String>,
     parts_bytes: usize,
     terminal: bool,
     invalid: bool,
@@ -51,7 +53,8 @@ impl Recorder {
             scope,
             context: context.finalize().into(),
             parts: Vec::new(),
-            call_ids: HashSet::new(),
+            call_ids: HashMap::new(),
+            call_order: Vec::new(),
             parts_bytes: 2,
             terminal: false,
             invalid: false,
@@ -94,28 +97,41 @@ impl Recorder {
             .and_then(Value::as_array_mut)
         {
             for part in parts {
-                // Uniform downstream IDs are needed even without a stable session
-                // or after abandoning an oversized/incomplete recording.
-                if let Some(call) = part.get_mut("functionCall").and_then(Value::as_object_mut) {
-                    if !call.contains_key("id") {
-                        call.insert(
-                            "id".into(),
-                            Value::String(format!("call_douane_{:032x}", rand::random::<u128>())),
-                        );
-                    }
+                let mut generated = None;
+                if let Some(call) = part.get("functionCall").and_then(Value::as_object) {
+                    let native_id = call.get("id").and_then(Value::as_str);
+                    let id = if !call.contains_key("id") {
+                        generated = Some(format!("call_douane_{:032x}", rand::random::<u128>()));
+                        generated.as_deref()
+                    } else {
+                        native_id
+                    };
                     if !self.invalid {
-                        match call.get("id").and_then(Value::as_str) {
+                        match id {
                             Some(id) if !id.is_empty() => {
-                                if !self.call_ids.insert(id.to_owned()) {
+                                if self
+                                    .call_ids
+                                    .insert(id.to_owned(), native_id.map(str::to_owned))
+                                    .is_some()
+                                {
                                     self.abort();
+                                } else {
+                                    self.call_order.push(id.to_owned());
                                 }
                             }
                             _ => self.abort(),
                         }
                     }
                 }
+                // Record the unmodified provider part before adding the client
+                // identity. Oversized parts are rejected before cloning them.
                 if !self.invalid {
                     self.push(part);
+                }
+                // Clients still need usable IDs after an abandoned recording
+                // or when no stable session was supplied.
+                if let Some(id) = generated {
+                    part["functionCall"]["id"] = Value::String(id);
                 }
             }
         }
@@ -123,6 +139,13 @@ impl Recorder {
     }
 
     fn push(&mut self, part: &Value) {
+        // Empty SSE boundary deltas are not historical text blocks. Keep all
+        // signatures, thought flags, auxiliary fields and whitespace intact.
+        if part.as_object().is_some_and(|part| {
+            part.len() == 1 && part.get("text").and_then(Value::as_str) == Some("")
+        }) {
+            return;
+        }
         if let Some(last) = self
             .parts
             .last_mut()
@@ -159,6 +182,7 @@ impl Recorder {
         self.invalid = true;
         self.parts.clear();
         self.call_ids.clear();
+        self.call_order.clear();
     }
 
     pub(crate) fn finish(self) -> Option<RecordedTurn> {
@@ -169,7 +193,17 @@ impl Recorder {
         {
             return None;
         }
-        let visible = fingerprint(&model_visible_parts(&self.parts));
+        // Match the client's IDs without retaining a second copy of native
+        // reasoning. Only this temporary visible projection uses client IDs.
+        let mut client_parts = self.parts.clone();
+        for (part, id) in client_parts
+            .iter_mut()
+            .filter(|part| part.get("functionCall").is_some())
+            .zip(&self.call_order)
+        {
+            part["functionCall"]["id"] = Value::String(id.clone());
+        }
+        let visible = fingerprint(&model_visible_parts(&client_parts));
         let bytes = self.parts.iter().map(value_memory).sum::<usize>()
             + self.parts.capacity() * std::mem::size_of::<Value>()
             + self.scope.account.capacity()
@@ -178,8 +212,9 @@ impl Recorder {
             + self
                 .call_ids
                 .iter()
-                .map(|id| id.capacity() + 64)
+                .map(|(id, native)| id.capacity() + native.as_ref().map_or(0, String::capacity))
                 .sum::<usize>()
+            + self.call_ids.capacity() * 2 * (std::mem::size_of::<(String, Option<String>)>() + 1)
             // Reserve conservative space for the index's key, bucket slack and
             // allocation metadata, including the first small HashMap allocation.
             + 4 * std::mem::size_of::<((Fingerprint, Fingerprint), RecordedTurn)>()
@@ -332,6 +367,8 @@ impl ReplayCache {
             .ok_or("expected native Gemini contents array for signed-history replay")?;
         let mut context = history_hasher();
         let mut replacements = Vec::new();
+        let mut native_ids = HashMap::new();
+        let mut response_ids = Vec::new();
         for (index, content) in contents.iter().enumerate() {
             if content.get("role").and_then(Value::as_str) == Some("model") {
                 let parts = content
@@ -346,6 +383,11 @@ impl ReplayCache {
                     .and_then(|conversation| conversation.turns.get(&(current_context, visible)));
                 if let Some(turn) = hit {
                     replacements.push((index, turn.parts.clone()));
+                    native_ids.extend(
+                        turn.call_ids
+                            .iter()
+                            .map(|(client, native)| (client.as_str(), native.as_deref())),
+                    );
                 } else {
                     let ids = parts.iter().filter_map(|part| {
                         part.pointer("/functionCall/id").and_then(Value::as_str)
@@ -355,7 +397,7 @@ impl ReplayCache {
                             conversation
                                 .turns
                                 .values()
-                                .any(|turn| turn.call_ids.contains(id))
+                                .any(|turn| turn.call_ids.contains_key(id))
                         })
                     }) {
                         return Err("signed Gemini tool history does not match its recorded credential, model, session or preceding context".into());
@@ -377,6 +419,17 @@ impl ReplayCache {
                     }
                 }
             }
+            if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+                for (part_index, part) in parts.iter().enumerate() {
+                    if let Some(native) = part
+                        .pointer("/functionResponse/id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| native_ids.get(id))
+                    {
+                        response_ids.push((index, part_index, native.map(str::to_owned)));
+                    }
+                }
+            }
             hash_content(&mut context, content);
         }
         let contents = request
@@ -385,6 +438,16 @@ impl ReplayCache {
             .unwrap();
         for (index, parts) in replacements {
             contents[index]["parts"] = Value::Array(parts);
+        }
+        for (index, part_index, native) in response_ids {
+            let response = contents[index]["parts"][part_index]["functionResponse"]
+                .as_object_mut()
+                .unwrap();
+            if let Some(id) = native {
+                response.insert("id".into(), Value::String(id));
+            } else {
+                response.remove("id");
+            }
         }
         if let Some(conversation) = self.conversations.get_mut(scope) {
             conversation.last_used = now;
