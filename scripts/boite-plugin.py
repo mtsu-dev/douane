@@ -7,7 +7,7 @@ The directory holds the raw executables a release attaches
 (douane-windows-x64.exe, douane-macos-arm64 and so on). Fields other than the
 version and artifacts come from the existing boite-plugin.json when there is
 one, otherwise from the defaults below. The result is checked against the
-rules Boite applies (docs/plugins.md in beboite/boite) before it is written:
+rules Boite applies (docs/plugins.md in mtsu-dev/boite) before it is written:
 an unknown field or a bad value stops the script with the field it names.
 """
 
