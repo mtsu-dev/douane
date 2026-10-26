@@ -55,7 +55,7 @@ On Windows, unzip the archive and run `douane.exe --config douane.toml` from tha
 
 ### Douane in Boite
 
-[Boite](https://github.com/beboite/boite) installs Douane from **Settings > Plugins**: it downloads the executable for its platform from the release named in `boite-plugin.json` at the repository root (written by the first release), checks its SHA-256 and runs it on `127.0.0.1`. Douane's accounts, database and configuration live outside the plugin folder, so uninstalling or updating the plugin keeps the accounts. Each release opens a pull request that moves `boite-plugin.json` to the new executables; Boite offers that version once it is merged.
+[Boite](https://github.com/mtsu-dev/boite) installs Douane from **Settings > Plugins**: it downloads the executable for its platform from the release named in `boite-plugin.json` at the repository root (written by the first release), checks its SHA-256 and runs it on `127.0.0.1`. Douane's accounts, database and configuration live outside the plugin folder, so uninstalling or updating the plugin keeps the accounts. Each release opens a pull request that moves `boite-plugin.json` to the new executables; Boite offers that version once it is merged.
 
 ### Docker
 
@@ -117,7 +117,7 @@ The dashboard's **Set up a tool** page writes these settings for you, with your 
 | OpenAI-compatible tools | Base URL `http://127.0.0.1:8787/v1`, API key: a client key `dk_...`, a model id from `/v1/models` |
 | Claude Code | `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` (no `/v1`), `ANTHROPIC_AUTH_TOKEN=dk_...` |
 | Grok CLI | `XAI_API_KEY=dk_...`, `GROK_MODELS_BASE_URL` and `GROK_XAI_API_BASE_URL` set to `http://127.0.0.1:8787/v1`, `GROK_MODELS_LIST_URL=http://127.0.0.1:8787/v1/models?provider=xai&ids=upstream` |
-| [Boite](https://github.com/beboite/boite) | Subscription proxy set to the dashboard URL, and its key field to a client key: Boite lists the models and draws each account's quota bars from `/v1/quotas` |
+| [Boite](https://github.com/mtsu-dev/boite) | Subscription proxy set to the dashboard URL, and its key field to a client key: Boite lists the models and draws each account's quota bars from `/v1/quotas` |
 
 For the Grok CLI, a session saved by `grok login` takes precedence over the key; set `GROK_AUTH_PATH` to a missing file to keep it out.
 
