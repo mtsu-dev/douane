@@ -75,7 +75,7 @@ jobs:
         run: rustup toolchain install 1.90.0 --profile minimal && rustup default 1.90.0
       # Saved from main only: a pull request's cache is visible to that pull
       # request alone and would evict the one every pull request restores.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test workspace
@@ -106,7 +106,7 @@ jobs:
           persist-credentials: false
       - name: Install Rust 1.90
         run: rustup toolchain install 1.90.0 --profile minimal && rustup default 1.90.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test workspace
