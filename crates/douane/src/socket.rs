@@ -80,7 +80,7 @@ fn failure_status(status: u16) -> Option<NativeFailure> {
         429 => Some(NativeFailure {
             status,
             seconds: 60,
-            reason: "websocket upstream quota exceeded",
+            reason: "websocket upstream rate limited",
         }),
         401 | 403 => Some(NativeFailure {
             status,
@@ -107,14 +107,16 @@ fn native_failure(value: &Value) -> Option<NativeFailure> {
         .into_iter()
         .flatten()
         .find_map(|code| match code {
-            "rate_limit_exceeded"
-            | "usage_limit_reached"
+            "rate_limit_exceeded" | "slow_down" => failure_status(429),
+            "usage_limit_reached"
             | "insufficient_quota"
             | "credit_balance_exhausted"
             | "organization_spend_limit_exceeded"
             | "project_spend_limit_exceeded"
-            | "quota_exceeded"
-            | "slow_down" => failure_status(429),
+            | "quota_exceeded" => failure_status(429).map(|failure| NativeFailure {
+                reason: "websocket upstream quota exceeded",
+                ..failure
+            }),
             "invalid_api_key"
             | "authentication_error"
             | "invalid_authentication"
@@ -140,15 +142,12 @@ fn native_failure(value: &Value) -> Option<NativeFailure> {
 }
 
 fn account_eligible(account: &AccountCredential, model: &str) -> bool {
-    matches!(account.summary().status.as_str(), "ready" | "error")
-        && (account.models.is_empty() || account.models.iter().any(|m| m == model))
-        && !account.model_exhaustion.iter().any(|(family, reset)| {
-            model.contains(family)
-                && reset
-                    .as_deref()
-                    .and_then(crate::subscriptions::parse_timestamp)
-                    .is_none_or(|at| at > time::OffsetDateTime::now_utc())
-        })
+    matches!(account.summary().status.as_str(), "ready" | "error") && account.serves(model)
+}
+
+/// Selection offers a resting account only when its pool has nothing ready.
+fn account_offered(account: &AccountCredential, model: &str) -> bool {
+    account_eligible(account, model) || (account.resting() && account.serves(model))
 }
 
 fn bind_account(state: &AppState, account: &AccountCredential, session: Option<&str>) {
@@ -214,7 +213,7 @@ async fn connect_pool(
             continue;
         }
         let account = match state.oauth.credential(&candidate.id).await {
-            Ok(account) if account_eligible(&account, model) => account,
+            Ok(account) if account_offered(&account, model) => account,
             _ => continue,
         };
         let (url, _) = relay::upstream(&account, Dialect::Responses, model, &[]);
@@ -506,7 +505,17 @@ async fn run(mut downstream: WebSocket, state: Arc<AppState>, headers: HeaderMap
                                     break;
                                 }
                             };
-                            let usable = match state.accounts.get(&account.id).await.filter(|a| account_eligible(a, &requested)) {
+                            let current = state.accounts.get(&account.id).await;
+                            // A resting account stays only while its pool still has nothing else.
+                            let kept = match &current {
+                                Some(a) if account_eligible(a, &requested) => true,
+                                Some(a) if account_offered(a, &requested) => state
+                                    .candidates_for(&requested, Some(provider.as_str()), session.as_deref(), client.as_ref())
+                                    .await
+                                    .is_ok_and(|(_, c)| c.first().is_some_and(|first| first.id == a.id)),
+                                _ => false,
+                            };
+                            let usable = match current.filter(|_| kept) {
                                 Some(current) => !state.reserve_excludes(&current).await
                                     && !state.client_excludes(client.as_ref(), &current).await
                                     && !state.credits_avoidable(&current, &requested).await,

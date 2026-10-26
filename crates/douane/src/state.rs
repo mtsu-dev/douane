@@ -689,11 +689,20 @@ impl AppState {
             let free_before = config.settings.free_before_reset_seconds();
             let mut eligible = vec![];
             let mut candidates = vec![];
-            for a in self
+            let mut pool_accounts = self
                 .accounts
                 .eligible_in_for_replay(provider, route.as_deref(), Some(model), owner)
-                .await
-            {
+                .await;
+            // A rate limit rests one account so the pool can rotate. With no
+            // other account to rotate to, refusing every client for the whole
+            // rest blames a missing subscription; the upstream decides instead.
+            if pool_accounts.is_empty() && owner.is_none() {
+                pool_accounts = self
+                    .accounts
+                    .resting_in(provider, route.as_deref(), Some(model))
+                    .await;
+            }
+            for a in pool_accounts {
                 if owner.is_some_and(|owner| a.id != owner) {
                     continue;
                 }
@@ -1433,6 +1442,71 @@ mod tests {
         assert_eq!(first(&famille).await.unwrap(), account.id);
         assert!(
             first(&outsider)
+                .await
+                .unwrap_err()
+                .starts_with("no available subscription")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_rests_an_account_without_closing_its_pool() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let mut ids = vec![];
+        for name in ["main", "spare"] {
+            let account = state
+                .accounts
+                .import(
+                    json!({"type":"codex","access_token":"fixture","account_id":name,"name":name}),
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(account.id);
+        }
+        let (main, spare) = (ids[0].clone(), ids[1].clone());
+        let first = || async {
+            state
+                .candidates("gpt-5.5", Some("codex"), None)
+                .await
+                .map(|(_, accounts)| accounts.iter().map(|a| a.id.clone()).collect::<Vec<_>>())
+        };
+        // With another account ready, the rested one stays out of rotation.
+        state
+            .accounts
+            .cooldown(&main, 400, "upstream temporarily unavailable")
+            .await
+            .unwrap();
+        assert_eq!(first().await.unwrap(), vec![spare.clone()]);
+        // With none ready, the pool still serves: the upstream answers the
+        // client itself rather than a 503 naming a missing subscription.
+        state
+            .accounts
+            .cooldown(&spare, 60, "websocket upstream rate limited")
+            .await
+            .unwrap();
+        let mut resting = first().await.unwrap();
+        resting.sort();
+        let mut both = vec![main.clone(), spare.clone()];
+        both.sort();
+        assert_eq!(resting, both);
+        // An empty window or a refused login still closes the pool: retrying
+        // either cannot succeed before its reset or a new login.
+        state
+            .accounts
+            .cooldown(&main, 300, "authentication needs reconnecting")
+            .await
+            .unwrap();
+        state
+            .accounts
+            .cooldown(&spare, 3600, "websocket upstream quota exceeded")
+            .await
+            .unwrap();
+        assert!(
+            first()
                 .await
                 .unwrap_err()
                 .starts_with("no available subscription")
