@@ -693,55 +693,60 @@ impl AppState {
                 .accounts
                 .eligible_in_for_replay(provider, route.as_deref(), Some(model), owner)
                 .await;
-            // A rate limit rests one account so the pool can rotate. With no
-            // other account to rotate to, refusing every client for the whole
-            // rest blames a missing subscription; the upstream decides instead.
-            if pool_accounts.is_empty() && owner.is_none() {
+            let mut resting = false;
+            loop {
+                for a in pool_accounts {
+                    if owner.is_some_and(|owner| a.id != owner) {
+                        continue;
+                    }
+                    if client.is_some_and(|c| !c.access.allows(&a)) {
+                        continue;
+                    }
+                    if !self.serves(&a.id, model, a.provider) {
+                        continue;
+                    }
+                    let quota = self.quotas.get(&a.id).await;
+                    if self.reserve_excludes_with(&a, quota.as_ref(), now, free_before) {
+                        continue;
+                    }
+                    if let Some(reset) = self.clients.share_blocks(
+                        client,
+                        &a,
+                        quota.as_ref(),
+                        now.unix_timestamp(),
+                        free_before,
+                    ) {
+                        if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
+                            held_back = Some((pool.to_owned(), reset));
+                        }
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        id: a.id.clone(),
+                        remaining_percent: quota.as_ref().and_then(|q| {
+                            q.weekly_remaining_percent()
+                                .or_else(|| q.remaining_percent())
+                        }),
+                        weekly_reset: quota
+                            .as_ref()
+                            .and_then(|q| q.weekly_reset())
+                            .and_then(crate::subscriptions::parse_timestamp)
+                            .map(|t| t.unix_timestamp()),
+                        credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
+                    });
+                    eligible.push(a);
+                }
+                // A rate limit rests one account so the pool can rotate. With no
+                // usable account to rotate to, refusing every client for the whole
+                // rest blames a missing subscription; the upstream decides instead.
+                if !eligible.is_empty() || owner.is_some() || resting {
+                    break;
+                }
+                resting = true;
                 pool_accounts = self
                     .accounts
                     .resting_in(provider, route.as_deref(), Some(model))
                     .await;
-            }
-            for a in pool_accounts {
-                if owner.is_some_and(|owner| a.id != owner) {
-                    continue;
-                }
-                if client.is_some_and(|c| !c.access.allows(&a)) {
-                    continue;
-                }
-                if !self.serves(&a.id, model, a.provider) {
-                    continue;
-                }
-                let quota = self.quotas.get(&a.id).await;
-                if self.reserve_excludes_with(&a, quota.as_ref(), now, free_before) {
-                    continue;
-                }
-                if let Some(reset) = self.clients.share_blocks(
-                    client,
-                    &a,
-                    quota.as_ref(),
-                    now.unix_timestamp(),
-                    free_before,
-                ) {
-                    if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
-                        held_back = Some((pool.to_owned(), reset));
-                    }
-                    continue;
-                }
-                candidates.push(Candidate {
-                    id: a.id.clone(),
-                    remaining_percent: quota.as_ref().and_then(|q| {
-                        q.weekly_remaining_percent()
-                            .or_else(|| q.remaining_percent())
-                    }),
-                    weekly_reset: quota
-                        .as_ref()
-                        .and_then(|q| q.weekly_reset())
-                        .and_then(crate::subscriptions::parse_timestamp)
-                        .map(|t| t.unix_timestamp()),
-                    credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
-                });
-                eligible.push(a);
             }
             let strategy = config
                 .settings
@@ -1481,6 +1486,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(first().await.unwrap(), vec![spare.clone()]);
+        // A ready account outside the client's access must not hide the
+        // rested one it may use.
+        let (main_only, _) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("main only".into()),
+                access: Some(crate::clients::Access {
+                    all: false,
+                    pools: Default::default(),
+                    accounts: [main.clone()].into(),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, allowed) = state
+            .candidates_for("gpt-5.5", Some("codex"), None, Some(&main_only))
+            .await
+            .unwrap();
+        assert_eq!(allowed[0].id, main);
         // With none ready, the pool still serves: the upstream answers the
         // client itself rather than a 503 naming a missing subscription.
         state
