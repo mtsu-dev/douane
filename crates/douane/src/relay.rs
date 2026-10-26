@@ -1887,7 +1887,20 @@ impl CallGuard {
             || value["type"] == "response.failed"
             || value.get("error").is_some_and(|v| !v.is_null())
         {
-            self.fail("upstream reported an error in its stream");
+            // The provider's error code (rate_limit_exceeded, usage_limit_reached)
+            // tells a rate limit from an empty window; its message stays out.
+            let code = ["/error/code", "/response/error/code", "/error/type"]
+                .iter()
+                .find_map(|path| value.pointer(path).and_then(Value::as_str))
+                .filter(|code| {
+                    code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                });
+            match code {
+                Some(code) => self.fail(&format!(
+                    "upstream reported an error in its stream ({code})"
+                )),
+                None => self.fail("upstream reported an error in its stream"),
+            }
         }
     }
 }

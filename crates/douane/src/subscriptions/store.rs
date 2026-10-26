@@ -324,6 +324,29 @@ impl AccountCredential {
         reserve_windows(&self.reserve_windows).unwrap_or_default()
     }
 
+    /// Whether this account lists `model` and no exhausted window of its
+    /// family holds it back.
+    pub(crate) fn serves(&self, model: &str) -> bool {
+        (self.models.is_empty() || self.models.iter().any(|m| m == model))
+            && !self.model_exhaustion.iter().any(|(family, reset)| {
+                model.contains(family)
+                    && reset
+                        .as_deref()
+                        .and_then(parse_timestamp)
+                        .is_none_or(|t| t > time::OffsetDateTime::now_utc())
+            })
+    }
+
+    /// Cooling down after a refusal that may already be over (a rate limit,
+    /// an overloaded upstream), not after an exhausted window or a refused
+    /// login.
+    pub(crate) fn resting(&self) -> bool {
+        self.summary().status == "cooldown"
+            && !self.last_error.as_deref().is_some_and(|reason| {
+                reason.contains("authentication") || reason.contains("quota exceeded")
+            })
+    }
+
     pub(crate) fn summary(&self) -> AccountSummary {
         let current = time::OffsetDateTime::now_utc();
         let active = |until: &Option<String>| {
@@ -728,6 +751,36 @@ impl AccountStore {
         model: Option<&str>,
         owner: Option<&str>,
     ) -> Vec<AccountCredential> {
+        self.pool(provider, route, model, |account| {
+            matches!(account.summary().status.as_str(), "ready" | "error")
+                || (owner == Some(account.id.as_str()) && account.summary().status == "cooldown")
+        })
+        .await
+    }
+
+    /// Accounts of one pool resting after a rate limit, the soonest back
+    /// first. A pool with nothing ready still tries them: the upstream then
+    /// answers for itself instead of the gateway refusing every client.
+    pub(crate) async fn resting_in(
+        &self,
+        provider: SubscriptionProvider,
+        route: Option<&str>,
+        model: Option<&str>,
+    ) -> Vec<AccountCredential> {
+        let mut resting = self
+            .pool(provider, route, model, AccountCredential::resting)
+            .await;
+        resting.sort_by(|a, b| a.cooldown_until.cmp(&b.cooldown_until));
+        resting
+    }
+
+    async fn pool(
+        &self,
+        provider: SubscriptionProvider,
+        route: Option<&str>,
+        model: Option<&str>,
+        status: impl Fn(&AccountCredential) -> bool,
+    ) -> Vec<AccountCredential> {
         self.accounts
             .read()
             .await
@@ -735,19 +788,8 @@ impl AccountStore {
             .filter(|account| {
                 account.provider == provider
                     && account.route.as_deref() == route
-                    && (matches!(account.summary().status.as_str(), "ready" | "error")
-                        || (owner == Some(account.id.as_str())
-                            && account.summary().status == "cooldown"))
-                    && model.is_none_or(|model| {
-                        (account.models.is_empty() || account.models.iter().any(|m| m == model))
-                            && !account.model_exhaustion.iter().any(|(family, reset)| {
-                                model.contains(family)
-                                    && reset
-                                        .as_deref()
-                                        .and_then(parse_timestamp)
-                                        .is_none_or(|t| t > time::OffsetDateTime::now_utc())
-                            })
-                    })
+                    && status(account)
+                    && model.is_none_or(|model| account.serves(model))
             })
             .cloned()
             .collect()

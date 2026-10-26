@@ -1228,6 +1228,41 @@ async fn native_websocket_rechecks_cooldown_before_each_continuation() {
 }
 
 #[tokio::test]
+async fn native_websocket_rate_limit_on_the_only_account_leaves_the_next_request_to_upstream() {
+    let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
+    *fixture.mock.rejected_token.lock().unwrap() = Some("Bearer fixture-alpha".into());
+    *fixture.mock.native_failure.lock().unwrap() = Some(
+        json!({"type":"error","status":429,"error":{"type":"rate_limit_exceeded","code":"rate_limit_exceeded","resets_in_seconds":400}}),
+    );
+    let mut limited = fixture.socket("native-rate-limit").await;
+    send(
+        &mut limited,
+        json!({"type":"response.create","model":"codex/gpt-test","input":"first"}),
+    )
+    .await;
+    assert_eq!(next(&mut limited).await["status"], 429);
+    let _ = limited.close(None).await;
+    *fixture.mock.native_failure.lock().unwrap() = None;
+    // Another session during the 400 s rest: the gateway used to refuse it
+    // with "no available subscription" while the upstream would serve it.
+    let mut other = fixture.socket("native-rate-limit-other").await;
+    send(
+        &mut other,
+        json!({"type":"response.create","model":"codex/gpt-test","input":"second"}),
+    )
+    .await;
+    assert_eq!(next(&mut other).await["type"], "response.completed");
+    let _ = other.close(None).await;
+    let calls = fixture.calls(2).await;
+    assert!(calls.iter().any(|call| {
+        call.error
+            .as_deref()
+            .is_some_and(|error| error.ends_with("(rate_limit_exceeded)"))
+    }));
+    assert_eq!(fixture.received().len(), 2);
+}
+
+#[tokio::test]
 async fn native_websocket_request_error_without_lane_releases_the_only_active_call() {
     let fixture = Fixture::new(&[("codex", "alpha")], Strategy::FillFirst).await;
     *fixture.mock.rejected_token.lock().unwrap() = Some("Bearer fixture-alpha".into());

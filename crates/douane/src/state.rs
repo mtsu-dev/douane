@@ -689,50 +689,64 @@ impl AppState {
             let free_before = config.settings.free_before_reset_seconds();
             let mut eligible = vec![];
             let mut candidates = vec![];
-            for a in self
+            let mut pool_accounts = self
                 .accounts
                 .eligible_in_for_replay(provider, route.as_deref(), Some(model), owner)
-                .await
-            {
-                if owner.is_some_and(|owner| a.id != owner) {
-                    continue;
-                }
-                if client.is_some_and(|c| !c.access.allows(&a)) {
-                    continue;
-                }
-                if !self.serves(&a.id, model, a.provider) {
-                    continue;
-                }
-                let quota = self.quotas.get(&a.id).await;
-                if self.reserve_excludes_with(&a, quota.as_ref(), now, free_before) {
-                    continue;
-                }
-                if let Some(reset) = self.clients.share_blocks(
-                    client,
-                    &a,
-                    quota.as_ref(),
-                    now.unix_timestamp(),
-                    free_before,
-                ) {
-                    if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
-                        held_back = Some((pool.to_owned(), reset));
+                .await;
+            let mut resting = false;
+            loop {
+                for a in pool_accounts {
+                    if owner.is_some_and(|owner| a.id != owner) {
+                        continue;
                     }
-                    continue;
+                    if client.is_some_and(|c| !c.access.allows(&a)) {
+                        continue;
+                    }
+                    if !self.serves(&a.id, model, a.provider) {
+                        continue;
+                    }
+                    let quota = self.quotas.get(&a.id).await;
+                    if self.reserve_excludes_with(&a, quota.as_ref(), now, free_before) {
+                        continue;
+                    }
+                    if let Some(reset) = self.clients.share_blocks(
+                        client,
+                        &a,
+                        quota.as_ref(),
+                        now.unix_timestamp(),
+                        free_before,
+                    ) {
+                        if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
+                            held_back = Some((pool.to_owned(), reset));
+                        }
+                        continue;
+                    }
+                    candidates.push(Candidate {
+                        id: a.id.clone(),
+                        remaining_percent: quota.as_ref().and_then(|q| {
+                            q.weekly_remaining_percent()
+                                .or_else(|| q.remaining_percent())
+                        }),
+                        weekly_reset: quota
+                            .as_ref()
+                            .and_then(|q| q.weekly_reset())
+                            .and_then(crate::subscriptions::parse_timestamp)
+                            .map(|t| t.unix_timestamp()),
+                        credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
+                    });
+                    eligible.push(a);
                 }
-                candidates.push(Candidate {
-                    id: a.id.clone(),
-                    remaining_percent: quota.as_ref().and_then(|q| {
-                        q.weekly_remaining_percent()
-                            .or_else(|| q.remaining_percent())
-                    }),
-                    weekly_reset: quota
-                        .as_ref()
-                        .and_then(|q| q.weekly_reset())
-                        .and_then(crate::subscriptions::parse_timestamp)
-                        .map(|t| t.unix_timestamp()),
-                    credits_only: quota.as_ref().is_some_and(|q| q.credits_only(now)),
-                });
-                eligible.push(a);
+                // A rate limit rests one account so the pool can rotate. With no
+                // usable account to rotate to, refusing every client for the whole
+                // rest blames a missing subscription; the upstream decides instead.
+                if !eligible.is_empty() || owner.is_some() || resting {
+                    break;
+                }
+                resting = true;
+                pool_accounts = self
+                    .accounts
+                    .resting_in(provider, route.as_deref(), Some(model))
+                    .await;
             }
             let strategy = config
                 .settings
@@ -1433,6 +1447,90 @@ mod tests {
         assert_eq!(first(&famille).await.unwrap(), account.id);
         assert!(
             first(&outsider)
+                .await
+                .unwrap_err()
+                .starts_with("no available subscription")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_rests_an_account_without_closing_its_pool() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.server.auth_dir = directory.path().join("auth");
+        config.server.database = directory.path().join("requests.sqlite");
+        let state = AppState::new(config, None).unwrap();
+        let mut ids = vec![];
+        for name in ["main", "spare"] {
+            let account = state
+                .accounts
+                .import(
+                    json!({"type":"codex","access_token":"fixture","account_id":name,"name":name}),
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(account.id);
+        }
+        let (main, spare) = (ids[0].clone(), ids[1].clone());
+        let first = || async {
+            state
+                .candidates("gpt-5.5", Some("codex"), None)
+                .await
+                .map(|(_, accounts)| accounts.iter().map(|a| a.id.clone()).collect::<Vec<_>>())
+        };
+        // With another account ready, the rested one stays out of rotation.
+        state
+            .accounts
+            .cooldown(&main, 400, "upstream temporarily unavailable")
+            .await
+            .unwrap();
+        assert_eq!(first().await.unwrap(), vec![spare.clone()]);
+        // A ready account outside the client's access must not hide the
+        // rested one it may use.
+        let (main_only, _) = state
+            .clients
+            .create(crate::clients::ClientPatch {
+                name: Some("main only".into()),
+                access: Some(crate::clients::Access {
+                    all: false,
+                    pools: Default::default(),
+                    accounts: [main.clone()].into(),
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, allowed) = state
+            .candidates_for("gpt-5.5", Some("codex"), None, Some(&main_only))
+            .await
+            .unwrap();
+        assert_eq!(allowed[0].id, main);
+        // With none ready, the pool still serves: the upstream answers the
+        // client itself rather than a 503 naming a missing subscription.
+        state
+            .accounts
+            .cooldown(&spare, 60, "websocket upstream rate limited")
+            .await
+            .unwrap();
+        let mut resting = first().await.unwrap();
+        resting.sort();
+        let mut both = vec![main.clone(), spare.clone()];
+        both.sort();
+        assert_eq!(resting, both);
+        // An empty window or a refused login still closes the pool: retrying
+        // either cannot succeed before its reset or a new login.
+        state
+            .accounts
+            .cooldown(&main, 300, "authentication needs reconnecting")
+            .await
+            .unwrap();
+        state
+            .accounts
+            .cooldown(&spare, 3600, "websocket upstream quota exceeded")
+            .await
+            .unwrap();
+        assert!(
+            first()
                 .await
                 .unwrap_err()
                 .starts_with("no available subscription")
