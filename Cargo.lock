@@ -313,7 +313,7 @@ dependencies = [
 
 [[package]]
 name = "douane"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "douanectl"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "clap",
