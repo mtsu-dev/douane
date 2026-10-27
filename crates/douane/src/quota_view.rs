@@ -57,7 +57,12 @@ pub fn overview(
         .map(|snapshot| (snapshot.account_id.as_str(), snapshot))
         .collect();
     let mut groups: BTreeMap<SubscriptionProvider, Vec<Member>> = BTreeMap::new();
-    for account in accounts.iter().filter(|a| a.provider.reports_quota()) {
+    // A disabled account serves no request, so it takes no bar and no part
+    // in an average; the admin dashboard still shows it.
+    let shown = accounts
+        .iter()
+        .filter(|a| a.enabled && a.provider.reports_quota());
+    for account in shown {
         groups
             .entry(account.provider)
             .or_default()
@@ -473,6 +478,30 @@ mod tests {
     }
 
     #[test]
+    fn disabled_accounts_take_no_bar() {
+        let accounts = vec![
+            summary("kept", SubscriptionProvider::Claude, "ready"),
+            summary("parked", SubscriptionProvider::Claude, "disabled"),
+            summary("refunded", SubscriptionProvider::Codex, "disabled"),
+        ];
+        let mut failed = snapshot("parked", vec![], vec![]);
+        failed.error = Some("provider is rate-limiting quota reads (HTTP 429)".into());
+        let value = overview(
+            accounts,
+            vec![snapshot("kept", vec![], vec![]), failed],
+            &Settings::default(),
+            "2026-10-04T12:00:00Z".into(),
+        );
+        // A provider whose accounts are all disabled leaves the list.
+        let providers = value["providers"].as_array().unwrap();
+        assert_eq!(providers.len(), 1);
+        let entries = providers[0]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], "kept");
+        assert!(!value.to_string().contains("HTTP 429"));
+    }
+
+    #[test]
     fn provider_windows_hide_and_lead_with_the_primary() {
         let accounts = vec![
             summary("a", SubscriptionProvider::Claude, "ready"),
@@ -627,7 +656,8 @@ mod tests {
         let accounts = vec![
             summary("a", SubscriptionProvider::Claude, "ready"),
             summary("b", SubscriptionProvider::Claude, "cooldown"),
-            summary("c", SubscriptionProvider::Claude, "disabled"),
+            summary("c", SubscriptionProvider::Claude, "error"),
+            summary("d", SubscriptionProvider::Claude, "disabled"),
         ];
         let snapshots = vec![
             snapshot(
@@ -654,6 +684,17 @@ mod tests {
                     quota_window("weekly", None, Some("2026-10-06T00:00:00Z")),
                 ],
                 vec![],
+            ),
+            // A disabled account counts nowhere: not in the mean, the
+            // earliest reset, the credits nor the account count.
+            snapshot(
+                "d",
+                vec![quota_window(
+                    "five-hour",
+                    Some(0.0),
+                    Some("2026-10-04T12:10:00Z"),
+                )],
+                vec![quota_credit("codex-credits", Some(100.0), None)],
             ),
         ];
         let value = overview(
@@ -687,9 +728,9 @@ mod tests {
     #[test]
     fn average_status_and_error_follow_the_worst_account_without_snapshots() {
         let accounts = vec![
-            summary("a", SubscriptionProvider::Codex, "disabled"),
+            summary("a", SubscriptionProvider::Codex, "cooldown"),
             summary("b", SubscriptionProvider::Codex, "error"),
-            summary("c", SubscriptionProvider::Codex, "cooldown"),
+            summary("c", SubscriptionProvider::Codex, "disabled"),
         ];
         let value = overview(
             accounts.clone(),
@@ -700,7 +741,7 @@ mod tests {
         let entry = &value["providers"][0]["entries"][0];
         assert_eq!(entry["status"], "error");
         assert_eq!(entry["error"], "provider request failed");
-        assert_eq!(entry["label"], "Codex · 3 comptes");
+        assert_eq!(entry["label"], "Codex · 2 comptes");
         assert_eq!(entry["updated_at"], Value::Null);
 
         let mut failed = snapshot("a", vec![], vec![]);
@@ -713,7 +754,7 @@ mod tests {
         );
         let entry = &value["providers"][0]["entries"][0];
         assert_eq!(entry["label"], "Codex · 1 compte");
-        assert_eq!(entry["status"], "disabled");
+        assert_eq!(entry["status"], "cooldown");
         assert_eq!(
             entry["error"],
             "upstream authentication or quota request failed (HTTP 401)"
