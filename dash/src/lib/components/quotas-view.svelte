@@ -78,7 +78,7 @@
 							{#if !current.primary && windowsOf(group.id).length}<p class="window-default">{t('quotas.defaultWindow')}</p>{/if}
 						</div>
 					{/if}
-				<QuotaForecast accounts={accounts.filter(a => a.provider === group.id)} {quotas} {forecasts}/>
+				{#if accounts.some(a => a.provider === group.id && a.enabled)}<QuotaForecast accounts={accounts.filter(a => a.provider === group.id)} {quotas} {forecasts}/>{/if}
 				<div class="ledger">
 					{#each group.accounts as account (account.id)}
 						{@const quota = quotas.find(q => q.account_id === account.id)}
