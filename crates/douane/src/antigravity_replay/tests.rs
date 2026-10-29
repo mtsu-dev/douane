@@ -683,7 +683,7 @@ fn a_successful_long_running_generation_renews_idle_ttl_after_release() {
     assert!(cache.record_at(turn_for(scope(), &request(), "first"), started));
     let mut history = text_history("first");
     append(&mut history, "user", json!([{"text":"Continue."}]));
-    let parent = cache.begin(&scope(), &mut history).unwrap();
+    let parent = cache.begin(&scope(), &mut history).unwrap().parent;
     let completed = started + Duration::from_secs(2 * 3600);
     let mut second = turn_for(scope(), &history, "second");
     second.parent = parent;
@@ -1383,7 +1383,8 @@ fn partly_recorded_conversation_continues_instead_of_mixing_lineages() {
         .unwrap();
     let parent = cache
         .begin(&session("agent-a"), &mut history.clone())
-        .unwrap();
+        .unwrap()
+        .parent;
     let mut recorder = Recorder::new(session("agent-a"), contents(&history)).with_parent(parent);
     recorder.observe(&mut json!({"candidates":[{"content":{"parts":[
         {"thought":true,"text":"x".repeat(2048),"thoughtSignature":"SYNTHETIC_LARGE"},
@@ -1399,7 +1400,8 @@ fn partly_recorded_conversation_continues_instead_of_mixing_lineages() {
     tool_result(&mut history, "a2");
     let parent = cache
         .begin(&session("agent-a"), &mut history)
-        .expect("a partly recorded conversation must keep working");
+        .expect("a partly recorded conversation must keep working")
+        .parent;
     assert!(parent.is_some(), "the recorded turn stays the parent");
     assert_eq!(
         history["contents"][1]["parts"],
@@ -1434,7 +1436,8 @@ fn evicted_conversation_continues_and_records_its_next_turns() {
     );
     let parent = cache
         .begin(&session("agent-a"), &mut history.clone())
-        .expect("an evicted conversation must keep working");
+        .expect("an evicted conversation must keep working")
+        .parent;
     assert_eq!(parent, None);
     let mut outgoing = history.clone();
     cache.restore(&session("agent-a"), &mut outgoing).unwrap();
@@ -1504,4 +1507,64 @@ fn default_budget_keeps_ten_parallel_long_conversations() {
     cache.configure(&settings);
     assert!(cache.bytes <= 8 * 1024 * 1024);
     assert!(cache.conversations.len() < 10);
+}
+
+#[test]
+fn evicted_conversation_continues_beside_pinned_neighbours() {
+    let seed = turn_for(session("agent-b"), &request(), "b1");
+    // Room for one conversation only, held by a call in flight.
+    let budget = seed.bytes + conversation_bytes(&session("agent-b"));
+    let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
+    assert!(cache.record(seed));
+    cache
+        .begin(&session("agent-b"), &mut text_history("b1"))
+        .unwrap();
+    let mut history = request();
+    append(&mut history, "model", json!([unsigned_call("a1", 1)]));
+    tool_result(&mut history, "a1");
+    let started = cache
+        .begin(&session("agent-a"), &mut history)
+        .expect("an evicted conversation must keep working beside pinned neighbours");
+    assert!(!started.pinned);
+    assert_eq!(started.parent, None);
+    assert_eq!(
+        history["contents"][1]["parts"][0]["thoughtSignature"],
+        SKIP_SIGNATURE_VALIDATION
+    );
+    assert!(cache.bytes <= cache.max_bytes);
+    assert!(!cache.conversations.contains_key(&session("agent-a")));
+    assert_eq!(
+        cache.conversations[&session("agent-b")].in_flight,
+        1,
+        "the unpinned call leaves the neighbour's pin alone"
+    );
+}
+
+#[test]
+fn lowering_the_budget_trims_a_pinned_conversation_once_its_call_ends() {
+    let mut cache = ReplayCache::default();
+    let mut parent = None;
+    for step in 0..80 {
+        let turn = heavy_step(session("agent-a"), step, parent);
+        parent = Some(turn.id);
+        assert!(cache.record(turn));
+    }
+    assert!(cache.bytes > 1024 * 1024);
+    cache.begin(&session("agent-a"), &mut request()).unwrap();
+    let settings = crate::settings::Settings {
+        antigravity_replay_mib: 1,
+        ..Default::default()
+    };
+    cache.configure(&settings);
+    assert!(
+        cache.conversations.contains_key(&session("agent-a")),
+        "a call in flight keeps its conversation"
+    );
+    cache.release(&session("agent-a"));
+    assert!(
+        cache.bytes <= cache.max_bytes,
+        "the ended call leaves {} bytes over a {} byte budget",
+        cache.bytes,
+        cache.max_bytes
+    );
 }

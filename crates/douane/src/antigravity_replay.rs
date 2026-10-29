@@ -370,6 +370,13 @@ impl Conversation {
     }
 }
 
+/// A native call admitted by `ReplayCache::begin`.
+pub(crate) struct Started {
+    pub(crate) parent: Option<TurnId>,
+    /// Whether the call holds a pin that `release` must drop when it ends.
+    pub(crate) pinned: bool,
+}
+
 pub(crate) struct ReplayCache {
     conversations: BTreeMap<Scope, Conversation>,
     bytes: usize,
@@ -404,7 +411,7 @@ impl ReplayCache {
     }
 
     /// Apply changed settings at once: a smaller budget evicts idle
-    /// conversations now and pinned ones at a later recording.
+    /// conversations now and pinned ones when their call ends.
     pub(crate) fn configure(&mut self, settings: &crate::settings::Settings) {
         self.max_bytes = settings.antigravity_replay_bytes();
         self.ttl = settings.antigravity_replay_idle();
@@ -488,22 +495,23 @@ impl ReplayCache {
 
     /// Pin a fully validated conversation until the upstream call ends. Other
     /// sessions cannot evict its prefix while its next turn is being produced.
-    pub(crate) fn begin(
-        &mut self,
-        scope: &Scope,
-        request: &mut Value,
-    ) -> Result<Option<TurnId>, String> {
+    /// A conversation with no room beside pinned ones runs unpinned and unrecorded.
+    pub(crate) fn begin(&mut self, scope: &Scope, request: &mut Value) -> Result<Started, String> {
         let now = Instant::now();
         let parent = self.restore_at(scope, request, now)?;
         if scope.session.trim().is_empty() {
-            return Ok(parent);
+            return Ok(Started {
+                parent,
+                pinned: false,
+            });
         }
         if !self.conversations.contains_key(scope) {
             let bytes = conversation_bytes(scope);
             if !self.make_room(Some(scope), bytes) {
-                return Err(
-                    "signed Gemini history cache has no capacity for this conversation".into(),
-                );
+                return Ok(Started {
+                    parent,
+                    pinned: false,
+                });
             }
             self.conversations.insert(
                 scope.clone(),
@@ -519,15 +527,24 @@ impl ReplayCache {
             self.bytes += bytes;
         }
         self.conversations.get_mut(scope).unwrap().in_flight += 1;
-        Ok(parent)
+        Ok(Started {
+            parent,
+            pinned: true,
+        })
     }
 
+    /// Drop a pin taken by `begin`. A budget lowered during the call is
+    /// enforced here, once nothing holds the conversation.
     pub(crate) fn release(&mut self, scope: &Scope) {
-        if let Some(conversation) = self.conversations.get_mut(scope) {
-            conversation.in_flight = conversation.in_flight.saturating_sub(1);
-            if conversation.in_flight == 0 && conversation.turns.is_empty() {
+        let Some(conversation) = self.conversations.get_mut(scope) else {
+            return;
+        };
+        conversation.in_flight = conversation.in_flight.saturating_sub(1);
+        if conversation.in_flight == 0 {
+            if conversation.turns.is_empty() {
                 self.remove(scope);
             }
+            self.make_room(None, 0);
         }
     }
 

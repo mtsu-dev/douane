@@ -71,7 +71,8 @@ call) costs about 18 KB in that accounting, so a 150-step conversation takes
 about 2.7 MB and ten of them about 27 MB: the default holds ten parallel long
 conversations at half its budget. The former 8 MiB fit three, and swarms of six
 to eight Gemini agents lost conversations to eviction (2026-10-29). Changing the
-setting applies at once; a smaller budget evicts idle scopes immediately.
+setting applies at once; a smaller budget evicts idle scopes immediately and
+pinned ones when their last call ends.
 
 A fully validated restore or successfully recorded native completion renews the
 scope's idle TTL (`antigravity_replay_idle_minutes`, one hour by default). A generation that outlasts the TTL while pinned
@@ -81,7 +82,8 @@ whole idle scopes in least-recently-used order.
 Active upstream calls pin their scope, including concurrent calls in the same
 scope, until completion or cancellation. An extension that cannot fit alongside
 its own prefix, or beside pinned scopes, is delivered unrecorded without
-deleting that prefix.
+deleting that prefix. A call whose scope cannot even be opened beside pinned
+scopes runs unpinned and unrecorded instead of being refused.
 
 ## Missing turns
 
