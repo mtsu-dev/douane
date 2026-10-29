@@ -50,14 +50,26 @@ fn plan_in(slot: &Slot) -> Arc<Plan> {
 
 // Google withholds Argon from the legacy Hub client identity.
 fn current_antigravity_client(headers: &HeaderMap) -> bool {
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    };
+    let arch = if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        std::env::consts::ARCH
+    };
+    let expected = format!(
+        "antigravity/acp/1.4.1 (aidev_client; os_type={os}; arch={arch}; host_path=douane/{}; proxy_client=antigravity/sdk)",
+        env!("CARGO_PKG_VERSION")
+    );
     headers
         .get("user-agent")
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.starts_with("antigravity/acp/1.4.1 (aidev_client; ")
-                && value.contains("host_path=douane/")
-                && value.ends_with("proxy_client=antigravity/sdk)")
-        })
+        == Some(expected.as_str())
 }
 
 async fn listing(State(slot): State<Slot>, headers: HeaderMap) -> Json<Value> {
