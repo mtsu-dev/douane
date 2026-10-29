@@ -2,7 +2,7 @@ use super::oauth::send_json;
 use super::store::{subscription_from_value, text};
 use super::{
     AccountCredential, AccountStore, OAuthManager, SubscriptionError, SubscriptionProvider,
-    SubscriptionTier, now, parse_timestamp, timestamp,
+    SubscriptionTier, antigravity_user_agent, now, parse_timestamp, timestamp,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -745,7 +745,7 @@ impl QuotaService {
                             "missing Google project ID",
                         ))?;
                 let value = send_json(self.client.post("https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
-                    .bearer_auth(&account.access_token).header("User-Agent", "antigravity/hub/2.9.1")
+                    .bearer_auth(&account.access_token).header("User-Agent", antigravity_user_agent())
                     .json(&json!({"project":project}))).await?;
                 let windows = parse_antigravity(&value, observed);
                 (value, windows)
