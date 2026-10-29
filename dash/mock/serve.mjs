@@ -48,6 +48,16 @@ const providers = [
 	['xai', 'Grok', true, true], ['copilot', 'GitHub Copilot', true, true], ['antigravity', 'Antigravity', false, true],
 	['kimi', 'Kimi', false, true], ['qwen', 'Qwen', false, false], ['openai_compatible', 'OpenAI-compatible', false, false]
 ].map(([id, name, oauth, quota]) => ({ id, name, oauth, quota, docs_url: 'https://example.com' }));
+// Forecasts are fixtures, never inferred from sample token counts.
+const forecastRates = { 'acc-claude-home': [12, .9, .15], 'acc-claude-work': [10, .5, .2], 'acc-codex': [2, .85], 'acc-grok': [.4], 'acc-go': [0, .2, .02] };
+const forecasts = quotas.flatMap(q => q.windows.flatMap((w, index) => {
+	const rate = forecastRates[q.account_id]?.[index];
+	if (rate == null) return [];
+	const hours = (Date.parse(w.reset_at) - Date.parse(q.updated_at)) / 3600_000;
+	return [{ account_id: q.account_id, window_id: w.id, observed_seconds: 21600, rate_per_hour: rate,
+		remaining_at_reset: Math.max(0, w.remaining_percent - rate * hours),
+		exhausts_at: rate > 0 && w.remaining_percent / rate < hours ? new Date(Date.parse(q.updated_at) + w.remaining_percent / rate * 3600_000).toISOString() : null }];
+}));
 const model = (provider, id, name, context_length) => ({ id: `${provider}/${id}`, provider, name, context_length, enabled: true });
 const models = [
 	model('claude', 'claude-opus-5-5', 'Claude Opus 5.5', 1_000_000), model('claude', 'claude-sonnet-5-5', 'Claude Sonnet 5.5', 1_000_000),
@@ -179,7 +189,7 @@ function api(method, path, body, query = new URLSearchParams()) {
 		case '/clients': return { clients, usage: usage.filter((row) => row.reset * 1000 > Date.now()) };
 		case '/providers': return { providers };
 		case '/accounts': return { accounts };
-		case '/quotas': return { quotas };
+		case '/quotas': return { quotas, forecasts };
 		case '/models': return { models };
 		case '/calls': return { calls };
 		case '/settings': return settings;

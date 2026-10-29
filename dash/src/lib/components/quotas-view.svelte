@@ -1,4 +1,5 @@
 <script lang="ts">
+	import QuotaForecast from './quota-forecast.svelte';
 	import Search from '@lucide/svelte/icons/search';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import Plus from '@lucide/svelte/icons/plus';
@@ -13,7 +14,7 @@
 	import EmptyState from './empty-state.svelte';
 	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type QuotaWindow, type Settings, type QuotaDisplay, type QuotaWindowChoice, type Provider } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
-	let { accounts, quotas, providers = [], busy, refresh, connect, rename, resetUpdated, settings, setQuotaDisplay, setQuotaWindows }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void>; setQuotaWindows: (provider: string, choice: QuotaWindowChoice) => Promise<void> } = $props();
+	let { accounts, quotas, forecasts = [], providers = [], busy, refresh, connect, rename, resetUpdated, settings, setQuotaDisplay, setQuotaWindows }: { accounts: Account[]; quotas: Quota[]; forecasts?: import('$lib/management').WindowForecast[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; connect: () => void; rename: (account: Account, name: string) => Promise<void>; resetUpdated: () => Promise<void>; settings: Settings | null; setQuotaDisplay: (provider: string, display: QuotaDisplay) => Promise<void>; setQuotaWindows: (provider: string, choice: QuotaWindowChoice) => Promise<void> } = $props();
 	let provider = $state('all');
 	let search = $state('');
 	let sort = $state('name');
@@ -51,6 +52,8 @@
 	</div>
 {/if}
 
+{#if accounts.some(a => a.enabled && providerIds.includes(a.provider))}<QuotaForecast accounts={accounts.filter(a => providerIds.includes(a.provider))} {quotas} {forecasts} global/>{/if}
+
 <div class="section-toolbar quota-toolbar"><label class="search-input"><Search size={18}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('common.connectAccount')} onclick={connect}/></section>
@@ -75,6 +78,7 @@
 							{#if !current.primary && windowsOf(group.id).length}<p class="window-default">{t('quotas.defaultWindow')}</p>{/if}
 						</div>
 					{/if}
+				<QuotaForecast accounts={accounts.filter(a => a.provider === group.id)} {quotas} {forecasts}/>
 				<div class="ledger">
 					{#each group.accounts as account (account.id)}
 						{@const quota = quotas.find(q => q.account_id === account.id)}

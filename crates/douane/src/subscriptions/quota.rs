@@ -247,6 +247,7 @@ pub struct QuotaService {
     save_lock: tokio::sync::Mutex<()>,
     verification_urls: RwLock<BTreeMap<String, String>>,
     failures: RwLock<BTreeMap<String, Failures>>,
+    forecast: RwLock<super::forecast::History>,
     /// GitHub's Copilot entitlement endpoint; tests point it at a loopback.
     pub(crate) copilot_user_url: String,
 }
@@ -263,6 +264,14 @@ impl QuotaService {
         oauth: Arc<OAuthManager>,
     ) -> Self {
         let cache = load_snapshots(&store.quota_snapshot_path());
+        let forecast = std::fs::read(
+            store
+                .quota_snapshot_path()
+                .with_file_name(".quota-forecast"),
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
         Self {
             client,
             store,
@@ -271,6 +280,7 @@ impl QuotaService {
             save_lock: tokio::sync::Mutex::new(()),
             verification_urls: RwLock::new(BTreeMap::new()),
             failures: RwLock::new(BTreeMap::new()),
+            forecast: RwLock::new(forecast),
             copilot_user_url: "https://api.github.com/copilot_internal/user".into(),
         }
     }
@@ -279,6 +289,23 @@ impl QuotaService {
     /// a restart: a provider refusing quota reads still has something to show.
     pub async fn save(&self) {
         let _guard = self.save_lock.lock().await;
+        let snapshots = self.list().await;
+        let mut forecast = self.forecast.write().await;
+        forecast.observe(&snapshots, time::OffsetDateTime::now_utc().unix_timestamp());
+        let forecast_bytes = serde_json::to_vec(&*forecast).ok();
+        drop(forecast);
+        if let Some(bytes) = forecast_bytes {
+            let path = self
+                .store
+                .quota_snapshot_path()
+                .with_file_name(".quota-forecast");
+            if !matches!(
+                tokio::task::spawn_blocking(move || write_private(&path, &bytes)).await,
+                Ok(Ok(()))
+            ) {
+                tracing::warn!("quota forecast history was not saved");
+            }
+        }
         let path = self.store.quota_snapshot_path();
         let Ok(bytes) = serde_json::to_vec(&*self.cache.read().await) else {
             return;
@@ -306,6 +333,16 @@ impl QuotaService {
             .filter(|snapshot| accounts.contains(&snapshot.account_id))
             .cloned()
             .collect()
+    }
+
+    pub async fn forecasts(
+        &self,
+        snapshots: &[QuotaSnapshot],
+    ) -> Vec<super::forecast::WindowForecast> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut forecast = self.forecast.write().await;
+        forecast.observe(snapshots, now);
+        forecast.report(snapshots, now)
     }
 
     #[cfg(test)]
@@ -398,6 +435,10 @@ impl QuotaService {
             }
             snapshot.updated_at = now();
             snapshot.error = None;
+            self.forecast
+                .write()
+                .await
+                .record(snapshot, time::OffsetDateTime::now_utc().unix_timestamp());
         }
         self.failures.write().await.remove(&account.id);
     }
@@ -488,6 +529,10 @@ impl QuotaService {
             .await
             .is_ok()
         {
+            self.forecast
+                .write()
+                .await
+                .record(&snapshot, observed.unix_timestamp());
             cache.insert(id.into(), snapshot);
             drop(cache);
             self.failures.write().await.remove(id);
@@ -676,6 +721,10 @@ impl QuotaService {
             verification_urls.remove(id);
         }
         cache.insert(id.into(), snapshot.clone());
+        self.forecast
+            .write()
+            .await
+            .record(&snapshot, time::OffsetDateTime::now_utc().unix_timestamp());
         Ok(snapshot)
     }
 
@@ -2248,6 +2297,64 @@ mod tests {
             )
             .await;
         assert!(service.get(&codex.id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn inference_refills_invalidate_forecasts_without_a_dashboard_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let summary = store
+            .import(json!({"type":"claude","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store);
+        let observed = time::OffsetDateTime::now_utc();
+        let reset = observed + time::Duration::hours(2);
+        let baseline = QuotaSnapshot {
+            account_id: summary.id.clone(),
+            provider: SubscriptionProvider::Claude,
+            windows: vec![QuotaWindow {
+                id: "five-hour".into(),
+                label: "5 hours".into(),
+                remaining_percent: Some(80.0),
+                reset_at: Some(timestamp(reset)),
+                used: None,
+                limit: None,
+            }],
+            updated_at: timestamp(observed - time::Duration::minutes(30)),
+            error: None,
+            subscription: None,
+            credits: vec![],
+            verification_required: false,
+            verification_available: false,
+        };
+        service
+            .forecast
+            .write()
+            .await
+            .record(&baseline, observed.unix_timestamp() - 1800);
+        for used in ["0.4", "0.6", "0.5"] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "anthropic-ratelimit-unified-5h-utilization",
+                used.parse().unwrap(),
+            );
+            headers.insert(
+                "anthropic-ratelimit-unified-5h-reset",
+                reset.unix_timestamp().to_string().parse().unwrap(),
+            );
+            service.observe_claude_headers(&account, &headers).await;
+        }
+        let snapshots = service.list().await;
+        assert!(
+            service
+                .forecast
+                .read()
+                .await
+                .report(&snapshots, time::OffsetDateTime::now_utc().unix_timestamp())
+                .is_empty()
+        );
     }
 
     #[test]
