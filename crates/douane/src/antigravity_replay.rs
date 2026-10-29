@@ -10,6 +10,9 @@ use std::{
 };
 
 const MAX_TURN_BYTES: usize = 256 * 1024;
+/// Gemini's documented placeholder for a function call whose original thought
+/// signature is gone (history from another model, or replay lost to eviction).
+pub(crate) const SKIP_SIGNATURE_VALIDATION: &str = "skip_thought_signature_validator";
 type Fingerprint = [u8; 32];
 pub(crate) type TurnId = u128;
 
@@ -377,7 +380,7 @@ pub(crate) struct ReplayCache {
 
 impl Default for ReplayCache {
     fn default() -> Self {
-        Self::with_limits(8 * 1024 * 1024, MAX_TURN_BYTES, Duration::from_secs(3600))
+        Self::for_settings(&crate::settings::Settings::default())
     }
 }
 
@@ -390,6 +393,23 @@ impl ReplayCache {
             max_turn_bytes,
             ttl,
         }
+    }
+
+    pub(crate) fn for_settings(settings: &crate::settings::Settings) -> Self {
+        Self::with_limits(
+            settings.antigravity_replay_bytes(),
+            MAX_TURN_BYTES,
+            settings.antigravity_replay_idle(),
+        )
+    }
+
+    /// Apply changed settings at once: a smaller budget evicts idle
+    /// conversations now and pinned ones at a later recording.
+    pub(crate) fn configure(&mut self, settings: &crate::settings::Settings) {
+        self.max_bytes = settings.antigravity_replay_bytes();
+        self.ttl = settings.antigravity_replay_idle();
+        self.prune(Instant::now());
+        self.make_room(None, 0);
     }
 
     pub(crate) fn record(&mut self, turn: RecordedTurn) -> bool {
@@ -439,7 +459,7 @@ impl ReplayCache {
         }
         let overhead = conversation.map_or_else(|| conversation_bytes(&turn.scope), |_| 0);
         let additional = turn.bytes.saturating_add(overhead);
-        if !self.make_room(&turn.scope, additional) {
+        if !self.make_room(Some(&turn.scope), additional) {
             return false;
         }
         let conversation = self
@@ -480,7 +500,7 @@ impl ReplayCache {
         }
         if !self.conversations.contains_key(scope) {
             let bytes = conversation_bytes(scope);
-            if !self.make_room(scope, bytes) {
+            if !self.make_room(Some(scope), bytes) {
                 return Err(
                     "signed Gemini history cache has no capacity for this conversation".into(),
                 );
@@ -512,7 +532,7 @@ impl ReplayCache {
     }
 
     /// Validate the complete history before replacing any parts or renewing
-    /// its TTL. Missing text turns require native replay just like tool turns.
+    /// its TTL. Turns missing from the cache replay as the client sent them.
     #[cfg(test)]
     pub(crate) fn restore(&mut self, scope: &Scope, request: &mut Value) -> Result<(), String> {
         self.restore_at(scope, request, Instant::now()).map(|_| ())
@@ -551,30 +571,32 @@ impl ReplayCache {
         let Some(contents) = request.get("contents").and_then(Value::as_array) else {
             return Err("expected native Gemini contents array for signed-history replay".into());
         };
+        // The first model turn still in the cache names the owner. Older turns
+        // may have been evicted or never recorded and replay unsigned.
         let mut context = history_hasher();
-        let mut first = None;
+        let mut scopes = Vec::new();
         for content in contents {
             if content["role"] == "model" {
                 let parts = content["parts"]
                     .as_array()
                     .ok_or("expected model parts array for signed-history replay")?;
-                first = Some((
-                    context.finalize().into(),
+                let key: (Fingerprint, Fingerprint) = (
+                    context.clone().finalize().into(),
                     fingerprint(&model_visible_parts(parts)),
-                ));
-                break;
+                );
+                for (scope, conversation) in &self.conversations {
+                    if scope.model == model
+                        && scope.session == session
+                        && conversation.candidate(key.0, key.1)?.is_some()
+                    {
+                        scopes.push(scope.clone());
+                    }
+                }
+                if !scopes.is_empty() {
+                    break;
+                }
             }
             hash_content(&mut context, content);
-        }
-        let Some(key) = first else { return Ok(None) };
-        let mut scopes = Vec::new();
-        for (scope, conversation) in &self.conversations {
-            if scope.model == model
-                && scope.session == session
-                && conversation.candidate(key.0, key.1)?.is_some()
-            {
-                scopes.push(scope.clone());
-            }
         }
         if scopes.len() > 1 {
             return Err(
@@ -620,7 +642,7 @@ impl ReplayCache {
         let mut native_ids = HashMap::new();
         let mut response_ids = Vec::new();
         let mut previous = None;
-        let mut unknown_native = false;
+        let mut unsigned = Vec::new();
         for (index, content) in contents.iter().enumerate() {
             if content.get("role").and_then(Value::as_str) == Some("model") {
                 let parts = content
@@ -635,9 +657,9 @@ impl ReplayCache {
                     None => None,
                 };
                 if let Some(turn) = hit {
-                    if unknown_native {
-                        return Err("signed Gemini history cannot mix recorded and unrecorded native lineages".into());
-                    }
+                    // Unrecorded turns may sit between recorded ones (eviction,
+                    // a completion the cache could not keep), but the recorded
+                    // turns themselves still form one ordered lineage.
                     if let Some(previous) = previous {
                         if !conversation.unwrap().follows(previous, turn) {
                             return Err(
@@ -654,15 +676,20 @@ impl ReplayCache {
                             .map(|(client, native)| (client.as_str(), native.as_deref())),
                     );
                 } else {
-                    // Legacy native signed history may pass unchanged, but it
-                    // cannot create a bridge between recorded branches.
-                    if previous.is_some() {
-                        return Err("signed Gemini history cannot mix recorded and unrecorded native lineages".into());
-                    }
-                    unknown_native = true;
+                    // An output recorded elsewhere never moves to this scope,
+                    // not even as unsigned client text.
                     let ids = parts.iter().filter_map(|part| {
                         part.pointer("/functionCall/id").and_then(Value::as_str)
                     });
+                    let mut elsewhere = self
+                        .conversations
+                        .iter()
+                        .filter(|(other, _)| {
+                            *other != scope
+                                && other.model == scope.model
+                                && other.session == scope.session
+                        })
+                        .map(|(_, conversation)| conversation.candidate(current_context, visible));
                     if ids.into_iter().any(|id| {
                         self.conversations.values().any(|conversation| {
                             conversation
@@ -670,23 +697,27 @@ impl ReplayCache {
                                 .values()
                                 .any(|turn| turn.call_ids.contains_key(id))
                         })
-                    }) {
+                    }) || elsewhere.any(|candidate| !matches!(candidate, Ok(None)))
+                    {
                         return Err("signed Gemini tool history does not match its recorded credential, model, session or preceding context".into());
                     }
                     let tools = parts.iter().any(|part| part.get("functionCall").is_some());
-                    if !calls_are_signed(parts) || (!tools && !parts.iter().any(has_signature)) {
-                        let kind = if tools {
-                            "signed Gemini tool history"
-                        } else {
-                            "signed Gemini history"
-                        };
-                        return Err(if scope.session.trim().is_empty() {
-                            format!("{kind} requires a stable session identifier")
-                        } else {
-                            format!(
-                                "{kind} is unavailable for this credential, model and session; start a new conversation after cache expiry or restart"
-                            )
-                        });
+                    let signed =
+                        calls_are_signed(parts) && (tools || parts.iter().any(has_signature));
+                    if !signed {
+                        if scope.session.trim().is_empty() {
+                            let kind = if tools {
+                                "signed Gemini tool history"
+                            } else {
+                                "signed Gemini history"
+                            };
+                            return Err(format!("{kind} requires a stable session identifier"));
+                        }
+                        // Its native parts were evicted, expired or never
+                        // recorded. Send the client's projection instead.
+                        if !calls_are_signed(parts) {
+                            unsigned.push(index);
+                        }
                     }
                 }
             }
@@ -709,6 +740,9 @@ impl ReplayCache {
             .unwrap();
         for (index, parts) in replacements {
             contents[index]["parts"] = Value::Array(parts);
+        }
+        for index in unsigned {
+            skip_signature_validation(&mut contents[index]["parts"]);
         }
         for (index, part_index, native) in response_ids {
             let response = contents[index]["parts"][part_index]["functionResponse"]
@@ -743,7 +777,7 @@ impl ReplayCache {
         }
     }
 
-    fn make_room(&mut self, scope: &Scope, additional: usize) -> bool {
+    fn make_room(&mut self, scope: Option<&Scope>, additional: usize) -> bool {
         let required = self
             .bytes
             .saturating_add(additional)
@@ -754,13 +788,17 @@ impl ReplayCache {
         let mut victims: Vec<_> = self
             .conversations
             .iter()
-            .filter(|(candidate, conversation)| *candidate != scope && conversation.in_flight == 0)
+            .filter(|(candidate, conversation)| {
+                Some(*candidate) != scope && conversation.in_flight == 0
+            })
             .map(|(scope, conversation)| {
                 (scope.clone(), conversation.last_used, conversation.bytes)
             })
             .collect();
         victims.sort_by_key(|(_, last_used, _)| *last_used);
-        if victims.iter().map(|(_, _, bytes)| bytes).sum::<usize>() < required {
+        // A new turn either fits whole or evicts nothing; a reconfiguration
+        // trims what it can and leaves pinned conversations in place.
+        if scope.is_some() && victims.iter().map(|(_, _, bytes)| bytes).sum::<usize>() < required {
             return false;
         }
         let mut freed = 0;
@@ -809,6 +847,22 @@ fn calls_are_signed(parts: &[Value]) -> bool {
                 .is_some_and(|previous| detached_signature(&parts[previous]))
             || parts.get(index + 1).is_some_and(detached_signature)
     })
+}
+
+/// Mark the first unsigned call of an unrecorded model step the way Gemini
+/// documents for history whose signatures are gone. Later parallel calls of a
+/// step carry no signature natively either, and text needs none.
+fn skip_signature_validation(parts: &mut Value) {
+    let Some(parts) = parts.as_array_mut() else {
+        return;
+    };
+    if let Some(call) = parts
+        .iter_mut()
+        .find(|part| part.get("functionCall").is_some())
+        .filter(|call| !has_signature(call))
+    {
+        call["thoughtSignature"] = Value::String(SKIP_SIGNATURE_VALIDATION.into());
+    }
 }
 
 fn detached_signature(part: &Value) -> bool {

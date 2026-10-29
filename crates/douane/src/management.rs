@@ -362,6 +362,7 @@ pub async fn restore(State(state): State<Arc<AppState>>, Json(body): Json<Value>
                 );
             }
         }
+        state.configure_replay(&config.settings);
         *state.config.write().await = config;
     }
     // Clients are checked before anything changes, and stored after the
@@ -1050,6 +1051,7 @@ pub async fn update_settings(
             );
         }
     }
+    state.configure_replay(&settings);
     *state.config.write().await = config;
     Json(json!(settings)).into_response()
 }

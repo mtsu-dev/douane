@@ -29,9 +29,10 @@ identity. Original native parts retain that metadata unchanged.
 
 Every recorded generation has an immutable identity and one validated parent.
 Retained model turns must follow one ordered lineage; reordered turns, sibling
-branches, ambiguous matches and altered model outputs are rejected. Repeated
-generations never overwrite nodes that existing descendants reference. Parent
-links and indexes use linear memory within the existing cache budget.
+branches and ambiguous matches are rejected; an altered model output never
+inherits native parts. Repeated generations never overwrite nodes that existing
+descendants reference. Parent links and indexes use linear memory within the
+existing cache budget.
 
 The authenticated client may remove a prefix or edit its own user text, tool
 results and inline system/developer reminders. Their new values are forwarded
@@ -62,24 +63,52 @@ Ownership is ephemeral with the replay cache and is not a new persistent pin.
 The cache retains whole scopes rather than independently expiring individual
 turns. Each scope indexes immutable generations by preceding context and
 complete visible output.
-The memory budget remains 8 MiB, including conservative allocation/index
-overhead, and each native turn remains limited to 256 KiB of serialized parts.
-There is no independent turn-count limit.
+The memory budget is `antigravity_replay_mib` (64 MiB by default), including
+conservative allocation/index overhead, and each native turn remains limited
+to 256 KiB of serialized parts. There is no independent turn-count limit. A
+heavy coding-agent step (4 KiB thought summary, 8 KiB signature, 1 KiB tool
+call) costs about 18 KB in that accounting, so a 150-step conversation takes
+about 2.7 MB and ten of them about 27 MB: the default holds ten parallel long
+conversations at half its budget. The former 8 MiB fit three, and swarms of six
+to eight Gemini agents lost conversations to eviction (2026-10-29). Changing the
+setting applies at once; a smaller budget evicts idle scopes immediately.
 
 A fully validated restore or successfully recorded native completion renews the
-scope's one-hour idle TTL. A generation that outlasts the TTL while pinned
+scope's idle TTL (`antigravity_replay_idle_minutes`, one hour by default). A generation that outlasts the TTL while pinned
 therefore remains replayable after completion. A failed restore, changed session
 or refused recording does not renew an existing scope. Capacity pressure evicts
 whole idle scopes in least-recently-used order.
 Active upstream calls pin their scope, including concurrent calls in the same
 scope, until completion or cancellation. An extension that cannot fit alongside
-its own prefix fails without deleting that prefix. If pinned scopes occupy the
-available budget, new scopes or responses fail explicitly.
+its own prefix, or beside pinned scopes, is delivered unrecorded without
+deleting that prefix.
 
-JSON responses report a replay recording failure as HTTP 502. Translated SSE
-responses report an error event and withhold the successful completion event
-until recording succeeds. Missing unsigned text history is rejected locally,
-just like missing unsigned tool history, before contacting the provider.
+## Missing turns
+
+A model turn the cache no longer holds (evicted, expired, lost at a restart, or
+a completion it could not keep) is forwarded as the client's projection. Its
+first tool call without a signature gets Gemini's documented
+`skip_thought_signature_validator` placeholder, the way
+[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/internal/signature/gemini_validation.go)
+handles history Gemini never signed; later parallel calls and text stay
+unsigned, as Gemini emits them. Recorded turns in the same request keep their
+native parts and must still follow one ordered lineage, so unrecorded turns may
+sit before or between them. The next completion records with the last recorded
+turn as its parent. Before 2026-10-29 such a request was refused with HTTP 400
+(`cannot mix recorded and unrecorded native lineages`, or `unavailable ... start
+a new conversation`) and every retry failed again.
+
+An output recorded in another account's scope of the same session, or a call
+ID recorded anywhere, is still refused rather than sent unsigned. A history
+without a stable session identifier is still refused.
+
+Owner lookup takes the first model turn the cache still holds, so a
+conversation whose oldest turns were evicted stays on its account.
+
+JSON responses report a native recording failure (transport, truncation,
+refusal, empty output, oversized turn) as HTTP 502. Translated SSE responses
+report an error event and withhold the successful completion event until
+recording succeeds.
 
 Native recording distinguishes transport/interruption, missing completion,
 empty output, truncation without output, provider refusal and turn-size errors.
@@ -88,8 +117,9 @@ text; it never produces a successful SSE completion. Token counters alone do
 not determine whether output exists. Unsupported native media is rejected by
 both translated JSON and SSE responses.
 
-The cache is process-local. A restart, idle expiry or whole-scope eviction can
-require a new conversation. No private reasoning is persisted, added to client
+The cache is process-local. After a restart, idle expiry or whole-scope
+eviction the conversation continues without the hidden reasoning of the lost
+turns. No private reasoning is persisted, added to client
 payloads or written to diagnostics. This change does not provide durable replay
 or change client compaction settings.
 
@@ -100,8 +130,10 @@ cargo test -p douane --lib antigravity_replay::tests --locked --jobs 2
 cargo test -p douane --test antigravity_harness --locked --jobs 2
 ```
 
-The cache tests cover two interleaved 160-turn conversations, atomic eviction,
-sliding expiry, rejected restores, concurrent pins and capacity refusal. The
+The cache tests cover two interleaved 160-turn conversations, ten parallel
+150-step conversations within the default budget, atomic eviction, evicted and
+partly recorded conversations continuing, sliding expiry, rejected restores,
+concurrent pins and reconfiguration. The
 public HTTP harness covers tool cycles and text correction with dynamic system
 reminders across Messages, Chat and Responses over JSON and SSE, including
 reasoning deltas whose signature arrives in a final empty-text frame,

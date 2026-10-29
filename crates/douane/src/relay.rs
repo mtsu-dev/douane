@@ -1135,6 +1135,8 @@ impl NativeReplay {
             .ok_or("native Gemini history recording was already finalized")?
             .finish()
             .map_err(|failure| failure.to_string())?;
+        // A completion the cache cannot keep is still delivered: the next
+        // request replays this turn from the client's projection instead.
         if !self
             .state
             .antigravity_replay
@@ -1142,7 +1144,10 @@ impl NativeReplay {
             .unwrap_or_else(|e| e.into_inner())
             .record(turn)
         {
-            return Err("signed Gemini history cache cannot retain the complete conversation within its byte budget".into());
+            tracing::warn!(
+                model = %self.scope.model,
+                "signed Gemini history cache is full; this turn will replay without its native parts"
+            );
         }
         Ok(())
     }

@@ -43,6 +43,11 @@ pub struct Settings {
     /// window is a month) when its reserve and client shares stop applying,
     /// so what is left gets used. 0 keeps them to the end.
     pub free_before_reset_hours: u32,
+    /// Memory for Antigravity's signed Gemini history, every conversation
+    /// together. A conversation squeezed out replays without its native parts.
+    pub antigravity_replay_mib: u32,
+    /// Minutes an idle conversation keeps its signed Gemini history.
+    pub antigravity_replay_idle_minutes: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +99,8 @@ impl Default for Settings {
             quota_display: BTreeMap::new(),
             quota_windows: BTreeMap::new(),
             free_before_reset_hours: 6,
+            antigravity_replay_mib: 64,
+            antigravity_replay_idle_minutes: 60,
         }
     }
 }
@@ -159,6 +166,12 @@ impl Settings {
         if self.free_before_reset_hours > 168 {
             bail!("free_before_reset_hours must be between 0 and 168");
         }
+        if !(1..=4096).contains(&self.antigravity_replay_mib) {
+            bail!("antigravity_replay_mib must be between 1 and 4096");
+        }
+        if !(1..=1440).contains(&self.antigravity_replay_idle_minutes) {
+            bail!("antigravity_replay_idle_minutes must be between 1 and 1440");
+        }
         if let Some(p) = &self.default_provider {
             if crate::subscriptions::SubscriptionProvider::parse(p).is_none() {
                 bail!("unknown default provider");
@@ -184,6 +197,14 @@ impl Settings {
             );
         }
         Ok(())
+    }
+
+    pub fn antigravity_replay_bytes(&self) -> usize {
+        self.antigravity_replay_mib as usize * 1024 * 1024
+    }
+
+    pub fn antigravity_replay_idle(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.antigravity_replay_idle_minutes) * 60)
     }
 
     pub fn free_before_reset_seconds(&self) -> i64 {

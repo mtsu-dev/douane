@@ -165,11 +165,15 @@ reminders. Hidden reasoning and opaque signatures never enter the ledger or
 disk. Chat Completions exposes returned thought text as `reasoning_content`;
 other dialects do not fabricate signed thinking blocks.
 
-The replay cache has an 8 MiB budget and a one-hour idle lifetime, with a
-256 KiB native-turn limit and no independent turn-count limit. Interrupted,
-invalid or oversized turns are not recorded. Missing, ambiguous, altered or
-cross-scope model history is refused locally, including after restart or
-expiry. Provider refusals and empty completions produce explicit errors.
+The replay cache has a 64 MiB budget and a one-hour idle lifetime by default
+(`antigravity_replay_mib`, `antigravity_replay_idle_minutes`), with a 256 KiB
+native-turn limit and no independent turn-count limit. Interrupted, invalid or
+oversized turns are not recorded. A turn missing from the cache (evicted,
+expired, lost at a restart or never recorded) is sent as the client's text, its
+first tool call marked with Gemini's `skip_thought_signature_validator`
+placeholder, so the conversation continues without that turn's hidden
+reasoning. Ambiguous, reordered or cross-scope model history is refused
+locally. Provider refusals and empty completions produce explicit errors.
 See [signed history](docs/antigravity-replay.md) for retention and compaction
 rules. Acceptance by a live Google account remains separate from offline tests.
 
