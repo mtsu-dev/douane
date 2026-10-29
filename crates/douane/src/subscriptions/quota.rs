@@ -291,7 +291,7 @@ impl QuotaService {
         let _guard = self.save_lock.lock().await;
         let snapshots = self.list().await;
         let mut forecast = self.forecast.write().await;
-        forecast.observe(&snapshots, time::OffsetDateTime::now_utc().unix_timestamp());
+        forecast.retain(&snapshots);
         let forecast_bytes = serde_json::to_vec(&*forecast).ok();
         drop(forecast);
         if let Some(bytes) = forecast_bytes {
@@ -341,7 +341,7 @@ impl QuotaService {
     ) -> Vec<super::forecast::WindowForecast> {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut forecast = self.forecast.write().await;
-        forecast.observe(snapshots, now);
+        forecast.retain(snapshots);
         forecast.report(snapshots, now)
     }
 
@@ -421,7 +421,7 @@ impl QuotaService {
                     verification_required: false,
                     verification_available: false,
                 });
-            for (position, window) in windows.into_iter().enumerate() {
+            for (position, window) in windows.iter().cloned().enumerate() {
                 match snapshot.windows.iter_mut().find(|w| w.id == window.id) {
                     Some(existing) => {
                         existing.remaining_percent = window.remaining_percent;
@@ -435,10 +435,11 @@ impl QuotaService {
             }
             snapshot.updated_at = now();
             snapshot.error = None;
-            self.forecast
-                .write()
-                .await
-                .record(snapshot, time::OffsetDateTime::now_utc().unix_timestamp());
+            self.forecast.write().await.record_claude_headers(
+                snapshot,
+                &windows,
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            );
         }
         self.failures.write().await.remove(&account.id);
     }
@@ -633,6 +634,7 @@ impl QuotaService {
             .err()
             .is_some_and(SubscriptionError::is_verification_required);
         let verification_available = verification_url.is_some();
+        let newly_observed = result.is_ok();
         let snapshot = match result {
             Ok(observation) => {
                 let snapshot = QuotaSnapshot {
@@ -721,10 +723,12 @@ impl QuotaService {
             verification_urls.remove(id);
         }
         cache.insert(id.into(), snapshot.clone());
-        self.forecast
-            .write()
-            .await
-            .record(&snapshot, time::OffsetDateTime::now_utc().unix_timestamp());
+        if newly_observed {
+            self.forecast
+                .write()
+                .await
+                .record(&snapshot, time::OffsetDateTime::now_utc().unix_timestamp());
+        }
         Ok(snapshot)
     }
 
@@ -2297,6 +2301,101 @@ mod tests {
             )
             .await;
         assert!(service.get(&codex.id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn mixed_precision_claude_readings_preserve_forecasts() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(AccountStore::open(directory.path()).unwrap());
+        let summary = store
+            .import(json!({"type":"claude","access_token":"fixture"}), None)
+            .await
+            .unwrap();
+        let account = store.get(&summary.id).await.unwrap();
+        let service = QuotaService::new(reqwest::Client::new(), store);
+        let observed = time::OffsetDateTime::now_utc();
+        let reset = observed + time::Duration::hours(2);
+        let baseline = QuotaSnapshot {
+            account_id: summary.id.clone(),
+            provider: SubscriptionProvider::Claude,
+            windows: vec![QuotaWindow {
+                id: "five-hour".into(),
+                label: "5 hours".into(),
+                remaining_percent: Some(80.0),
+                reset_at: Some(timestamp(reset)),
+                used: Some(20.0),
+                limit: Some(100.0),
+            }],
+            updated_at: timestamp(observed - time::Duration::minutes(30)),
+            error: None,
+            subscription: None,
+            credits: vec![],
+            verification_required: false,
+            verification_available: false,
+        };
+        service
+            .forecast
+            .write()
+            .await
+            .record(&baseline, observed.unix_timestamp() - 1800);
+        let recent = QuotaSnapshot {
+            updated_at: timestamp(observed - time::Duration::minutes(5)),
+            ..baseline.clone()
+        };
+        service
+            .forecast
+            .write()
+            .await
+            .record(&recent, observed.unix_timestamp() - 300);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.534".parse().unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reset.unix_timestamp().to_string().parse().unwrap(),
+        );
+        service.observe_claude_headers(&account, &headers).await;
+        let quiet = service
+            .complete_refresh(
+                &summary.id,
+                &account,
+                Err(SubscriptionError::Upstream(429)),
+                Trigger::Background,
+            )
+            .await
+            .unwrap();
+        assert!(quiet.error.is_none());
+        service.save().await;
+        let _ = service.forecasts(&[quiet]).await;
+        let usage = service
+            .complete_refresh(
+                &summary.id,
+                &account,
+                Ok(Observation {
+                    windows: parse_claude(
+                        &json!({"five_hour": {"utilization": 53, "resets_at": timestamp(reset)}}),
+                        observed,
+                    ),
+                    credits: vec![],
+                    plan: None,
+                    subscription: None,
+                    organization_id: None,
+                }),
+                Trigger::Manual,
+            )
+            .await
+            .unwrap();
+        let usage_at = parse_timestamp(&usage.updated_at).unwrap().unix_timestamp();
+        let report = service.forecasts(&[usage]).await;
+        assert_eq!(
+            report.len(),
+            1,
+            "rounded usage must not look like a refill after precise headers"
+        );
+        let span = usage_at - observed.unix_timestamp() + 1800;
+        assert_eq!(report[0].rate_per_hour, 33.0 / span as f64 * 3600.0);
     }
 
     #[tokio::test]

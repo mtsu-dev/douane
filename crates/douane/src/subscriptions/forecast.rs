@@ -1,5 +1,5 @@
 //! Estimates from observed quota changes. Never used for routing or quota values.
-use super::{QuotaSnapshot, parse_timestamp, timestamp};
+use super::{QuotaSnapshot, QuotaWindow, parse_timestamp, timestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -9,7 +9,14 @@ const MAX_GAP: i64 = 30 * 60;
 const SAMPLE_INTERVAL: i64 = 5 * 60;
 
 #[derive(Default, Serialize, Deserialize)]
-pub(super) struct History(BTreeMap<String, BTreeMap<String, Series>>);
+pub(super) struct History(BTreeMap<String, BTreeMap<String, BTreeMap<Source, Series>>>);
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Source {
+    Usage,
+    ClaudeHeaders,
+}
 
 #[derive(Serialize, Deserialize)]
 struct Series {
@@ -37,15 +44,44 @@ pub struct WindowForecast {
 }
 
 impl History {
+    #[cfg(test)]
     pub fn observe(&mut self, snapshots: &[QuotaSnapshot], now: i64) {
-        self.0
-            .retain(|id, _| snapshots.iter().any(|q| &q.account_id == id));
+        self.retain(snapshots);
         for quota in snapshots {
             self.record(quota, now);
         }
     }
 
+    pub fn retain(&mut self, snapshots: &[QuotaSnapshot]) {
+        self.0.retain(|id, windows| {
+            let Some(quota) = snapshots.iter().find(|q| &q.account_id == id) else {
+                return false;
+            };
+            windows.retain(|id, _| quota.windows.iter().any(|w| &w.id == id));
+            true
+        });
+    }
+
     pub fn record(&mut self, quota: &QuotaSnapshot, now: i64) {
+        self.record_from(quota, &quota.windows, now, Source::Usage);
+    }
+
+    pub fn record_claude_headers(
+        &mut self,
+        quota: &QuotaSnapshot,
+        windows: &[QuotaWindow],
+        now: i64,
+    ) {
+        self.record_from(quota, windows, now, Source::ClaudeHeaders);
+    }
+
+    fn record_from(
+        &mut self,
+        quota: &QuotaSnapshot,
+        observed_windows: &[QuotaWindow],
+        now: i64,
+        source: Source,
+    ) {
         let Some(at) = parse_timestamp(&quota.updated_at).map(|t| t.unix_timestamp()) else {
             return;
         };
@@ -53,8 +89,7 @@ impl History {
             return;
         }
         let windows = self.0.entry(quota.account_id.clone()).or_default();
-        windows.retain(|id, _| quota.windows.iter().any(|w| &w.id == id));
-        for window in &quota.windows {
+        for window in observed_windows {
             let Some(remaining) = window
                 .remaining_percent
                 .filter(|p| p.is_finite() && (0.0..=100.0).contains(p))
@@ -70,19 +105,27 @@ impl History {
             else {
                 continue;
             };
-            let series = windows.entry(window.id.clone()).or_insert_with(|| Series {
+            let sources = windows.entry(window.id.clone()).or_default();
+            let last = sources
+                .get(&source)
+                .and_then(Series::last)
+                .map(|p| (p.at, p.remaining));
+            if sources.values().filter_map(Series::last).any(|p| at < p.at) {
+                continue;
+            }
+            // Compare refills within one source: Claude headers and usage have
+            // different precision. A confirmed refill invalidates both histories.
+            if sources.values().any(|s| (s.reset - reset).abs() > 60)
+                || last.is_some_and(|(_, previous)| remaining > previous)
+            {
+                sources.clear();
+            }
+            let series = sources.entry(source).or_insert_with(|| Series {
                 reset,
                 points: Vec::new(),
                 last_observed: None,
             });
-            let last = series.last_observed.as_ref().or(series.points.last());
-            if last.is_some_and(|p| at < p.at) {
-                continue;
-            }
-            // New reset, refill, or an observation gap: never bridge cycles or downtime.
-            if (series.reset - reset).abs() > 60
-                || last.is_some_and(|p| at - p.at > MAX_GAP || remaining > p.remaining)
-            {
+            if last.is_some_and(|(previous_at, _)| at - previous_at > MAX_GAP) {
                 series.points.clear();
             }
             series.reset = reset;
@@ -114,57 +157,87 @@ impl History {
                 continue;
             }
             for window in &quota.windows {
-                let Some(series) = self
+                let Some(sources) = self
                     .0
                     .get(&quota.account_id)
                     .and_then(|s| s.get(&window.id))
                 else {
                     continue;
                 };
-                let Some(first) = series.points.iter().find(|p| p.at >= now - LOOKBACK) else {
+                if window
+                    .remaining_percent
+                    .is_none_or(|p| !p.is_finite() || !(0.0..=100.0).contains(&p))
+                {
                     continue;
-                };
-                let Some(remaining) = window.remaining_percent.filter(|p| {
-                    p.is_finite() && (0.0..=100.0).contains(p) && *p <= first.remaining
-                }) else {
-                    continue;
-                };
+                }
                 let Some(reset) = window
                     .reset_at
                     .as_deref()
                     .and_then(parse_timestamp)
                     .map(|t| t.unix_timestamp())
-                    .filter(|r| *r > now && (*r - series.reset).abs() <= 60)
+                    .filter(|r| *r > now)
                 else {
                     continue;
                 };
-                let span = at - first.at;
-                if span < MIN_SPAN {
-                    continue;
+                if let Some((_, forecast)) = sources
+                    .values()
+                    .filter_map(|s| s.forecast(&quota.account_id, &window.id, reset, now))
+                    .max_by_key(|(at, _)| *at)
+                {
+                    forecasts.push(forecast);
                 }
-                let rate = (first.remaining - remaining) / span as f64;
-                // Empty quotas censor demand: the observed slope cannot predict refill needs.
-                let exhausts = if remaining == 0.0 {
-                    Some(at)
-                } else if rate > 0.0 {
-                    let seconds = remaining / rate;
-                    (seconds < (reset - at) as f64).then(|| at + seconds.ceil() as i64)
-                } else {
-                    None
-                };
-                forecasts.push(WindowForecast {
-                    account_id: quota.account_id.clone(),
-                    window_id: window.id.clone(),
-                    observed_seconds: span,
-                    rate_per_hour: rate * 3600.0,
-                    remaining_at_reset: (remaining - rate * (reset - at) as f64).max(0.0),
-                    exhausts_at: exhausts
-                        .and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok())
-                        .map(timestamp),
-                });
             }
         }
         forecasts
+    }
+}
+
+impl Series {
+    fn last(&self) -> Option<&Point> {
+        self.last_observed.as_ref().or(self.points.last())
+    }
+
+    fn forecast(
+        &self,
+        account_id: &str,
+        window_id: &str,
+        reset: i64,
+        now: i64,
+    ) -> Option<(i64, WindowForecast)> {
+        let last = self.last()?;
+        let first = self.points.iter().find(|p| p.at >= now - LOOKBACK)?;
+        let span = last.at - first.at;
+        if last.at > now
+            || now - last.at > MAX_GAP
+            || (reset - self.reset).abs() > 60
+            || span < MIN_SPAN
+            || last.remaining > first.remaining
+        {
+            return None;
+        }
+        let rate = (first.remaining - last.remaining) / span as f64;
+        // Empty quotas censor demand: the observed slope cannot predict refill needs.
+        let exhausts = if last.remaining == 0.0 {
+            Some(last.at)
+        } else if rate > 0.0 {
+            let seconds = last.remaining / rate;
+            (seconds < (reset - last.at) as f64).then(|| last.at + seconds.ceil() as i64)
+        } else {
+            None
+        };
+        Some((
+            last.at,
+            WindowForecast {
+                account_id: account_id.into(),
+                window_id: window_id.into(),
+                observed_seconds: span,
+                rate_per_hour: rate * 3600.0,
+                remaining_at_reset: (last.remaining - rate * (reset - last.at) as f64).max(0.0),
+                exhausts_at: exhausts
+                    .and_then(|t| time::OffsetDateTime::from_unix_timestamp(t).ok())
+                    .map(timestamp),
+            },
+        ))
     }
 }
 
@@ -237,6 +310,32 @@ mod tests {
         let quotas = [snapshot(NOW + 120, 50.0, NOW + 7200)];
         history.observe(&quotas, NOW + 120);
         assert!(history.report(&quotas, NOW + 120).is_empty());
+    }
+
+    #[test]
+    fn source_precision_stays_separate_and_small_refills_invalidate_both() {
+        let mut history = History::default();
+        let usage = snapshot(NOW - 1800, 80.0, NOW + 7200);
+        history.record(&usage, NOW - 1800);
+        let headers = snapshot(NOW - 1800, 79.6, NOW + 7200);
+        history.record_claude_headers(&headers, &headers.windows, NOW - 1800);
+        let usage = snapshot(NOW, 47.0, NOW + 7200);
+        history.record(&usage, NOW);
+        let headers = snapshot(NOW, 46.6, NOW + 7200);
+        history.record_claude_headers(&headers, &headers.windows, NOW);
+        let mut restored: History =
+            serde_json::from_slice(&serde_json::to_vec(&history).unwrap()).unwrap();
+        let usage = snapshot(NOW + 60, 47.0, NOW + 7200);
+        restored.record(&usage, NOW + 60);
+        assert_eq!(restored.report(&[usage], NOW + 60).len(), 1);
+        for (at, remaining) in [(NOW + 120, 46.5), (NOW + 180, 46.6)] {
+            let headers = snapshot(at, remaining, NOW + 7200);
+            restored.record_claude_headers(&headers, &headers.windows, at);
+            assert_eq!(
+                restored.report(&[headers], at).len(),
+                usize::from(at == NOW + 120)
+            );
+        }
     }
     #[test]
     fn resets_refills_stale_readings_and_short_histories_stay_unknown() {
