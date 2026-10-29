@@ -15,6 +15,12 @@ request_timeout_seconds = 180
 # Hours before an account's weekly reset when its reserve and client shares stop
 # applying, so what is left gets used. 0 keeps them to the end.
 free_before_reset_hours = 6
+# Memory for Antigravity's signed Gemini history, every conversation together,
+# and how long an idle conversation keeps it. 64 MiB holds ten parallel agents
+# of 150 heavy tool steps each with room to spare. A conversation squeezed out
+# keeps working without its hidden reasoning.
+antigravity_replay_mib = 64
+antigravity_replay_idle_minutes = 60
 
 [settings.provider_strategies]
 # claude = "reset-first"

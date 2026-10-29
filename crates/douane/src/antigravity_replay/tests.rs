@@ -599,16 +599,12 @@ fn byte_budget_evicts_whole_least_recently_used_conversations() {
         !cache.conversations.contains_key(&scopes[0]),
         "no old tail may survive eviction"
     );
-    assert!(
-        cache
-            .restore_at(&scopes[0], &mut text_history("first"), now)
-            .is_err()
-    );
-    assert!(
-        cache
-            .restore_at(&scopes[0], &mut text_history("second"), now)
-            .is_err()
-    );
+    for text in ["first", "second"] {
+        let mut evicted = text_history(text);
+        let original = evicted.clone();
+        assert_eq!(cache.restore_at(&scopes[0], &mut evicted, now), Ok(None));
+        assert_eq!(evicted, original, "evicted native parts are never replayed");
+    }
     assert!(cache.bytes <= budget);
 
     // Give three one-turn conversations enough room for exactly two. A valid
@@ -687,7 +683,7 @@ fn a_successful_long_running_generation_renews_idle_ttl_after_release() {
     assert!(cache.record_at(turn_for(scope(), &request(), "first"), started));
     let mut history = text_history("first");
     append(&mut history, "user", json!([{"text":"Continue."}]));
-    let parent = cache.begin(&scope(), &mut history).unwrap();
+    let parent = cache.begin(&scope(), &mut history).unwrap().parent;
     let completed = started + Duration::from_secs(2 * 3600);
     let mut second = turn_for(scope(), &history, "second");
     second.parent = parent;
@@ -726,17 +722,18 @@ fn rejected_restores_and_recordings_do_not_renew_idle_ttl() {
         session: "changed-session".into(),
         ..scope()
     };
-    assert!(
-        cache
-            .restore_at(
-                &other,
-                &mut text_history("first"),
-                now + Duration::from_secs(26)
-            )
-            .is_err()
-    );
+    cache
+        .restore_at(
+            &other,
+            &mut text_history("first"),
+            now + Duration::from_secs(26),
+        )
+        .unwrap();
     let mut partially_valid = text_history("first");
-    append(&mut partially_valid, "model", json!([{"text":"altered"}]));
+    partially_valid["contents"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role":"model","parts":"malformed"}));
     assert!(
         cache
             .restore_at(
@@ -746,16 +743,16 @@ fn rejected_restores_and_recordings_do_not_renew_idle_ttl() {
             )
             .is_err()
     );
-    assert!(
-        cache
-            .restore_at(
-                &scope(),
-                &mut text_history("first"),
-                now + Duration::from_secs(28)
-            )
-            .is_err(),
+    assert_eq!(
+        cache.restore_at(
+            &scope(),
+            &mut text_history("first"),
+            now + Duration::from_secs(28)
+        ),
+        Ok(None),
         "failed restore and rejected record must not renew TTL"
     );
+    assert!(cache.conversations.is_empty());
     assert_eq!(cache.bytes, 0);
 }
 
@@ -771,9 +768,11 @@ fn expired_turns_are_not_replayed() {
     );
     let mut replay = initial;
     append(&mut replay, "model", json!([unsigned_call("expired", 1)]));
-    let original = replay.clone();
-    assert!(cache.restore(&scope(), &mut replay).is_err());
-    assert_eq!(replay, original);
+    cache.restore(&scope(), &mut replay).unwrap();
+    assert_eq!(
+        replay["contents"][1]["parts"][0]["thoughtSignature"], SKIP_SIGNATURE_VALIDATION,
+        "expired native parts are never replayed"
+    );
 }
 
 #[test]
@@ -821,13 +820,29 @@ fn existing_duplicate_upstream_ids_are_not_rewritten_or_recorded() {
 }
 
 #[test]
-fn unknown_unsigned_calls_fail_locally_and_native_signed_calls_pass() {
+fn unknown_unsigned_calls_skip_validation_and_native_signed_calls_pass() {
     let mut cache = ReplayCache::default();
     let mut unsigned = request();
-    append(&mut unsigned, "model", json!([unsigned_call("unknown", 1)]));
-    let original = unsigned.clone();
-    assert!(cache.restore(&scope(), &mut unsigned).is_err());
-    assert_eq!(unsigned, original);
+    append(
+        &mut unsigned,
+        "model",
+        json!([{"text":"two calls"},unsigned_call("unknown", 1),unsigned_call("parallel", 2)]),
+    );
+    let mut anonymous = unsigned.clone();
+    let original = anonymous.clone();
+    let no_session = Scope {
+        session: String::new(),
+        ..scope()
+    };
+    assert!(cache.restore(&no_session, &mut anonymous).is_err());
+    assert_eq!(anonymous, original);
+    cache.restore(&scope(), &mut unsigned).unwrap();
+    let mut first = unsigned_call("unknown", 1);
+    first["thoughtSignature"] = json!(SKIP_SIGNATURE_VALIDATION);
+    assert_eq!(
+        unsigned["contents"][1]["parts"],
+        json!([{"text":"two calls"},first,unsigned_call("parallel", 2)])
+    );
     let mut native = request();
     append(&mut native, "model", json!([signed_call("unknown", 1)]));
     let original = native.clone();
@@ -962,7 +977,7 @@ fn long_concurrent_conversations_keep_every_signed_turn_below_the_byte_budget() 
 }
 
 #[test]
-fn missing_or_expired_plain_text_history_is_refused_instead_of_sent_unsigned() {
+fn missing_or_expired_plain_text_history_is_sent_as_client_text() {
     let initial = request();
     let mut cache = ReplayCache::with_limits(8192, 4096, Duration::ZERO);
     store(
@@ -979,14 +994,15 @@ fn missing_or_expired_plain_text_history_is_refused_instead_of_sent_unsigned() {
         json!([{"text":"Please return valid JSON."}]),
     );
     let original = history.clone();
-    assert!(cache.restore(&scope(), &mut history).is_err());
-    assert_eq!(history, original);
-    assert!(
-        ReplayCache::default()
-            .restore(&scope(), &mut history)
-            .is_err(),
-        "restart must fail explicitly"
+    cache.restore(&scope(), &mut history).unwrap();
+    assert_eq!(
+        history, original,
+        "expired private parts are never replayed"
     );
+    ReplayCache::default()
+        .restore(&scope(), &mut history)
+        .unwrap();
+    assert_eq!(history, original, "a restart continues from client text");
 }
 
 #[test]
@@ -1032,16 +1048,35 @@ fn owner_lookup_validates_all_history_without_touching_ttl_or_request() {
         t0,
         "fallback owner lookup must not renew TTL"
     );
-    // A valid first turn must not authorize an unrecorded later turn.
+    // An unrecorded later turn replays unsigned on the same owner.
     append(
         &mut follow,
         "model",
         json!([unsigned_call("unrecorded", 2)]),
     );
-    assert!(
+    assert_eq!(
         cache
             .owner_at(&scope().model, &scope().session, &follow, now)
-            .is_err()
+            .unwrap(),
+        Some(scope().account)
+    );
+    // An evicted or unrecorded first turn does not hide a later recorded one.
+    let mut unrecorded_first = request();
+    append(
+        &mut unrecorded_first,
+        "model",
+        json!([unsigned_call("lost", 0)]),
+    );
+    append(&mut unrecorded_first, "user", json!([{"text":"result"}]));
+    unrecorded_first["contents"]
+        .as_array_mut()
+        .unwrap()
+        .extend(follow["contents"].as_array().unwrap()[1..3].iter().cloned());
+    assert_eq!(
+        cache
+            .owner_at(&scope().model, &scope().session, &unrecorded_first, now)
+            .unwrap(),
+        Some(scope().account)
     );
     assert_eq!(cache.conversations[&scope()].last_used, t0);
     assert_eq!(
@@ -1310,4 +1345,226 @@ fn concurrent_siblings_and_reordered_ancestors_cannot_be_spliced() {
         append(&mut valid, "model", json!([unsigned_call(id, n)]));
         cache.restore(&scope(), &mut valid).unwrap();
     }
+}
+
+fn tool_result(history: &mut Value, id: &str) {
+    append(
+        history,
+        "user",
+        json!([{"functionResponse":{"id":id,"name":"synthetic_tool","response":{"result":"ok"}}}]),
+    );
+}
+
+fn session(name: &str) -> Scope {
+    Scope {
+        session: name.into(),
+        ..scope()
+    }
+}
+
+#[test]
+fn partly_recorded_conversation_continues_instead_of_mixing_lineages() {
+    // Two parallel agents: the second keeps its call pinned while the first
+    // completes a turn that no longer fits beside it.
+    let mut history = request();
+    let mut recorder = Recorder::new(session("agent-a"), contents(&history));
+    recorder.observe(&mut json!({"candidates":[{"content":{"parts":[signed_call("a1", 1)]},"finishReason":"STOP"}]}));
+    let a1 = recorder.finish().unwrap();
+    let b1 = turn_for(session("agent-b"), &request(), "b1");
+    // Room for both first turns, not for a 2 KiB thought beside them.
+    let budget = a1.bytes + b1.bytes + conversation_bytes(&session("agent-a")) * 2 + 512;
+    let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
+    assert!(cache.record(a1));
+    assert!(cache.record(b1));
+    append(&mut history, "model", json!([unsigned_call("a1", 1)]));
+    tool_result(&mut history, "a1");
+    cache
+        .begin(&session("agent-b"), &mut text_history("b1"))
+        .unwrap();
+    let parent = cache
+        .begin(&session("agent-a"), &mut history.clone())
+        .unwrap()
+        .parent;
+    let mut recorder = Recorder::new(session("agent-a"), contents(&history)).with_parent(parent);
+    recorder.observe(&mut json!({"candidates":[{"content":{"parts":[
+        {"thought":true,"text":"x".repeat(2048),"thoughtSignature":"SYNTHETIC_LARGE"},
+        signed_call("a2", 2)
+    ]},"finishReason":"STOP"}]}));
+    assert!(
+        !cache.record(recorder.finish().unwrap()),
+        "the pinned neighbour leaves no room for this turn"
+    );
+    cache.release(&session("agent-a"));
+    // The client already holds the delivered call and sends its result.
+    append(&mut history, "model", json!([unsigned_call("a2", 2)]));
+    tool_result(&mut history, "a2");
+    let parent = cache
+        .begin(&session("agent-a"), &mut history)
+        .expect("a partly recorded conversation must keep working")
+        .parent;
+    assert!(parent.is_some(), "the recorded turn stays the parent");
+    assert_eq!(
+        history["contents"][1]["parts"],
+        json!([signed_call("a1", 1)])
+    );
+    assert_eq!(
+        history["contents"][3]["parts"][0]["thoughtSignature"],
+        SKIP_SIGNATURE_VALIDATION
+    );
+}
+
+#[test]
+fn evicted_conversation_continues_and_records_its_next_turns() {
+    let seed = turn_for(session("agent-a"), &request(), "seed");
+    let budget = (seed.bytes + conversation_bytes(&session("agent-a"))) * 2;
+    let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
+    let mut history = request();
+    store(
+        &mut cache,
+        session("agent-a"),
+        &history,
+        json!([signed_call("a1", 1)]),
+    );
+    append(&mut history, "model", json!([unsigned_call("a1", 1)]));
+    tool_result(&mut history, "a1");
+    for other in ["agent-b", "agent-c"] {
+        assert!(cache.record(turn_for(session(other), &request(), other)));
+    }
+    assert!(
+        !cache.conversations.contains_key(&session("agent-a")),
+        "parallel conversations evict the idle one"
+    );
+    let parent = cache
+        .begin(&session("agent-a"), &mut history.clone())
+        .expect("an evicted conversation must keep working")
+        .parent;
+    assert_eq!(parent, None);
+    let mut outgoing = history.clone();
+    cache.restore(&session("agent-a"), &mut outgoing).unwrap();
+    assert_eq!(
+        outgoing["contents"][1]["parts"][0]["thoughtSignature"],
+        SKIP_SIGNATURE_VALIDATION
+    );
+    let mut recorder = Recorder::new(session("agent-a"), contents(&history)).with_parent(parent);
+    recorder.observe(&mut json!({"candidates":[{"content":{"parts":[signed_call("a2", 2)]},"finishReason":"STOP"}]}));
+    assert!(cache.record(recorder.finish().unwrap()));
+    cache.release(&session("agent-a"));
+    append(&mut history, "model", json!([unsigned_call("a2", 2)]));
+    tool_result(&mut history, "a2");
+    cache
+        .begin(&session("agent-a"), &mut history)
+        .expect("the turn recorded after eviction must replay natively");
+    assert_eq!(
+        history["contents"][1]["parts"][0]["thoughtSignature"],
+        SKIP_SIGNATURE_VALIDATION
+    );
+    assert_eq!(
+        history["contents"][3]["parts"],
+        json!([signed_call("a2", 2)])
+    );
+}
+
+/// One Gemini tool step at the heavy end of a coding agent's: a 4 KiB thought
+/// summary, an 8 KiB signature and a 1 KiB shell command (about 18 KB each in
+/// the cache's conservative accounting).
+fn heavy_step(scope: Scope, step: usize, parent: Option<TurnId>) -> RecordedTurn {
+    let mut recorder = Recorder::new(
+        scope,
+        vec![json!({"role":"user","parts":[{"text":format!("result {step}")}]})],
+    )
+    .with_parent(parent);
+    recorder.observe(&mut json!({"candidates":[{"content":{"parts":[
+        {"thought":true,"text":"t".repeat(4096)},
+        {"text":"Running the command.","thoughtSignature":"S".repeat(8192)},
+        {"functionCall":{"id":format!("toolu_{step:020}"),"name":"Bash","args":{"command":"c".repeat(1024),"description":"run"}}}
+    ]},"finishReason":"STOP"}]}));
+    recorder.finish().unwrap()
+}
+
+#[test]
+fn default_budget_keeps_ten_parallel_long_conversations() {
+    let mut cache = ReplayCache::default();
+    let now = Instant::now();
+    for agent in 0..10 {
+        let mut parent = None;
+        for step in 0..150 {
+            let turn = heavy_step(session(&format!("agent-{agent}")), step, parent);
+            parent = Some(turn.id);
+            assert!(cache.record_at(turn, now));
+        }
+    }
+    assert_eq!(cache.conversations.len(), 10, "no conversation was evicted");
+    assert!(
+        cache.bytes * 2 <= cache.max_bytes,
+        "{} of {}",
+        cache.bytes,
+        cache.max_bytes
+    );
+    let settings = crate::settings::Settings {
+        antigravity_replay_mib: 8,
+        ..Default::default()
+    };
+    cache.configure(&settings);
+    assert!(cache.bytes <= 8 * 1024 * 1024);
+    assert!(cache.conversations.len() < 10);
+}
+
+#[test]
+fn evicted_conversation_continues_beside_pinned_neighbours() {
+    let seed = turn_for(session("agent-b"), &request(), "b1");
+    // Room for one conversation only, held by a call in flight.
+    let budget = seed.bytes + conversation_bytes(&session("agent-b"));
+    let mut cache = ReplayCache::with_limits(budget, 4096, Duration::from_secs(60));
+    assert!(cache.record(seed));
+    cache
+        .begin(&session("agent-b"), &mut text_history("b1"))
+        .unwrap();
+    let mut history = request();
+    append(&mut history, "model", json!([unsigned_call("a1", 1)]));
+    tool_result(&mut history, "a1");
+    let started = cache
+        .begin(&session("agent-a"), &mut history)
+        .expect("an evicted conversation must keep working beside pinned neighbours");
+    assert!(!started.pinned);
+    assert_eq!(started.parent, None);
+    assert_eq!(
+        history["contents"][1]["parts"][0]["thoughtSignature"],
+        SKIP_SIGNATURE_VALIDATION
+    );
+    assert!(cache.bytes <= cache.max_bytes);
+    assert!(!cache.conversations.contains_key(&session("agent-a")));
+    assert_eq!(
+        cache.conversations[&session("agent-b")].in_flight,
+        1,
+        "the unpinned call leaves the neighbour's pin alone"
+    );
+}
+
+#[test]
+fn lowering_the_budget_trims_a_pinned_conversation_once_its_call_ends() {
+    let mut cache = ReplayCache::default();
+    let mut parent = None;
+    for step in 0..80 {
+        let turn = heavy_step(session("agent-a"), step, parent);
+        parent = Some(turn.id);
+        assert!(cache.record(turn));
+    }
+    assert!(cache.bytes > 1024 * 1024);
+    cache.begin(&session("agent-a"), &mut request()).unwrap();
+    let settings = crate::settings::Settings {
+        antigravity_replay_mib: 1,
+        ..Default::default()
+    };
+    cache.configure(&settings);
+    assert!(
+        cache.conversations.contains_key(&session("agent-a")),
+        "a call in flight keeps its conversation"
+    );
+    cache.release(&session("agent-a"));
+    assert!(
+        cache.bytes <= cache.max_bytes,
+        "the ended call leaves {} bytes over a {} byte budget",
+        cache.bytes,
+        cache.max_bytes
+    );
 }

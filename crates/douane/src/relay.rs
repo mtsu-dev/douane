@@ -658,19 +658,20 @@ pub async fn forward(
             // Future context identity follows the client projection, whose
             // tool IDs differ from the original provider IDs restored below.
             let client_contents = history["contents"].as_array().cloned().unwrap_or_default();
-            let parent = match state
+            let started = match state
                 .antigravity_replay
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .begin(&scope, &mut history)
             {
-                Ok(parent) => parent,
+                Ok(started) => started,
                 Err(e) => return error(StatusCode::BAD_REQUEST, &e),
             };
             let native_replay = NativeReplay {
                 state: state.clone(),
                 scope: scope.clone(),
-                recorder: Some(Recorder::new(scope, client_contents).with_parent(parent)),
+                pinned: started.pinned,
+                recorder: Some(Recorder::new(scope, client_contents).with_parent(started.parent)),
                 terminal_output: None,
             };
             // Only model parts cross from the chronological cache projection
@@ -1108,6 +1109,7 @@ pub async fn forward(
 struct NativeReplay {
     state: Arc<AppState>,
     scope: Scope,
+    pinned: bool,
     recorder: Option<Recorder>,
     terminal_output: Option<String>,
 }
@@ -1135,6 +1137,8 @@ impl NativeReplay {
             .ok_or("native Gemini history recording was already finalized")?
             .finish()
             .map_err(|failure| failure.to_string())?;
+        // A completion the cache cannot keep is still delivered: the next
+        // request replays this turn from the client's projection instead.
         if !self
             .state
             .antigravity_replay
@@ -1142,13 +1146,19 @@ impl NativeReplay {
             .unwrap_or_else(|e| e.into_inner())
             .record(turn)
         {
-            return Err("signed Gemini history cache cannot retain the complete conversation within its byte budget".into());
+            tracing::warn!(
+                model = %self.scope.model,
+                "signed Gemini history cache is full; this turn will replay without its native parts"
+            );
         }
         Ok(())
     }
 }
 impl Drop for NativeReplay {
     fn drop(&mut self) {
+        if !self.pinned {
+            return;
+        }
         self.state
             .antigravity_replay
             .lock()

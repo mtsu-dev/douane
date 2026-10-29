@@ -164,8 +164,8 @@ async fn nested_native_stream_error_is_sanitized_and_never_records_a_turn() {
             false,
         )
         .await;
-    assert_eq!(status, 400, "{body}");
-    assert_eq!(fixture.mock.received.lock().unwrap().len(), 1);
+    assert_eq!(status, 200, "{body}");
+    assert_unrecorded_call_replay(&fixture);
 }
 
 #[tokio::test]
@@ -723,6 +723,27 @@ async fn streamed_thought_signature_survives_two_tool_cycles() {
     }
 }
 
+/// The second upstream request carries the client's call with Gemini's
+/// skip-validation placeholder, never the first attempt's native signature.
+fn assert_unrecorded_call_replay(fixture: &Fixture) {
+    let received = fixture.mock.received.lock().unwrap();
+    assert_eq!(received.len(), 2);
+    let model = received[1]["request"]["contents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|content| content["role"] == "model")
+        .unwrap();
+    let call = model["parts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|part| part.get("functionCall").is_some())
+        .unwrap();
+    assert_eq!(call["thoughtSignature"], "skip_thought_signature_validator");
+    assert!(!model.to_string().contains("SYNTHETIC_"), "{model}");
+}
+
 #[tokio::test]
 async fn interrupted_native_stream_never_commits_a_signed_tool_turn() {
     let mut incomplete = reply(1);
@@ -750,8 +771,8 @@ async fn interrupted_native_stream_never_commits_a_signed_tool_turn() {
             false,
         )
         .await;
-    assert_eq!(status, 400, "{body}");
-    assert_eq!(fixture.mock.received.lock().unwrap().len(), 1);
+    assert_eq!(status, 200, "{body}");
+    assert_unrecorded_call_replay(&fixture);
 }
 
 #[tokio::test]
@@ -988,9 +1009,9 @@ async fn unreplayable_native_turn_is_an_error_before_successful_completion() {
 }
 
 #[tokio::test]
-async fn full_conversation_budget_refuses_the_current_completion_explicitly() {
+async fn full_conversation_budget_still_delivers_and_continues_without_native_parts() {
     for stream in [false, true] {
-        let replies = (0..80).map(|turn| {
+        let replies = (0..60).map(|turn| {
             let mut native = reply(3);
             native["response"]["candidates"][0]["content"]["parts"] = json!([
                 {"thought":true,"text":"x".repeat(192 * 1024),"thoughtSignature":"SYNTHETIC_HIDDEN"},
@@ -999,9 +1020,12 @@ async fn full_conversation_budget_refuses_the_current_completion_explicitly() {
             native
         }).collect();
         let fixture = Fixture::new("antigravity", replies).await;
+        fixture.state.configure_replay(&douane::settings::Settings {
+            antigravity_replay_mib: 8,
+            ..Default::default()
+        });
         let mut history = with_system_reminders("messages", &[]);
-        let mut refused = false;
-        for turn in 0..80 {
+        for turn in 0..60 {
             let (status, body) = fixture
                 .post(
                     "messages",
@@ -1010,15 +1034,6 @@ async fn full_conversation_budget_refuses_the_current_completion_explicitly() {
                     stream,
                 )
                 .await;
-            if body.contains("byte budget") {
-                assert_eq!(status, if stream { 200 } else { 502 });
-                if stream {
-                    assert!(body.contains("event: error"));
-                    assert!(!body.contains("event: message_stop"));
-                }
-                refused = true;
-                break;
-            }
             assert_eq!(status, 200, "{body}");
             assert!(!body.contains("event: error"), "{body}");
             history["messages"].as_array_mut().unwrap().extend([
@@ -1026,10 +1041,21 @@ async fn full_conversation_budget_refuses_the_current_completion_explicitly() {
                 json!({"role":"user","content":"Continue the synthetic conversation."}),
             ]);
         }
-        assert!(
-            refused,
-            "the unchanged 8 MiB budget must refuse this conversation before losing its prefix"
+        // The first turns keep their native parts; the ones past the budget
+        // replay as the client's text.
+        let received = fixture.mock.received.lock().unwrap();
+        let models: Vec<_> = received[59]["request"]["contents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|content| content["role"] == "model")
+            .collect();
+        assert_eq!(models.len(), 59);
+        assert_eq!(
+            models[0]["parts"][0]["thoughtSignature"],
+            "SYNTHETIC_HIDDEN"
         );
+        assert_eq!(models[58]["parts"], json!([{"text":"answer 58"}]));
     }
 }
 

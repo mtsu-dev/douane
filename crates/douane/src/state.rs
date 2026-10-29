@@ -167,6 +167,8 @@ impl AppState {
         let resets = Arc::new(ResetManager::new(accounts.clone(), oauth.clone())?);
         let ledger = Ledger::open(&config.server.database)?;
         let clients = Arc::new(crate::clients::Clients::open(&config.server.auth_dir)?);
+        let antigravity_replay =
+            crate::antigravity_replay::ReplayCache::for_settings(&config.settings);
         Ok(Arc::new(Self {
             config: RwLock::new(config),
             config_path,
@@ -183,13 +185,21 @@ impl AppState {
             socket_heartbeat_ms: std::sync::atomic::AtomicU64::new(25_000),
             scheduler: Mutex::new(Scheduler::default()),
             affinity: Mutex::new(crate::affinity::Affinity::default()),
-            antigravity_replay: Mutex::new(crate::antigravity_replay::ReplayCache::default()),
+            antigravity_replay: Mutex::new(antigravity_replay),
             management_token,
             config_write: tokio::sync::Mutex::new(()),
             reserve_refresh: Mutex::new(BTreeMap::new()),
             refused: Mutex::new(BTreeMap::new()),
             listed: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    /// Apply the replay cache's limits from changed settings.
+    pub fn configure_replay(&self, settings: &crate::settings::Settings) {
+        self.antigravity_replay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .configure(settings);
     }
 
     fn refuses(&self, account: &str, model: &str) -> bool {
