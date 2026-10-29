@@ -5,7 +5,30 @@ use super::oauth::{google_verification_error, send_json};
 use super::store::text;
 use super::{SubscriptionError, SubscriptionProvider, timestamp};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{collections::BTreeMap, path::Path, sync::OnceLock, time::Duration};
+
+const ANTIGRAVITY_VERSION: &str = "1.4.1";
+
+/// Match the current ACP client protocol: Google gates models on this identity.
+/// Keep Douane's host and platform explicit, and use it for every Code Assist call.
+pub(crate) fn antigravity_user_agent() -> &'static str {
+    static USER_AGENT: OnceLock<String> = OnceLock::new();
+    USER_AGENT.get_or_init(|| {
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            os => os,
+        };
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            arch => arch,
+        };
+        format!(
+            "antigravity/acp/{ANTIGRAVITY_VERSION} (aidev_client; os_type={os}; arch={arch}; host_path=douane/{}; proxy_client=antigravity/sdk)",
+            env!("CARGO_PKG_VERSION")
+        )
+    })
+}
 
 const ANTIGRAVITY_CLIENT: &str =
     "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
@@ -233,7 +256,7 @@ impl GoogleOAuth {
             .bearer_auth(access)
             .json(&body);
         if provider == SubscriptionProvider::Antigravity {
-            request = request.header("User-Agent", "antigravity/hub/2.9.1");
+            request = request.header("User-Agent", antigravity_user_agent());
         }
         let loaded = send_json(request).await?;
         if let Some(error) = load_verification_error(&loaded) {
@@ -290,7 +313,7 @@ impl GoogleOAuth {
         let (endpoint, body) = if provider == SubscriptionProvider::Antigravity {
             (
                 format!("{}:onboardUser", self.daily_url),
-                json!({"tier_id":selected,"metadata":{"ide_type":"ANTIGRAVITY","ide_name":"antigravity","ide_version":"2.9.1"}}),
+                json!({"tier_id":selected,"metadata":{"ide_type":"ANTIGRAVITY","ide_name":"antigravity","ide_version":ANTIGRAVITY_VERSION}}),
             )
         } else {
             let mut body = json!({"tierId":selected,"metadata":metadata});
@@ -304,10 +327,7 @@ impl GoogleOAuth {
             let mut request = self.client.post(&endpoint).bearer_auth(access).json(&body);
             if provider == SubscriptionProvider::Antigravity {
                 request = request
-                    .header(
-                        "User-Agent",
-                        "antigravity/hub/2.9.1 google-api-nodejs-client/10.3.0",
-                    )
+                    .header("User-Agent", antigravity_user_agent())
                     .header("X-Goog-Api-Client", "gl-node/22.21.1");
             }
             request
@@ -597,13 +617,16 @@ mod tests {
                 assert_eq!(form["refresh_token"],"fixture-refresh");
                 axum::Json(json!({"access_token":"fixture-rotated","expires_in":3600}))
             }))
-            .route("/v1internal:loadCodeAssist",axum::routing::post(|axum::Json(body):axum::Json<Value>|async move {
+            .route("/v1internal:loadCodeAssist",axum::routing::post(|headers:axum::http::HeaderMap, axum::Json(body):axum::Json<Value>|async move {
                 assert_eq!(body["metadata"]["ideType"],"ANTIGRAVITY");
+                assert_eq!(headers["user-agent"], antigravity_user_agent());
                 axum::Json(json!({"allowedTiers":[{"id":"free-tier","isDefault":true}]}))
             }))
             .route("/daily:onboardUser",axum::routing::post(move|headers:axum::http::HeaderMap, axum::Json(body):axum::Json<Value>|{
                 let polls=worker_polls.clone();async move {
                     assert_eq!(body["tier_id"],"free-tier");assert_eq!(body["metadata"]["ide_type"],"ANTIGRAVITY");
+                    assert_eq!(body["metadata"]["ide_version"], ANTIGRAVITY_VERSION);
+                    assert_eq!(headers["user-agent"], antigravity_user_agent());
                     assert_eq!(headers["x-goog-api-client"],"gl-node/22.21.1");
                     let ready = polls.fetch_add(1,Ordering::SeqCst) > 0;
                     axum::Json(if ready {json!({"done":true,"response":{"cloudaicompanionProject":"antigravity-project"}})}else{json!({"done":false})})

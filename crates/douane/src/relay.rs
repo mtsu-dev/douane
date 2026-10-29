@@ -2,7 +2,7 @@ use crate::{
     antigravity_replay::{Recorder, Scope},
     ledger::{Call, Ledger},
     state::AppState,
-    subscriptions::{AccountCredential, SubscriptionProvider},
+    subscriptions::{AccountCredential, SubscriptionProvider, antigravity_user_agent},
     translate::{self, Bridge, Dialect, Frames},
 };
 use axum::{
@@ -372,7 +372,7 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
         SubscriptionProvider::Antigravity => {
             out.insert(
                 header::USER_AGENT,
-                header::HeaderValue::from_static("antigravity/hub/2.9.1"),
+                header::HeaderValue::from_static(antigravity_user_agent()),
             );
             out.insert(
                 "x-goog-api-client",

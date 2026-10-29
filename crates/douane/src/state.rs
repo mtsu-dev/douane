@@ -4,7 +4,7 @@ use crate::{
     settings::Config,
     subscriptions::{
         AccountCredential, AccountStore, OAuthManager, QuotaService, ResetManager,
-        SubscriptionProvider,
+        SubscriptionProvider, antigravity_user_agent,
     },
 };
 use anyhow::Result;
@@ -584,7 +584,7 @@ impl AppState {
                 "/v1internal:fetchAvailableModels",
             ))
             .bearer_auth(&account.access_token)
-            .header("User-Agent", "antigravity/hub/2.9.1")
+            .header("User-Agent", antigravity_user_agent())
             .json(&json!({ "project": project }))
             .timeout(std::time::Duration::from_secs(15))
             .send()
