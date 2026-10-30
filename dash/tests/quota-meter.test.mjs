@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 
-let server, View, render;
+let server, View, Summary, render;
 before(async () => {
 	server = await createServer({ root: fileURLToPath(new URL('../', import.meta.url)), server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
 	({ default: View } = await server.ssrLoadModule('/src/lib/components/quotas-view.svelte'));
+	({ default: Summary } = await server.ssrLoadModule('/src/lib/components/quota-forecast.svelte'));
 	({ render } = await server.ssrLoadModule('svelte/server'));
 	const { setLanguage } = await server.ssrLoadModule('/src/lib/i18n.svelte.ts');
 	setLanguage('en');
@@ -49,4 +50,15 @@ test('missing estimates remain unknown, while a predicted empty quota is a real 
 test('disabled accounts show only the actual quota; unknown quotas cannot show a known projection', () => {
 	assert.equal(meters(page({ enabled: false })).length, 1);
 	assert.deepEqual(meters(page({ current: null })).map(meter => meter.value), [undefined, undefined]);
+});
+
+test('provider and global summaries report missing readings even before the first estimate', () => {
+	for (const global of [false, true]) {
+		const { body } = render(Summary, { props: {
+			accounts: [{ id: 'missing', enabled: true }, { id: 'disabled', enabled: false }],
+			quotas: [], forecasts: [], global
+		} });
+		assert.match(body, /Accounts without quota readings: 1/);
+		assert.match(body, /Needs 30 minutes of recent quota readings/);
+	}
 });

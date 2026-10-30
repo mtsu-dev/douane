@@ -13,7 +13,7 @@ export const en = {
 	'forecast.slowCount': 'Unused capacity: {count}',
 	'forecast.balancedCount': 'On track: {count}',
 	'forecast.coverage': '{known}/{total} limits estimated',
-	'forecast.missingAccounts': '{count} accounts without quota readings',
+	'forecast.missingAccounts': 'Accounts without quota readings: {count}',
 	'forecast.learning': 'Needs 30 minutes of recent quota readings with a known reset.',
 	'forecast.current': 'Current',
 	'forecast.atReset': 'At reset',

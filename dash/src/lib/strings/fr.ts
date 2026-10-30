@@ -15,7 +15,7 @@ export const fr: Record<StringKey, string> = {
 	'forecast.slowCount': 'Marge inutilisée : {count}',
 	'forecast.balancedCount': 'Bon rythme : {count}',
 	'forecast.coverage': '{known}/{total} limites estimées',
-	'forecast.missingAccounts': '{count} comptes sans relevés de quota',
+	'forecast.missingAccounts': 'Comptes sans relevés de quota : {count}',
 	'forecast.learning': 'Il faut 30 min de relevés récents et un reset connu.',
 	'forecast.current': 'Actuel',
 	'forecast.atReset': 'Au reset',

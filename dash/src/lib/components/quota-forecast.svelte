@@ -17,15 +17,18 @@
 		<button class="info icon-button" aria-label={t('forecast.about')} aria-expanded={methodOpen} title={t('forecast.about')} onclick={() => methodOpen = !methodOpen}><Info size={17}/></button>
 	</div>
 	{#if methodOpen}<p class="method">{t('forecast.method')}</p>{/if}
-	{#if summary.known}
+	{#if summary.known || summary.missingAccounts}
 		<div class="forecast-counts">
+			{#if summary.known}
 			{#if summary.counts.fast}<span data-pace="fast">{t('forecast.fastCount', { count: summary.counts.fast })}</span>{/if}
 			{#if summary.counts.slow}<span data-pace="slow">{t('forecast.slowCount', { count: summary.counts.slow })}</span>{/if}
 			{#if summary.counts.balanced}<span>{t('forecast.balancedCount', { count: summary.counts.balanced })}</span>{/if}
 			<span class="coverage">{t('forecast.coverage', { known: summary.known, total: summary.total })}</span>
+			{/if}
 			{#if summary.missingAccounts}<span>{t('forecast.missingAccounts', { count: summary.missingAccounts })}</span>{/if}
 		</div>
-	{:else}<p class="learning">{t('forecast.learning')}</p>{/if}
+	{/if}
+	{#if !summary.known}<p class="learning">{t('forecast.learning')}</p>{/if}
 </section>
 
 <style>
