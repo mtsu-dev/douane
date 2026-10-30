@@ -62,6 +62,9 @@ test('the header holds title, provider tabs, search and sort in one toolbar', ()
   assert.match(header, /provider-tabs/);
   assert.match(header, /type="search"/);
   assert.match(header, /<select/);
+  // Counts live in each provider heading; the tabs stay short so the line holds them.
+  assert.doesNotMatch(header, /count-badge/);
+  assert.doesNotMatch(header, /search-input[^"]*filled/);
 });
 
 test('extra usage is hidden when it is off or reports nothing', () => {
