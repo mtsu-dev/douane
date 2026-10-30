@@ -1,8 +1,8 @@
 <script lang="ts">
 	import ChartNoAxesCombined from '@lucide/svelte/icons/chart-no-axes-combined';
 	import Info from '@lucide/svelte/icons/info';
-	import { forecastSummary, pace } from '$lib/forecast';
-	import { formatDate, formatDecimal, privateLabel, usageLabel, type Account, type Quota, type WindowForecast } from '$lib/management';
+	import { forecastSummary } from '$lib/forecast';
+	import type { Account, Quota, WindowForecast } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
 	let { accounts, quotas, forecasts, global = false }: { accounts: Account[]; quotas: Quota[]; forecasts: WindowForecast[]; global?: boolean } = $props();
 	let summary = $derived(forecastSummary(accounts, quotas, forecasts));
@@ -26,24 +26,6 @@
 			{#if summary.missingAccounts}<span>{t('forecast.missingAccounts', { count: summary.missingAccounts })}</span>{/if}
 		</div>
 	{:else}<p class="learning">{t('forecast.learning')}</p>{/if}
-	{#if !global && summary.rows.length}
-		<details>
-			<summary>{t('forecast.details')}</summary>
-			<div class="forecast-limits">
-				{#each summary.rows as row (`${row.account.id}/${row.window.id}`)}
-					<div class="forecast-limit">
-						<div class="limit-name"><strong>{privateLabel(row.account.name)}</strong><span>{usageLabel(row.window.label)}</span></div>
-						{#if row.forecast}
-							<div class="limit-outlook" data-pace={pace(row.forecast)}>
-								<strong>{row.forecast.exhausts_at ? t('forecast.emptyAt', { date: formatDate(row.forecast.exhausts_at) }) : t('forecast.leftAtReset', { value: Math.round(row.forecast.remaining_at_reset) })}</strong>
-								<span>{t('forecast.rate', { rate: formatDecimal(row.forecast.rate_per_hour), hours: formatDecimal(row.forecast.observed_seconds / 3600) })}</span>
-							</div>
-						{:else}<span class="unknown">{t('forecast.unavailable')}</span>{/if}
-					</div>
-				{/each}
-			</div>
-		</details>
-	{/if}
 </section>
 
 <style>
@@ -61,23 +43,11 @@
 	.coverage { margin-left: auto; color: var(--faint); }
 	.learning { margin: 10px 0 0; color: var(--muted); font-size: 15px; }
 	.method { margin: 12px 0; color: var(--muted); font-size: 15px; line-height: 1.6; }
-	details { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
-	summary { width: fit-content; cursor: pointer; color: var(--muted); font-size: 15px; }
-	summary:hover { color: var(--text); }
-	.forecast-limits { display: grid; margin-top: 8px; }
-	.forecast-limit { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 12px 0; }
-	.forecast-limit + .forecast-limit { border-top: 1px solid var(--border); }
-	.limit-name, .limit-outlook { display: grid; gap: 4px; font-size: 15px; }
-	.limit-name { min-width: 0; overflow-wrap: anywhere; }
-	.limit-name span, .limit-outlook span, .unknown { color: var(--muted); font-size: 15px; }
-	.limit-outlook { text-align: right; }
 	@media(max-width: 620px) {
 		.forecast, .global { padding: 15px; }
 		.forecast-heading { flex-wrap: wrap; gap: 8px; }
 		.pace { margin-left: 0; }
 		.info { margin-left: auto; }
 		.coverage { margin-left: 0; width: 100%; }
-		.forecast-limit { align-items: start; flex-direction: column; gap: 8px; }
-		.limit-outlook { text-align: left; }
 	}
 </style>
