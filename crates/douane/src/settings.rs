@@ -39,6 +39,8 @@ pub struct Settings {
     pub quota_display: BTreeMap<String, QuotaDisplay>,
     /// Which windows `/v1/quotas` shows for each provider, and the one shown first.
     pub quota_windows: BTreeMap<String, QuotaWindows>,
+    /// Show the optional provider consumption pace on the dashboard.
+    pub show_provider_pace: bool,
     /// Hours before an account's weekly reset (monthly when its longest
     /// window is a month) when its reserve and client shares stop applying,
     /// so what is left gets used. 0 keeps them to the end.
@@ -98,6 +100,7 @@ impl Default for Settings {
             default_provider: None,
             quota_display: BTreeMap::new(),
             quota_windows: BTreeMap::new(),
+            show_provider_pace: false,
             free_before_reset_hours: 6,
             antigravity_replay_mib: 64,
             antigravity_replay_idle_minutes: 60,

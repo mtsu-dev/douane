@@ -1,6 +1,6 @@
 // Serves the built dashboard with sample data, for README captures and UI work
 // without a running douane or any real account: `pnpm build && pnpm mock`.
-// Writes are accepted and ignored, except client keys, kept in memory. Nothing here reaches a provider.
+// Client keys, settings and reset results stay in memory. Nothing here reaches a provider.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
@@ -162,15 +162,25 @@ const summary = {
 };
 const settings = {
 	strategy: 'smart', quota_refresh_seconds: 300, free_before_reset_hours: 6, request_timeout_seconds: 180, default_provider: null,
-	provider_strategies: { claude: 'reset-first' }, quota_display: {}, quota_windows: {}
+	provider_strategies: { claude: 'reset-first' }, quota_display: {}, quota_windows: {}, show_provider_pace: false
 };
+const resetResults = new Map();
 const resets = (id) => {
 	const owner = accounts.find((a) => a.id === id);
 	const ready = owner && ['claude', 'codex'].includes(owner.provider);
-	return { account_id: id, provider: owner?.provider ?? '', status: ready ? 'ready' : 'unsupported', available_count: ready ? (id === 'acc-claude-home' ? 1 : 0) : null, next_expires_at: ready ? at(24 * 9) : null, error: null };
+	return { account_id: id, provider: owner?.provider ?? '', status: ready ? 'ready' : 'unsupported', available_count: ready ? (id === 'acc-claude-home' && ![...resetResults.values()].some(r => r.outcome === 'reset') ? 1 : 0) : null, next_expires_at: ready ? at(24 * 9) : null, error: null };
 };
 
 function api(method, path, body, query = new URLSearchParams()) {
+	if (method === 'PATCH' && path === '/settings') return Object.assign(settings, body);
+	const redeem = path.match(/^\/accounts\/([^/]+)\/resets\/redeem$/);
+	if (method === 'POST' && redeem) {
+		const id = decodeURIComponent(redeem[1]);
+		if (!body?.confirmation || !body.request_id) return [400, { error: { message: 'confirmation and request_id required' } }];
+		const key = `${id}:${body.request_id}`;
+		if (!resetResults.has(key)) resetResults.set(key, { request_id: body.request_id, outcome: resets(id).available_count ? 'reset' : 'no_credit' });
+		return resetResults.get(key);
+	}
 	// A pending device login for the sample dashboard. No provider request or credential is created.
 	if (method === 'POST' && path === '/oauth/start' && body?.provider === 'meta') return {
 		id: 'sample-meta-device', provider: 'meta', url: 'https://auth.meta.com/oidc/device/', user_code: 'MUSE-DEMO',
