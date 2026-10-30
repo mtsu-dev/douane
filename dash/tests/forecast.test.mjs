@@ -2,27 +2,49 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { forecastSummary } from '../src/lib/forecast.ts';
 
-test('global pace preserves a bottleneck alongside unused capacity and excludes disabled accounts', () => {
-	const accounts = [{ id: 'fast', enabled: true }, { id: 'slow', enabled: true }, { id: 'disabled', enabled: false }];
-	const quotas = accounts.map(a => ({ account_id: a.id, windows: [{ id: 'weekly' }] }));
-	const forecasts = [
-		{ account_id: 'fast', window_id: 'weekly', exhausts_at: '2026-11-01T00:00:00Z', remaining_at_reset: 0 },
-		{ account_id: 'slow', window_id: 'weekly', exhausts_at: null, remaining_at_reset: 60 },
-		{ account_id: 'disabled', window_id: 'weekly', exhausts_at: null, remaining_at_reset: 90 }
-	];
-	const summary = forecastSummary(accounts, quotas, forecasts);
-	assert.equal(summary.status, 'mixed');
-	assert.deepEqual(summary.counts, { fast: 1, slow: 1, balanced: 0 });
-	assert.equal(summary.total, 2);
+const at = '2026-10-30T12:00:00Z';
+const reset = hours => new Date(Date.parse(at) + hours * 3600_000).toISOString();
+const account = id => ({ id, enabled: true });
+const window = (id, remaining_percent, hours) => ({ id, remaining_percent, reset_at: reset(hours) });
+const quota = (id, windows) => ({ account_id: id, updated_at: at, windows });
+const forecast = (id, window_id, rate_per_hour) => ({ account_id: id, window_id, rate_per_hour });
+
+test('pace compares observed rate with remaining quota divided by time until its actual reset', () => {
+  const accounts = [account('a')];
+  const forecasts = [forecast('a', 'weekly', 1)];
+  assert.equal(forecastSummary(accounts, [quota('a', [window('weekly', 50, 24)])], forecasts).percent, 48);
+  assert.equal(forecastSummary(accounts, [quota('a', [window('weekly', 50, 48)])], forecasts).percent, 96);
 });
 
-test('unknown limits remain in coverage and do not vote as balanced or idle', () => {
-	const accounts = [{ id: 'a', enabled: true }, { id: 'unreported', enabled: true }];
-	const quotas = [{ account_id: 'a', windows: [{ id: 'weekly' }, { id: 'five-hour' }] }];
-	assert.equal(forecastSummary(accounts, quotas, []).status, 'unknown');
-	const summary = forecastSummary(accounts, quotas, [{ account_id: 'a', window_id: 'weekly', exhausts_at: null, remaining_at_reset: 20 }]);
-	assert.equal(summary.status, 'balanced');
-	assert.equal(summary.known, 1);
-	assert.equal(summary.total, 2);
-	assert.equal(summary.missingAccounts, 1);
+test('provider average counts each enabled account once using its most constrained window', () => {
+  const accounts = [account('a'), account('b'), { id: 'disabled', enabled: false }];
+  const quotas = [quota('a', [window('weekly', 50, 24), window('five-hour', 10, 2)]), quota('b', [window('weekly', 50, 12)])];
+  const forecasts = [forecast('a', 'weekly', 2), forecast('a', 'five-hour', 10), forecast('b', 'weekly', 5)];
+  const summary = forecastSummary(accounts, quotas, forecasts);
+  assert.equal(summary.percent, 160); // mean(200%, 120%), not mean(96%, 200%, 120%)
+  assert.equal(summary.known, 2);
+  assert.equal(summary.total, 2);
+});
+
+test('unknown constraints stay outside the average and remain in account coverage', () => {
+  const accounts = [account('a'), account('b'), account('missing')];
+  const quotas = [quota('a', [window('weekly', 50, 24), window('five-hour', null, 2)]), quota('b', [window('weekly', 50, 12)])];
+  const forecasts = [forecast('a', 'weekly', 2), forecast('b', 'weekly', 5)];
+  const summary = forecastSummary(accounts, quotas, forecasts);
+  assert.equal(summary.percent, 120);
+  assert.equal(summary.known, 1);
+  assert.equal(summary.total, 3);
+  assert.equal(forecastSummary(accounts, quotas, []).percent, null);
+});
+
+test('observed inactivity is zero pace; an exhausted limit cannot invent a finite rate', () => {
+  const accounts = [account('a')];
+  const forecasts = [forecast('a', 'weekly', 0)];
+  assert.equal(forecastSummary(accounts, [quota('a', [window('weekly', 100, 24)])], forecasts).percent, 0);
+  const exhausted = forecastSummary(accounts, [quota('a', [window('weekly', 0, 24)])], forecasts);
+  assert.equal(exhausted.exhausted, 1);
+  assert.equal(exhausted.percent, null);
+  const unavailable = forecastSummary(accounts, [quota('a', [window('weekly', 0, 24)])], []);
+  assert.equal(unavailable.exhausted, 0); // no usable forecast can mean the reading is stale
+  assert.equal(unavailable.known, 0);
 });

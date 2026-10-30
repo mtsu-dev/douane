@@ -3,62 +3,40 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import { createServer } from 'vite';
 
-let server, View, Summary, render;
+let server, View, render;
 before(async () => {
-	server = await createServer({ root: fileURLToPath(new URL('../', import.meta.url)), server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
-	({ default: View } = await server.ssrLoadModule('/src/lib/components/quotas-view.svelte'));
-	({ default: Summary } = await server.ssrLoadModule('/src/lib/components/quota-forecast.svelte'));
-	({ render } = await server.ssrLoadModule('svelte/server'));
-	const { setLanguage } = await server.ssrLoadModule('/src/lib/i18n.svelte.ts');
-	setLanguage('en');
+  server = await createServer({ root: fileURLToPath(new URL('../', import.meta.url)), server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
+  ({ default: View } = await server.ssrLoadModule('/src/lib/components/quotas-view.svelte'));
+  ({ render } = await server.ssrLoadModule('svelte/server'));
+  const { setLanguage } = await server.ssrLoadModule('/src/lib/i18n.svelte.ts');
+  setLanguage('en');
 });
 after(async () => { await server?.close(); });
 
-function page({ current = 64, projected = 31, enabled = true, exhausts = null } = {}) {
-	return render(View, { props: {
-		accounts: [{ id: 'sample', provider: 'claude', name: 'Sample', status: 'ready', enabled }],
-		quotas: [{ account_id: 'sample', windows: [{ id: 'five-hour', label: '5 hours', remaining_percent: current, reset_at: '2026-11-01T12:00:00Z' }] }],
-		forecasts: projected === null ? [] : [{ account_id: 'sample', window_id: 'five-hour', remaining_at_reset: projected, exhausts_at: exhausts, rate_per_hour: 3, observed_seconds: 3600 }],
-		busy: '', settings: null, refresh() {}, connect() {}, rename() {}, resetUpdated() {}, setQuotaDisplay() {}, setQuotaWindows() {}
-	} }).body;
+function page({ enabled = true, known = true, current = 50 } = {}) {
+  return render(View, { props: {
+    accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'ready', enabled }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled }],
+    quotas: ['a', 'b'].map(account_id => ({ account_id, updated_at: '2026-10-30T12:00:00Z', windows: [{ id: 'weekly', label: 'Weekly', remaining_percent: current, reset_at: '2026-10-31T12:00:00Z' }] })),
+    forecasts: known ? ['a', 'b'].map(account_id => ({ account_id, window_id: 'weekly', rate_per_hour: 3, observed_seconds: 3600, remaining_at_reset: 0, exhausts_at: '2026-10-31T04:40:00Z' })) : [],
+    busy: '', settings: null, refresh() {}, connect() {}, rename() {}, resetUpdated() {}, setQuotaDisplay() {}, setQuotaWindows() {}
+  } }).body;
 }
+const tags = (body, role) => [...body.matchAll(new RegExp(`<[^>]+role="${role}"[^>]*>`, 'g'))].map(([tag]) => tag);
 
-function meters(body) {
-	return [...body.matchAll(/<[^>]+role="meter"[^>]*>/g)].map(([tag]) => ({
-		label: tag.match(/aria-label="([^"]+)"/)?.[1],
-		value: tag.match(/aria-valuenow="([^"]+)"/)?.[1]
-	}));
-}
-
-test('each visible quota compares current and projected remaining capacity without opening details', () => {
-	assert.deepEqual(meters(page()), [
-		{ label: '5 hours / Current', value: '64' },
-		{ label: '5 hours / At reset (estimate)', value: '31' }
-	]);
+test('one pace line per provider compares consumption with average without repeated window projections', () => {
+  const body = page();
+  const lines = tags(body, 'meter').filter(tag => tag.includes('pace'));
+  assert.equal(lines.length, 2);
+  assert.ok(lines.every(tag => tag.includes('aria-valuenow="144"')));
+  assert.equal((body.match(/\+44% vs average/g) ?? []).length, 2);
+  assert.equal(tags(body, 'meter').length, 4);
+  assert.doesNotMatch(body, /Overall pace|At reset \(estimate\)|Run out early:/);
 });
 
-test('missing estimates remain unknown, while a predicted empty quota is a real zero', () => {
-	assert.deepEqual(meters(page({ projected: null })), [
-		{ label: '5 hours / Current', value: '64' },
-		{ label: '5 hours / At reset (estimate)', value: undefined }
-	]);
-	const empty = page({ projected: 0, exhausts: '2026-11-01T10:00:00Z' });
-	assert.equal(meters(empty)[1].value, '0');
-	assert.match(empty, /Empty by/);
-});
-
-test('disabled accounts show only the actual quota; unknown quotas cannot show a known projection', () => {
-	assert.equal(meters(page({ enabled: false })).length, 1);
-	assert.deepEqual(meters(page({ current: null })).map(meter => meter.value), [undefined, undefined]);
-});
-
-test('provider and global summaries report missing readings even before the first estimate', () => {
-	for (const global of [false, true]) {
-		const { body } = render(Summary, { props: {
-			accounts: [{ id: 'missing', enabled: true }, { id: 'disabled', enabled: false }],
-			quotas: [], forecasts: [], global
-		} });
-		assert.match(body, /Accounts without quota readings: 1/);
-		assert.match(body, /Needs 30 minutes of recent quota readings/);
-	}
+test('unknown estimates are visibly partial; disabled accounts retain only their actual quota', () => {
+  const body = page({ known: false });
+  assert.match(body, /0\/1 accounts measured/);
+  assert.ok(tags(body, 'meter').filter(tag => tag.includes('pace')).every(tag => !tag.includes('aria-valuenow')));
+  assert.equal(tags(page({ enabled: false }), 'meter').length, 2);
+  assert.ok(tags(page({ current: null }), 'meter').every(tag => !tag.includes('aria-valuenow')));
 });

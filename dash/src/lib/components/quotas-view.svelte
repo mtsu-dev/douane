@@ -52,8 +52,6 @@
 	</div>
 {/if}
 
-{#if accounts.some(a => a.enabled && providerIds.includes(a.provider))}<QuotaForecast accounts={accounts.filter(a => providerIds.includes(a.provider))} {quotas} {forecasts} global/>{/if}
-
 <div class="section-toolbar quota-toolbar"><label class="search-input"><Search size={18}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('common.connectAccount')} onclick={connect}/></section>
@@ -78,7 +76,7 @@
 							{#if !current.primary && windowsOf(group.id).length}<p class="window-default">{t('quotas.defaultWindow')}</p>{/if}
 						</div>
 					{/if}
-				{#if accounts.some(a => a.provider === group.id && a.enabled)}<QuotaForecast accounts={accounts.filter(a => a.provider === group.id)} {quotas} {forecasts}/>{/if}
+				{#if accounts.some(a => a.provider === group.id && a.enabled)}<QuotaForecast accounts={accounts.filter(a => a.provider === group.id)} {quotas} {forecasts} provider={group.id}/>{/if}
 				<div class="ledger">
 					{#each group.accounts as account (account.id)}
 						{@const quota = quotas.find(q => q.account_id === account.id)}
@@ -87,7 +85,7 @@
 							<div class="account-identity"><AccountName {account} {rename} {busy}/>{#if subscription?.label || account.plan}<p class="account-plan">{subscription?.label ?? account.plan}</p>{/if}{#if account.email}<PrivateEmail email={account.email}/>{/if}<AccountResets {account} {busy} updated={resetUpdated}/></div>
 							<div class="quota-details">
 								{#if quota?.verification_required}<div class="verification-needed"><p>{t('quotas.googleVerify')}</p>{#if quota.verification_available}<a class="button" href={`/admin/api/accounts/${encodeURIComponent(account.id)}/verification`} target="_blank" rel="noopener noreferrer" data-sveltekit-reload>{t('common.verifyGoogle')}<ExternalLink size={16}/></a>{:else}<p>{t('common.openAntigravity')}</p>{/if}</div>{/if}
-								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)} forecast={account.enabled ? forecasts.find(f => f.account_id === account.id && f.window_id === window.id) ?? null : undefined}/><p class="reset-date" title={window.reset_at ? t('quotas.resetAt', { date: formatDate(window.reset_at) }) : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : t('quotas.notReported')}</p>{/if}</div>
+								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)}/><p class="reset-date" title={window.reset_at ? t('quotas.resetAt', { date: formatDate(window.reset_at) }) : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : t('quotas.notReported')}</p>{/if}</div>
 								{#if quota?.credits?.length}<div class="credit-windows">{#each quota.credits as credit (credit.id)}<div class="credit-window"><div><span>{usageLabel(credit.label)}</span><strong>{credit.enabled === false ? t('common.disabled') : credit.unlimited ? t('quotas.unlimited') : creditValue(credit.remaining, credit.unit)}{#if credit.enabled !== false && credit.remaining != null}<span class="muted">{` ${t('quotas.remaining')}`}</span>{/if}</strong></div>{#if credit.used != null}<p>{credit.limit != null ? t('quotas.usedOf', { used: creditValue(credit.used, credit.unit), limit: creditValue(credit.limit, credit.unit) }) : t('quotas.used', { used: creditValue(credit.used, credit.unit) })}</p>{/if}{#if credit.reset_at}<p class="reset-date"><RefreshCw size={16}/>{resetLabel(credit.reset_at)}</p>{/if}</div>{/each}</div>{/if}
 							</div>
 							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? t('common.disabled') : quota?.error ? t('status.check') : account.reserve_reached && ['ready', 'active'].includes(account.status) ? t('status.reserveReached') : accountStatus(account)}</span><button class="icon-button" disabled={!!busy} onclick={() => refresh(account.id)} title={t('quotas.refreshAccount')} aria-label={t('quotas.refreshNamed', { name: privateLabel(account.name) })}><RefreshCw size={19}/></button></div>
