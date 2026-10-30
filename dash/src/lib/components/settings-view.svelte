@@ -21,7 +21,7 @@
 	async function setPace(show: boolean) {
 		const previous = draft.show_provider_pace ?? false;
 		draft.show_provider_pace = show;
-		if (!(await save({ ...settings, show_provider_pace: show }))) draft.show_provider_pace = previous;
+		if (!(await save(draft))) draft.show_provider_pace = previous;
 	}
 </script>
 
