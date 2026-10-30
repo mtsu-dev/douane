@@ -24,7 +24,10 @@
 	const shownCredits = (quota?: Quota) => quota?.credits?.filter(c => c.enabled !== false && (c.unlimited || c.remaining != null || !!c.used)) ?? [];
 	// Tabs go to their own row only when the line cannot hold them (many providers, or an open search), so none is ever cut.
 	let toolbarWidth = $state(0), titleWidth = $state(0), filtersWidth = $state(0), tabs = $state<HTMLElement>();
-	let tabsWidth = $derived.by(() => { void providerIds; void toolbarWidth; const last = tabs?.lastElementChild as HTMLElement | null; return last ? last.offsetLeft + last.offsetWidth - (tabs!.firstElementChild as HTMLElement).offsetLeft : 0; });
+	// Tab sizes change without the toolbar resizing (Figtree loading late, a provider added, the language switched): observe each tab.
+	let tabsVersion = $state(0);
+	$effect(() => { void providerIds; if (!tabs) return; const observer = new ResizeObserver(() => tabsVersion++); for (const tab of tabs.children) observer.observe(tab); return () => observer.disconnect(); });
+	let tabsWidth = $derived.by(() => { void tabsVersion; const last = tabs?.lastElementChild as HTMLElement | null; return last ? last.offsetLeft + last.offsetWidth - (tabs!.firstElementChild as HTMLElement).offsetLeft : 0; });
 	let stacked = $derived(toolbarWidth > 0 && titleWidth + tabsWidth + filtersWidth + 2 * TOOLBAR_GAP > toolbarWidth);
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
@@ -76,13 +79,15 @@
 	.quota-toolbar .provider-tabs>button { padding: 0 10px; height: 40px; font-size: 14px; }
 	.quota-toolbar.stacked { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 14px 16px; }
 	.quota-toolbar.stacked .provider-tabs { grid-column: 1/-1; grid-row: 2; }
+	.quota-toolbar.stacked .quota-filters { max-width: 100%; }
 	.quota-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-shrink: 0; min-width: 0; margin-left: auto; }
 	/* Search stays an icon until it is used, so the provider tabs keep the line. */
-	.quota-filters .search-input { width: 40px; padding: 0 11px; cursor: text; transition: width .2s; }
-	.quota-filters .search-input:focus-within, .quota-filters .search-input.filled { width: 220px; }
+	/* A flex basis rather than a width lets an open search shrink inside a narrow (phone) toolbar. */
+	.quota-filters .search-input { flex: 0 1 40px; width: auto; min-width: 40px; padding: 0 11px; cursor: text; transition: flex-basis .2s; }
+	.quota-filters .search-input:focus-within, .quota-filters .search-input.filled { flex-basis: 220px; }
 	.quota-filters .search-input input { min-width: 0; }
 	.quota-filters .search-input :global(svg) { flex-shrink: 0; }
-	.quota-filters select { width: 140px; background: var(--surface); }
+	.quota-filters select { flex-shrink: 0; width: 140px; background: var(--surface); }
 	.quota-filters select, .quota-filters .search-input { height: 40px; min-height: 40px; border-radius: 10px; font-size: 14px; }
 	.quota-filters input { font-size: 14px; }
 	.provider-groups { display: grid; gap: 30px; }
