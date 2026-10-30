@@ -29,10 +29,15 @@
 	$effect(() => { void providerIds; if (!tabs) return; const observer = new ResizeObserver(() => tabsVersion++); for (const tab of tabs.children) observer.observe(tab); return () => observer.disconnect(); });
 	// The width the tabs need on one line: stacked tabs may wrap, so their offsets no longer give it.
 	let tabsWidth = $derived.by(() => { void tabsVersion; if (!tabs?.children.length) return 0; const items = [...tabs.children] as HTMLElement[]; return items.reduce((sum, tab) => sum + tab.offsetWidth, 0) + (items.length - 1) * (parseFloat(getComputedStyle(tabs).columnGap) || 0); });
-	let searchFocused = $state(false);
+	// Leaving the search collapses its phone row; during a press that would move the tab under the finger, so wait for the press to end.
+	let searchFocused = $state(false), searchLabel = $state<HTMLElement>(), pressing = false;
+	const settleSearch = () => searchFocused = !!searchLabel?.contains(document.activeElement);
+	const pressEnd = () => { pressing = false; setTimeout(settleSearch); };
 	let stacked = $derived(toolbarWidth > 0 && titleWidth + tabsWidth + filtersWidth + 2 * TOOLBAR_GAP > toolbarWidth);
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
+
+<svelte:window onpointerdown={() => pressing = true} onpointerup={pressEnd} onpointercancel={pressEnd}/>
 
 <header class="quota-toolbar" class:stacked class:searching={searchFocused || !!search} bind:clientWidth={toolbarWidth}>
 	<h1 bind:clientWidth={titleWidth}>{t('nav.quotas')}</h1>
@@ -42,7 +47,7 @@
 			{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={20}/>{providerName(id)}</button>{/each}
 		</div>
 	{/if}
-	<div class="quota-filters" bind:clientWidth={filtersWidth}><label class="search-input" class:filled={!!search} onfocusin={() => searchFocused = true} onfocusout={() => searchFocused = false}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
+	<div class="quota-filters" bind:clientWidth={filtersWidth}><label class="search-input" class:filled={!!search} bind:this={searchLabel} onfocusin={() => searchFocused = true} onfocusout={() => { if (!pressing) searchFocused = false; }}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
 </header>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
