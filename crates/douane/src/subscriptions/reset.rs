@@ -426,7 +426,7 @@ impl ResetManager {
             .timeout(std::time::Duration::from_secs(25));
         match account.provider {
             SubscriptionProvider::Codex => {
-                let request = request.header("User-Agent", "codex-tui/0.160.0");
+                let request = request.header("User-Agent", crate::relay::CODEX_USER_AGENT);
                 if let Some(id) = &account.account_id {
                     request.header("ChatGPT-Account-Id", id)
                 } else {
@@ -435,7 +435,7 @@ impl ResetManager {
             }
             SubscriptionProvider::Claude => request
                 .header("anthropic-beta", "oauth-2025-04-20")
-                .header("User-Agent", "claude-cli/2.1.286 (external, cli)"),
+                .header("User-Agent", crate::relay::CLAUDE_USER_AGENT),
             _ => request,
         }
     }

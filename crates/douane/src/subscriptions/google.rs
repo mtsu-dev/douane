@@ -257,6 +257,8 @@ impl GoogleOAuth {
             .json(&body);
         if provider == SubscriptionProvider::Antigravity {
             request = request.header("User-Agent", antigravity_user_agent());
+        } else {
+            request = request.header("User-Agent", crate::relay::GEMINI_USER_AGENT);
         }
         let loaded = send_json(request).await?;
         if let Some(error) = load_verification_error(&loaded) {
@@ -329,6 +331,8 @@ impl GoogleOAuth {
                 request = request
                     .header("User-Agent", antigravity_user_agent())
                     .header("X-Goog-Api-Client", "gl-node/22.21.1");
+            } else {
+                request = request.header("User-Agent", crate::relay::GEMINI_USER_AGENT);
             }
             request
         };

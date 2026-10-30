@@ -130,7 +130,7 @@ pub struct AppState {
     /// Models an account refused although a catalog lists them, by account
     /// and model, with the time of the refusal.
     refused: Mutex<BTreeMap<(String, String), std::time::Instant>>,
-    /// The upstream ids each Copilot or Antigravity account's own live
+    /// The upstream ids each Codex, Copilot or Antigravity account's own live
     /// listing returned last: one Google or GitHub plan can offer models
     /// another one of the same pool lacks.
     listed: Mutex<BTreeMap<String, BTreeSet<String>>>,
@@ -465,8 +465,16 @@ impl AppState {
                     }
                 }
             }
-            if account.provider == SubscriptionProvider::Copilot {
-                match self.copilot_models(&account).await {
+            if matches!(
+                account.provider,
+                SubscriptionProvider::Codex | SubscriptionProvider::Copilot
+            ) {
+                let live = if account.provider == SubscriptionProvider::Codex {
+                    self.codex_models(&account).await
+                } else {
+                    self.copilot_models(&account).await
+                };
+                match live {
                     Some(live) => {
                         self.remember_listing(&account.id, &live);
                         available = live
@@ -555,6 +563,81 @@ impl AppState {
         let value = response.json::<Value>().await.ok()?;
         let models = copilot_catalog(&value);
         (!models.is_empty()).then_some(models)
+    }
+
+    /// Codex's native list carries newly released models and their current
+    /// context/reasoning metadata, independently of the bundled fallback.
+    async fn codex_models(&self, stored: &AccountCredential) -> Option<Vec<Model>> {
+        let account = self.oauth.credential(&stored.id).await.ok()?;
+        let base = account
+            .base_url
+            .as_deref()
+            .unwrap_or("https://chatgpt.com/backend-api/codex");
+        let mut request = self
+            .client
+            .get(crate::relay::endpoint(base, "/models"))
+            .query(&[("client_version", crate::relay::CODEX_VERSION)])
+            .bearer_auth(&account.access_token)
+            .header("originator", "codex_cli_rs")
+            .header("user-agent", crate::relay::CODEX_USER_AGENT)
+            .timeout(std::time::Duration::from_secs(15));
+        if let Some(id) = &account.account_id {
+            request = request.header("chatgpt-account-id", id);
+        }
+        let response = request.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let value: Value = response.json().await.ok()?;
+        let rows = value.get("models")?.as_array()?;
+        let mut models = Vec::new();
+        for row in rows {
+            let Some(id) = row
+                .get("slug")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                continue;
+            };
+            if row.get("supported_in_api").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let known = catalog()
+                .iter()
+                .find(|m| m.provider == SubscriptionProvider::Codex && m.id == id);
+            let levels: Vec<&str> = row
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .collect();
+            models.push(Model {
+                id: id.to_owned(),
+                upstream_id: id.to_owned(),
+                provider: SubscriptionProvider::Codex,
+                name: row
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                context_length: row
+                    .get("context_window")
+                    .and_then(Value::as_u64)
+                    .or_else(|| known.and_then(|m| m.context_length)),
+                max_output_tokens: row
+                    .get("max_output_tokens")
+                    .and_then(Value::as_u64)
+                    .or_else(|| known.and_then(|m| m.max_output_tokens)),
+                thinking: if levels.is_empty() {
+                    known.and_then(|m| m.thinking.clone())
+                } else {
+                    Some(json!({"levels":levels}))
+                },
+                ..Model::default()
+            });
+        }
+        Some(models)
     }
 
     /// What an account's own live listing named, for routing its requests.

@@ -66,9 +66,8 @@
     "context_length": 1000000,
     "max_output_tokens": 128000,
     "thinking": {
-      "min": 1024,
-      "max": 128000,
       "zero_allowed": true,
+      "dynamic_allowed": true,
       "levels": [
         "low",
         "medium",
@@ -85,9 +84,8 @@
     "context_length": 1000000,
     "max_output_tokens": 128000,
     "thinking": {
-      "min": 1024,
-      "max": 128000,
       "zero_allowed": true,
+      "dynamic_allowed": true,
       "levels": [
         "low",
         "medium",
@@ -140,9 +138,8 @@
     "context_length": 1000000,
     "max_output_tokens": 128000,
     "thinking": {
-      "min": 1024,
-      "max": 128000,
-      "zero_allowed": true,
+      "zero_allowed": false,
+      "dynamic_allowed": true,
       "levels": [
         "low",
         "medium",
@@ -159,9 +156,8 @@
     "context_length": 1000000,
     "max_output_tokens": 128000,
     "thinking": {
-      "min": 1024,
-      "max": 128000,
-      "zero_allowed": true,
+      "zero_allowed": false,
+      "dynamic_allowed": true,
       "levels": [
         "low",
         "medium",
@@ -178,7 +174,7 @@
     "context_length": 1000000,
     "max_output_tokens": 128000,
     "thinking": {
-      "zero_allowed": true,
+      "zero_allowed": false,
       "dynamic_allowed": true,
       "levels": [
         "low",
@@ -198,6 +194,7 @@
     "thinking": {
       "zero_allowed": true,
       "dynamic_allowed": true,
+      "disable_type": "between_tools",
       "levels": [
         "low",
         "medium",
@@ -286,21 +283,22 @@
     "name": "Claude 3.5 Haiku",
     "provider": "claude",
     "context_length": 128000,
-    "max_output_tokens": 8192,
-    "thinking": null
+    "max_output_tokens": 8192
   },
   {
     "id": "gpt-5.5",
     "name": "GPT 5.5",
     "provider": "codex",
-    "context_length": 272000,
+    "context_length": 500000,
     "max_output_tokens": 128000,
     "thinking": {
       "levels": [
         "low",
         "medium",
         "high",
-        "xhigh"
+        "xhigh",
+        "max",
+        "ultra"
       ]
     }
   },
@@ -316,7 +314,8 @@
         "medium",
         "high",
         "xhigh",
-        "max"
+        "max",
+        "ultra"
       ]
     }
   },
@@ -332,7 +331,8 @@
         "medium",
         "high",
         "xhigh",
-        "max"
+        "max",
+        "ultra"
       ]
     }
   },
@@ -340,7 +340,7 @@
     "id": "gpt-6.1-sol",
     "name": "GPT 6.1 Sol",
     "provider": "codex",
-    "context_length": 272000,
+    "context_length": 500000,
     "max_output_tokens": 128000,
     "thinking": {
       "levels": [
@@ -348,7 +348,8 @@
         "medium",
         "high",
         "xhigh",
-        "max"
+        "max",
+        "ultra"
       ]
     }
   },
@@ -372,7 +373,7 @@
     "id": "gpt-5.6-sol",
     "name": "GPT 5.6 Sol",
     "provider": "codex",
-    "context_length": 372000,
+    "context_length": 272000,
     "max_output_tokens": 128000,
     "thinking": {
       "levels": [
@@ -380,7 +381,8 @@
         "medium",
         "high",
         "xhigh",
-        "max"
+        "max",
+        "ultra"
       ]
     }
   },
@@ -388,7 +390,7 @@
     "id": "gpt-5.6-terra",
     "name": "GPT 5.6 Terra",
     "provider": "codex",
-    "context_length": 372000,
+    "context_length": 272000,
     "max_output_tokens": 128000,
     "thinking": {
       "levels": [
@@ -396,7 +398,8 @@
         "medium",
         "high",
         "xhigh",
-        "max"
+        "max",
+        "ultra"
       ]
     }
   },
@@ -404,7 +407,7 @@
     "id": "gpt-5.6-luna",
     "name": "GPT 5.6 Luna",
     "provider": "codex",
-    "context_length": 372000,
+    "context_length": 272000,
     "max_output_tokens": 128000,
     "thinking": {
       "levels": [
@@ -427,7 +430,8 @@
         "low",
         "medium",
         "high",
-        "xhigh"
+        "xhigh",
+        "max"
       ]
     }
   },
@@ -435,8 +439,8 @@
     "id": "gemini-2.5-pro",
     "name": "Gemini 2.5 Pro",
     "provider": "gemini",
-    "context_length": null,
-    "max_output_tokens": null,
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
     "thinking": {
       "min": 128,
       "max": 32768,
@@ -447,8 +451,8 @@
     "id": "gemini-2.5-flash",
     "name": "Gemini 2.5 Flash",
     "provider": "gemini",
-    "context_length": null,
-    "max_output_tokens": null,
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
     "thinking": {
       "max": 24576,
       "zero_allowed": true,
@@ -459,8 +463,8 @@
     "id": "gemini-2.5-flash-lite",
     "name": "Gemini 2.5 Flash Lite",
     "provider": "gemini",
-    "context_length": null,
-    "max_output_tokens": null,
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
     "thinking": {
       "max": 24576,
       "zero_allowed": true,
@@ -471,8 +475,8 @@
     "id": "gemini-3-pro-preview",
     "name": "Gemini 3 Pro Preview",
     "provider": "gemini",
-    "context_length": null,
-    "max_output_tokens": null,
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
     "thinking": {
       "min": 128,
       "max": 32768,
@@ -487,8 +491,8 @@
     "id": "gemini-3.1-pro-preview",
     "name": "Gemini 3.1 Pro Preview",
     "provider": "gemini",
-    "context_length": null,
-    "max_output_tokens": null,
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
     "thinking": {
       "min": 128,
       "max": 32768,
@@ -504,8 +508,8 @@
     "id": "gemini-3-flash-preview",
     "name": "Gemini 3 Flash Preview",
     "provider": "gemini",
-    "context_length": null,
-    "max_output_tokens": null,
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
     "thinking": {
       "min": 128,
       "max": 32768,
@@ -522,8 +526,8 @@
     "id": "gemini-3.1-flash-lite-preview",
     "name": "Gemini 3.1 Flash Lite Preview",
     "provider": "gemini",
-    "context_length": null,
-    "max_output_tokens": null,
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
     "thinking": {
       "min": 128,
       "max": 32768,
@@ -538,14 +542,19 @@
   },
   {
     "id": "gemini-3.8-flash-high",
-    "name": "Gemini 3.8 Flash (High)",
+    "name": "Gemini 3.8 Flash",
     "provider": "antigravity",
     "context_length": 1048576,
     "max_output_tokens": 65536,
     "thinking": {
-      "min": 32,
+      "min": 1,
       "max": 65535,
-      "dynamic_allowed": true
+      "dynamic_allowed": true,
+      "levels": [
+        "low",
+        "medium",
+        "high"
+      ]
     }
   },
   {
@@ -576,31 +585,34 @@
     "id": "claude-sonnet-4-6",
     "name": "Claude Sonnet 4.6 (Thinking)",
     "provider": "antigravity",
-    "context_length": 250000,
+    "context_length": 200000,
     "max_output_tokens": 64000,
     "thinking": {
       "min": 1024,
-      "max": 63999
+      "max": 64000,
+      "zero_allowed": true,
+      "dynamic_allowed": true
     }
   },
   {
     "id": "claude-opus-4-6-thinking",
     "name": "Claude Opus 4.6 (Thinking)",
     "provider": "antigravity",
-    "context_length": 250000,
+    "context_length": 200000,
     "max_output_tokens": 64000,
     "thinking": {
       "min": 1024,
-      "max": 63999
+      "max": 64000,
+      "zero_allowed": true,
+      "dynamic_allowed": true
     }
   },
   {
     "id": "gpt-oss-120b-medium",
     "name": "GPT-OSS 120B (Medium)",
     "provider": "antigravity",
-    "context_length": 131072,
-    "max_output_tokens": 32768,
-    "thinking": null
+    "context_length": 114000,
+    "max_output_tokens": 32768
   },
   {
     "id": "gemini-3-flash-agent",
@@ -645,9 +657,15 @@
     "context_length": 1048576,
     "max_output_tokens": 65535,
     "thinking": {
-      "min": 128,
+      "min": 1,
       "max": 65535,
-      "dynamic_allowed": true
+      "dynamic_allowed": true,
+      "levels": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ]
     }
   },
   {
@@ -656,7 +674,18 @@
     "provider": "antigravity",
     "context_length": 1048576,
     "max_output_tokens": 65535,
-    "thinking": null
+    "thinking": {
+      "min": 1,
+      "max": 65535,
+      "zero_allowed": true,
+      "dynamic_allowed": true,
+      "levels": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ]
+    }
   },
   {
     "id": "gemini-3-flash",
@@ -665,9 +694,15 @@
     "context_length": 1048576,
     "max_output_tokens": 65536,
     "thinking": {
-      "min": 32,
-      "max": 65535,
-      "dynamic_allowed": true
+      "min": 128,
+      "max": 32768,
+      "dynamic_allowed": true,
+      "levels": [
+        "minimal",
+        "low",
+        "medium",
+        "high"
+      ]
     }
   },
   {
@@ -686,17 +721,22 @@
     "id": "gemini-3.1-flash-image",
     "name": "Gemini 3.1 Flash Image",
     "provider": "antigravity",
-    "context_length": null,
-    "max_output_tokens": null,
-    "thinking": null
+    "thinking": {
+      "min": 128,
+      "max": 32768,
+      "dynamic_allowed": true,
+      "levels": [
+        "minimal",
+        "high"
+      ]
+    }
   },
   {
     "id": "kimi-k2",
     "name": "Kimi K2",
     "provider": "kimi",
     "context_length": 131072,
-    "max_output_tokens": 32768,
-    "thinking": null
+    "max_output_tokens": 32768
   },
   {
     "id": "kimi-k2-thinking",
@@ -881,8 +921,7 @@
     "name": "Grok Build 0.1",
     "provider": "xai",
     "context_length": 256000,
-    "max_output_tokens": 256000,
-    "thinking": null
+    "max_output_tokens": 256000
   },
   {
     "id": "grok-4.5",
@@ -920,16 +959,14 @@
     "name": "Grok 4.20 0309 Reasoning",
     "provider": "xai",
     "context_length": 2000000,
-    "max_output_tokens": 65536,
-    "thinking": null
+    "max_output_tokens": 65536
   },
   {
     "id": "grok-4.20-0309-non-reasoning",
     "name": "Grok 4.20 0309 Non Reasoning",
     "provider": "xai",
     "context_length": 2000000,
-    "max_output_tokens": 65536,
-    "thinking": null
+    "max_output_tokens": 65536
   },
   {
     "id": "grok-4.20-multi-agent-0309",
@@ -978,7 +1015,96 @@
     "name": "Composer 2.5 Fast",
     "provider": "xai",
     "context_length": 200000,
-    "max_output_tokens": 32768,
-    "thinking": null
+    "max_output_tokens": 32768
+  },
+  {
+    "id": "gpt-6.1-terra",
+    "name": "GPT 6.1 Terra",
+    "provider": "codex",
+    "context_length": 500000,
+    "max_output_tokens": 128000,
+    "thinking": {
+      "levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra"
+      ]
+    }
+  },
+  {
+    "id": "kimi-k3.1-pro",
+    "name": "Kimi K3.1 Pro",
+    "provider": "kimi",
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
+    "thinking": {
+      "zero_allowed": true,
+      "levels": [
+        "low",
+        "high",
+        "max"
+      ]
+    }
+  },
+  {
+    "id": "kimi-k3.1-pro-highspeed",
+    "name": "Kimi K3.1 Pro Highspeed",
+    "provider": "kimi",
+    "context_length": 1048576,
+    "max_output_tokens": 65536,
+    "thinking": {
+      "zero_allowed": true,
+      "levels": [
+        "low",
+        "high",
+        "max"
+      ]
+    }
+  },
+  {
+    "id": "claude-opus-5-5-high",
+    "name": "Claude Opus 5.5 (High)",
+    "provider": "antigravity",
+    "context_length": 1000000,
+    "max_output_tokens": 128000,
+    "thinking": {
+      "min": 1024,
+      "max": 64000,
+      "zero_allowed": true,
+      "dynamic_allowed": true
+    }
+  },
+  {
+    "id": "claude-sonnet-5-5-high",
+    "name": "Claude Sonnet 5.5 (High)",
+    "provider": "antigravity",
+    "context_length": 1000000,
+    "max_output_tokens": 128000,
+    "thinking": {
+      "min": 1024,
+      "max": 64000,
+      "zero_allowed": true,
+      "dynamic_allowed": true
+    }
+  },
+  {
+    "id": "gemini-4-argon-high",
+    "name": "Gemini 4 Argon",
+    "provider": "antigravity",
+    "context_length": 1048576,
+    "max_output_tokens": 1048576,
+    "thinking": {
+      "min": 1,
+      "max": 65535,
+      "dynamic_allowed": true,
+      "levels": [
+        "low",
+        "medium",
+        "high"
+      ]
+    }
   }
 ]
