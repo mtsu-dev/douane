@@ -30,7 +30,7 @@ test('the provider pace weighs accounts by the time their week has run', () => {
 });
 
 test('weekly windows win; otherwise the longest window with a known length counts', () => {
-  const quotas = [quota('a', [window('five-hour', 0, 1), window('monthly', 50, 15 * day)])];
+  const quotas = [quota('a', [window('five-hour', 0, 1), window('monthly', 50, 15.5 * day)])];
   assert.equal(providerPace([account('a')], quotas).percent, 100);
   const buckets = [quota('a', [window('bucket-1', 20, 2, 'Gemini 5h'), window('bucket-2', 70, 3.5 * day, 'Gemini Weekly')])];
   assert.equal(providerPace([account('a')], buckets).percent, 60);
@@ -49,4 +49,22 @@ test('a window read at its reset instant stays out instead of inflating the pace
   const pace = providerPace([account('a'), account('b')], quotas);
   assert.equal(pace.percent, 100);
   assert.deepEqual([pace.known, pace.total], [1, 2]);
+});
+
+test('a weekly bucket just reset does not hide a busier bucket of the same account', () => {
+  const quotas = [quota('a', [window('weekly', 100, 7 * day), window('opus-weekly', 50, 3.5 * day, 'Opus weekly')])];
+  const pace = providerPace([account('a')], quotas);
+  assert.equal(pace.percent, 100);
+  assert.equal(pace.known, 1);
+});
+
+test('a monthly window spans its real calendar month', () => {
+  // Reset on November 1: the window started October 1 and lasts 31 days. Read at its midpoint, 50% used is on pace.
+  const reset_at = '2026-11-01T00:00:00Z';
+  const updated_at = new Date(Date.parse('2026-10-01T00:00:00Z') + 15.5 * 24 * 3600_000).toISOString();
+  const quotas = [{ account_id: 'a', updated_at, windows: [{ id: 'monthly', label: 'monthly', remaining_percent: 50, reset_at }] }];
+  assert.equal(providerPace([account('a')], quotas).percent, 100);
+  // Read on October 1 at noon, more than 30 days before reset: still counted.
+  const early = [{ account_id: 'a', updated_at: '2026-10-01T12:00:00Z', windows: [{ id: 'monthly', label: 'monthly', remaining_percent: 99, reset_at }] }];
+  assert.equal(providerPace([account('a')], early).known, 1);
 });
