@@ -2,7 +2,7 @@ use super::oauth::send_json;
 use super::store::{subscription_from_value, text};
 use super::{
     AccountCredential, AccountStore, OAuthManager, SubscriptionError, SubscriptionProvider,
-    SubscriptionTier, now, parse_timestamp, timestamp,
+    SubscriptionTier, antigravity_user_agent, now, parse_timestamp, timestamp,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -740,7 +740,7 @@ impl QuotaService {
                     .client
                     .get("https://chatgpt.com/backend-api/wham/usage")
                     .bearer_auth(&account.access_token)
-                    .header("User-Agent", "codex-tui/0.149.1");
+                    .header("User-Agent", crate::relay::CODEX_USER_AGENT);
                 if let Some(id) = &account.account_id {
                     request = request.header("ChatGPT-Account-Id", id);
                 }
@@ -754,7 +754,7 @@ impl QuotaService {
                         .get("https://api.anthropic.com/api/oauth/usage")
                         .bearer_auth(&account.access_token)
                         .header("anthropic-beta", "oauth-2025-04-20")
-                        .header("User-Agent", "claude-cli/2.1.280 (external, cli)"),
+                        .header("User-Agent", crate::relay::CLAUDE_USER_AGENT),
                 )
                 .await?;
                 let windows = parse_claude(&value, observed);
@@ -798,7 +798,7 @@ impl QuotaService {
                             "missing Google project ID",
                         ))?;
                 let value = send_json(self.client.post("https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary")
-                    .bearer_auth(&account.access_token).header("User-Agent", "antigravity/hub/2.9.1")
+                    .bearer_auth(&account.access_token).header("User-Agent", antigravity_user_agent())
                     .json(&json!({"project":project}))).await?;
                 let windows = parse_antigravity(&value, observed);
                 (value, windows)
@@ -815,7 +815,7 @@ impl QuotaService {
                     self.client
                         .post("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")
                         .bearer_auth(&account.access_token)
-                        .header("User-Agent", "GeminiCLI/0.34.0 (windows; amd64)")
+                        .header("User-Agent", crate::relay::GEMINI_USER_AGENT)
                         .json(&json!({"project":project})),
                 )
                 .await?;
@@ -881,7 +881,7 @@ impl QuotaService {
                     self.client
                         .get("https://api.anthropic.com/api/oauth/profile")
                         .bearer_auth(&account.access_token)
-                        .header("User-Agent", "claude-cli/2.1.280 (external, cli)")
+                        .header("User-Agent", crate::relay::CLAUDE_USER_AGENT)
                         .header("anthropic-beta", "oauth-2025-04-20")
                         .timeout(std::time::Duration::from_secs(10)),
                 )

@@ -11,6 +11,7 @@ mod quota;
 mod reset;
 mod store;
 
+pub(crate) use google::antigravity_user_agent;
 pub use oauth::{OAuthAttempt, OAuthManager};
 pub use quota::{
     QuotaCredits, QuotaService, QuotaSnapshot, QuotaWindow, RESERVE_WINDOWS, reserve_kind,
