@@ -18,6 +18,7 @@ export const en = {
 	'common.import': 'Import',
 	'common.retry': 'Retry',
 	'common.connectAccount': 'Connect an account',
+	'accounts.connect': 'Connect',
 	'common.chooseOtherProvider': 'Choose another provider',
 	'common.searchAccount': 'Search accounts',
 	'common.noAccountConnected': 'No account connected',

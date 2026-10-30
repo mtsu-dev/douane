@@ -1,5 +1,4 @@
 <script lang="ts">
-	import Upload from '@lucide/svelte/icons/upload';
 	import Plus from '@lucide/svelte/icons/plus';
 	import Trash2 from '@lucide/svelte/icons/trash-2';
 	import Search from '@lucide/svelte/icons/search';
@@ -18,16 +17,23 @@
 	let search = $state('');
 	let provider = $state('all');
 	let confirmation = $state<string | null>(null);
-	let fileInput: HTMLInputElement;
 	let dragging = $state(false);
 	let providerIds = $derived([...new Set(accounts.map(a => a.provider))]);
 	let filtered = $derived(accounts.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.provider} ${a.route ?? ''} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())));
 	let groups = $derived(providerIds.map(id => ({ id, accounts: filtered.filter(a => a.provider === id) })).filter(group => group.accounts.length));
 </script>
 
-<div class="page-heading"><h1>{t('accounts.title')} <span class="count-badge">{accounts.length}</span></h1><div class="heading-actions"><button class="button" disabled={!!busy || !accounts.length} onclick={() => refresh()}><RefreshCw size={17} class={busy === 'quotas' ? 'spinning' : ''}/>{t('quotas.refresh')}</button><button class="button" onclick={() => fileInput.click()} disabled={!!busy}><Upload size={17}/>{t('common.import')}</button><button class="button primary" onclick={connect}><Plus size={19}/>{t('common.connectAccount')}</button></div></div>
-<input hidden type="file" accept=".json,application/json" multiple bind:this={fileInput} onchange={(event) => { if (event.currentTarget.files?.length) importFiles(event.currentTarget.files); event.currentTarget.value = ''; }}/>
-<div class="account-filters"><label class="search-input"><Search size={18}/><input type="search" placeholder={t('common.searchAccount')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.filter')} bind:value={provider}><option value="all">{t('quotas.all')}</option>{#each providerIds as id (id)}<option value={id}>{providerName(id)}</option>{/each}</select><span class="drop-hint">{t('accounts.drop')}</span></div>
+<header class="account-toolbar">
+	<h1>{t('accounts.title')} <span class="count-badge">{accounts.length}</span></h1>
+	<div class="account-filters">
+		<label class="search-input"><Search size={17}/><input type="search" placeholder={t('common.searchAccount')} aria-label={t('common.searchAccount')} bind:value={search}/></label>
+		<select aria-label={t('quotas.filter')} bind:value={provider}><option value="all">{t('quotas.all')}</option>{#each providerIds as id (id)}<option value={id}>{providerName(id)}</option>{/each}</select>
+	</div>
+	<div class="account-actions">
+		<button class="button refresh-button" disabled={!!busy || !accounts.length} onclick={() => refresh()} title={t('quotas.refresh')} aria-label={t('quotas.refresh')}><RefreshCw size={17} class={busy === 'quotas' ? 'spinning' : ''}/></button>
+		<button class="button primary connect-button" onclick={connect} title={t('common.connectAccount')} aria-label={t('common.connectAccount')}><Plus size={17}/><span>{t('accounts.connect')}</span></button>
+	</div>
+</header>
 <div class="account-groups" class:dragging role="region" aria-label={t('accounts.dropLabel')} ondragover={(event) => { event.preventDefault(); dragging = true; }} ondragleave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) dragging = false; }} ondrop={(event) => { event.preventDefault(); dragging = false; if (event.dataTransfer?.files.length && !busy) importFiles(event.dataTransfer.files); }}>
 	{#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('accounts.emptyDescription')} action={t('common.connectAccount')} onclick={connect}/></section>
 	{:else if !filtered.length}<section class="ledger"><EmptyState title={t('common.noMatchingAccount')} description={t('common.tryOtherName')}/></section>
@@ -52,15 +58,24 @@
 </div>
 
 <style>
-	h1 { display: flex; gap: 12px; align-items: center; } h1 .count-badge { font-size: 17px; }
-	.account-filters { display: flex; align-items: center; gap: 12px; margin: 0 0 24px; }.drop-hint { margin-left: auto; font-size: 13px; color: var(--faint); }
+	.account-toolbar { display: flex; align-items: center; gap: 24px; margin-bottom: 28px; }
+	h1 { display: flex; gap: 10px; align-items: center; flex-shrink: 0; margin: 0; } h1 .count-badge { font-size: 15px; }
+	.account-filters { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; margin-left: auto; }
+	.account-filters .search-input { width: auto; min-width: 0; flex: 1; }
+	.account-filters select { width: 150px; background: var(--surface); }
+	.account-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+	.account-toolbar .button, .account-filters select, .account-filters .search-input { height: 40px; min-height: 40px; border-radius: 10px; font-size: 14px; }
+	.account-toolbar .button { gap: 8px; padding: 0 12px; }
+	.account-toolbar .refresh-button { width: 40px; padding: 0; }
+	.account-filters input { font-size: 14px; }
 	.account-groups { display: grid; gap: 24px; border-radius: 12px; min-height: 120px; transition: outline-color .15s; }.account-groups.dragging { outline: 2px dashed var(--blue); outline-offset: 8px; }
 	.group-heading { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }.group-identity { display: flex; gap: 10px; align-items: center; }.group-identity h2 { font-family: var(--font-display); font-size: 21px; }
 	table { table-layout: fixed; }th, td { padding: 12px 16px; }th { font-size: 13px; }th:first-child { width: 37%; }th:nth-child(2) { width: 19%; }th:nth-child(3) { width: 25%; }.actions-heading { text-align: right; }td { vertical-align: top; }
 	.identity-cell { min-width: 0; }.account-meta { display: flex; flex-wrap: wrap; gap: 2px 12px; align-items: center; font-size: 14px; color: var(--muted); }.account-meta :global(.private-email) { margin: 0; }.verified-at { color: var(--faint); font-size: 12px; margin: 4px 0 0; }.disabled-row { opacity: .65; }
 	.reserve-cell :global(.reserve), .reserve-cell :global(.reserve-editor) { margin-top: 0; }.row-actions { display: flex; gap: 9px; align-items: center; justify-content: flex-end; }.row-actions .icon-button { min-width: 30px; width: 30px; min-height: 32px; height: 32px; }.inline-error { overflow-wrap: anywhere; font-size: 13px; color: var(--red); margin: 5px 0 0; }.verify-link { display: flex; gap: 6px; align-items: center; color: var(--blue); font-size: 14px; margin-top: 8px; }
 	.delete-confirmation { font-size: 14px; margin-top: 10px; }.delete-confirmation p { margin: 0 0 8px; }.delete-confirmation .button { margin: 4px 0 0; }
-	@media(max-width:1150px) { .page-heading { flex-direction: column; align-items: flex-start; }.heading-actions { flex-wrap: wrap; }.drop-hint { display: none; }th:first-child { width: 32%; }th:nth-child(3) { width: 27%; }th,td { padding: 12px; } }
+	@media(max-width:1150px) { .account-toolbar { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 16px; }.account-filters { grid-column: 1/-1; grid-row: 2; width: 100%; }.account-actions { grid-column: 2; grid-row: 1; }th:first-child { width: 32%; }th:nth-child(3) { width: 27%; }th,td { padding: 12px; } }
 	@media(max-width:850px) { table,tbody { display: block; }thead { display: none; }tr { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border); }tr:last-child { border: 0; }td { padding: 0; border: 0; }.identity-cell,.reserve-cell { grid-column: 1; }.status-cell { grid-column: 2; grid-row: 1; }.actions-cell { grid-column: 2; grid-row: 2; align-self: end; }.account-meta { display: grid; }.group-heading { gap: 10px; } }
-	@media(max-width:500px) { .heading-actions { gap: 8px; width: 100%; }.heading-actions .button { flex: 1; font-size: 14px; padding: 0 10px; }.account-filters { gap: 8px; }.account-filters .search-input { width: auto; min-width: 0; flex: 1; }.account-filters select { max-width: 125px; padding: 0 8px; }.status-cell { grid-column: 1; grid-row: 2; }.reserve-cell { grid-row: 3; grid-column: 1/-1; }.actions-cell { grid-row: 2; }.verified-at { font-size: 12px; } }
+	@media(max-width:500px) { .account-toolbar { gap: 16px 10px; margin-bottom: 24px; }.account-filters select { width: 120px; padding: 0 8px; }.status-cell { grid-column: 1; grid-row: 2; }.reserve-cell { grid-row: 3; grid-column: 1/-1; }.actions-cell { grid-row: 2; }.verified-at { font-size: 12px; } }
+	@media(max-width:360px) { .connect-button span { display: none; }.account-toolbar .connect-button { width: 40px; padding: 0; } }
 </style>

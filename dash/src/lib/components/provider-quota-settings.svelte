@@ -37,8 +37,9 @@
 					{/if}
 
 <style>
-	.display-choice { display: flex; align-items: center; gap: 10px; margin-left: 10px; font-size: 15px; color: var(--muted); }
-	.display-choice select { background: var(--surface); font-size: 15px; }
+	.display-choice { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--muted); }
+	.display-choice select { background: var(--surface); font-size: 14px; max-width: 210px; height: 40px; border-radius: 10px; }
+	.windows-toggle { height: 40px; padding: 0 12px; font-size: 14px; }
 	.windows-toggle[aria-expanded='true'] { border-color: var(--primary); color: var(--text); }
 	.window-choices { display: grid; gap: 4px; margin: 0 0 14px; padding: 10px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
 	.window-choice { display: flex; align-items: center; gap: 14px; min-height: 48px; }
@@ -51,9 +52,7 @@
 	.primary-choice.on :global(svg) { color: var(--primary); fill: var(--primary); }
 	.window-default { margin: 6px 0 4px; font-size: 15px; color: var(--muted); }
 
-	.client-quota-settings { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-	.display-choice { margin: 0; }
-	.display-choice select { max-width: 210px; height: 38px; }
+	.client-quota-settings { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 	.window-choices { flex-basis: 100%; margin: 12px 0 0; }
-	@media(max-width:650px) { .client-quota-settings { width: 100%; }.display-choice { flex: 1; min-width: 0; flex-wrap: wrap; gap: 6px; }.display-choice span { font-size: 13px; }.display-choice select { width: 100%; max-width: none; }.window-choice { flex-wrap: wrap; gap: 8px; padding: 8px 0; }.window-name { flex-basis: 100%; }.window-choice .switch { margin-left: auto; } }
+	@media(max-width:650px) { .client-quota-settings { width: 100%; align-items: flex-end; }.display-choice { flex: 1; min-width: 0; flex-wrap: wrap; gap: 6px; }.display-choice span { font-size: 13px; }.display-choice select { width: 100%; max-width: none; }.window-choice { flex-wrap: wrap; gap: 8px; padding: 8px 0; }.window-name { flex-basis: 100%; }.window-choice .switch { margin-left: auto; } }
 </style>

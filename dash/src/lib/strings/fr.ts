@@ -20,6 +20,7 @@ export const fr: Record<StringKey, string> = {
 	'common.import': 'Importer',
 	'common.retry': 'Réessayer',
 	'common.connectAccount': 'Connecter un compte',
+	'accounts.connect': 'Connecter',
 	'common.chooseOtherProvider': 'Choisir un autre fournisseur',
 	'common.searchAccount': 'Rechercher un compte',
 	'common.noAccountConnected': 'Aucun compte connecté',
