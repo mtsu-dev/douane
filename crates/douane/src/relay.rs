@@ -40,8 +40,12 @@ pub fn error(status: StatusCode, message: &str) -> Response {
 pub const COPILOT_API: &str = "https://api.githubcopilot.com";
 /// Copilot identifies the integration by the OAuth app and these headers;
 /// douane signs in through the OpenCode app and presents itself the same way.
-pub const COPILOT_USER_AGENT: &str = "opencode/1.19.2";
+pub const COPILOT_USER_AGENT: &str = "opencode/1.19.5";
 pub const COPILOT_API_VERSION: &str = "2026-06-01";
+pub(crate) const CODEX_VERSION: &str = "0.166.0";
+pub(crate) const CODEX_USER_AGENT: &str = "codex_cli_rs/0.166.0";
+pub(crate) const CLAUDE_USER_AGENT: &str = "claude-cli/2.1.312 (external, cli)";
+pub(crate) const GEMINI_USER_AGENT: &str = "GeminiCLI/0.66.0";
 
 /// The wire format a custom endpoint was configured with.
 fn configured_dialect(value: &str) -> Option<Dialect> {
@@ -286,9 +290,7 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
                     out.insert("anthropic-beta", value);
                 }
                 out.entry("user-agent")
-                    .or_insert(header::HeaderValue::from_static(
-                        "claude-cli/2.1.280 (external, cli)",
-                    ));
+                    .or_insert(header::HeaderValue::from_static(CLAUDE_USER_AGENT));
                 out.entry("x-app")
                     .or_insert(header::HeaderValue::from_static("cli"));
             }
@@ -302,7 +304,7 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
             out.entry("originator")
                 .or_insert(header::HeaderValue::from_static("codex_cli_rs"));
             out.entry("user-agent")
-                .or_insert(header::HeaderValue::from_static("codex_cli_rs/0.155.0"));
+                .or_insert(header::HeaderValue::from_static(CODEX_USER_AGENT));
         }
         SubscriptionProvider::Xai => {
             out.insert(
@@ -367,6 +369,12 @@ pub(crate) fn upstream_headers(account: &AccountCredential, incoming: &HeaderMap
             out.insert(
                 "openai-intent",
                 header::HeaderValue::from_static("conversation-edits"),
+            );
+        }
+        SubscriptionProvider::Gemini => {
+            out.insert(
+                header::USER_AGENT,
+                header::HeaderValue::from_static(GEMINI_USER_AGENT),
             );
         }
         SubscriptionProvider::Antigravity => {

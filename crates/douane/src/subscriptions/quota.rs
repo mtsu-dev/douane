@@ -687,7 +687,7 @@ impl QuotaService {
                     .client
                     .get("https://chatgpt.com/backend-api/wham/usage")
                     .bearer_auth(&account.access_token)
-                    .header("User-Agent", "codex-tui/0.149.1");
+                    .header("User-Agent", crate::relay::CODEX_USER_AGENT);
                 if let Some(id) = &account.account_id {
                     request = request.header("ChatGPT-Account-Id", id);
                 }
@@ -701,7 +701,7 @@ impl QuotaService {
                         .get("https://api.anthropic.com/api/oauth/usage")
                         .bearer_auth(&account.access_token)
                         .header("anthropic-beta", "oauth-2025-04-20")
-                        .header("User-Agent", "claude-cli/2.1.280 (external, cli)"),
+                        .header("User-Agent", crate::relay::CLAUDE_USER_AGENT),
                 )
                 .await?;
                 let windows = parse_claude(&value, observed);
@@ -762,7 +762,7 @@ impl QuotaService {
                     self.client
                         .post("https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota")
                         .bearer_auth(&account.access_token)
-                        .header("User-Agent", "GeminiCLI/0.34.0 (windows; amd64)")
+                        .header("User-Agent", crate::relay::GEMINI_USER_AGENT)
                         .json(&json!({"project":project})),
                 )
                 .await?;
@@ -828,7 +828,7 @@ impl QuotaService {
                     self.client
                         .get("https://api.anthropic.com/api/oauth/profile")
                         .bearer_auth(&account.access_token)
-                        .header("User-Agent", "claude-cli/2.1.280 (external, cli)")
+                        .header("User-Agent", crate::relay::CLAUDE_USER_AGENT)
                         .header("anthropic-beta", "oauth-2025-04-20")
                         .timeout(std::time::Duration::from_secs(10)),
                 )
