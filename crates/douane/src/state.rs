@@ -599,9 +599,8 @@ impl AppState {
             else {
                 continue;
             };
-            if row.get("supported_in_api").and_then(Value::as_bool) == Some(false) {
-                continue;
-            }
+            // `supported_in_api` describes API-key access. This native listing
+            // belongs to a ChatGPT subscription and may include models without it.
             let known = catalog()
                 .iter()
                 .find(|m| m.provider == SubscriptionProvider::Codex && m.id == id);

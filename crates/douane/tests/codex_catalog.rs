@@ -102,7 +102,7 @@ impl Fixture {
 fn listing(id: &str, context: u64) -> Value {
     json!({"models":[{"slug":id,"display_name":"Native model", "context_window":context,
         "supported_in_api":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]},
-        {"slug":"unsupported-chat","supported_in_api":false}, {}]})
+        {}]})
 }
 
 #[tokio::test]
@@ -116,7 +116,6 @@ async fn native_codex_models_are_discovered_with_current_metadata_and_account_el
     let ids = f.ids().await;
     assert!(ids.contains(&"codex/gpt-6.1-terra".into()), "{ids:?}");
     assert!(ids.contains(&"codex/gpt-future".into()), "{ids:?}");
-    assert!(!ids.contains(&"codex/unsupported-chat".into()));
     assert!(!ids.contains(&"codex/gpt-6-astra".into()));
     let models = f.state.models.read().await;
     let future = models.iter().find(|m| m.id == "codex/gpt-future").unwrap();
@@ -147,6 +146,30 @@ async fn native_codex_models_are_discovered_with_current_metadata_and_account_el
     let ids = f.ids().await;
     assert!(ids.contains(&"codex/gpt-next-release".into()));
     assert!(!ids.contains(&"codex/gpt-future".into()));
+}
+
+#[tokio::test]
+async fn subscription_models_remain_available_when_public_api_support_is_false() {
+    let f = Fixture::new(vec![json!({"models":[{
+        "slug":"gpt-subscription-only", "supported_in_api":false
+    }]})])
+    .await;
+    f.state.refresh_models().await;
+    assert!(
+        f.ids()
+            .await
+            .contains(&"codex/gpt-subscription-only".into())
+    );
+    let (_, accounts) = f
+        .state
+        .candidates("gpt-subscription-only", Some("codex"), None)
+        .await
+        .unwrap();
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&accounts[0]).unwrap()["id"],
+        f.accounts[0]
+    );
 }
 
 #[tokio::test]
