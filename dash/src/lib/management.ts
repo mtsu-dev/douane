@@ -20,7 +20,6 @@ export type QuotaWindow = { id: string; label: string; remaining_percent: number
 export type Subscription = { id: string; label: string; multiplier?: number | null; source: string };
 export type CreditUsage = { id: string; label: string; used?: number | null; limit?: number | null; remaining?: number | null; unit: string; reset_at?: string | null; unlimited?: boolean | null; enabled?: boolean | null };
 export type Quota = { account_id: string; windows: QuotaWindow[]; subscription?: Subscription | null; credits?: CreditUsage[]; updated_at?: string | null; error?: string | null; verification_required?: boolean; verification_available?: boolean };
-export type WindowForecast = { account_id: string; window_id: string; observed_seconds: number; rate_per_hour: number; remaining_at_reset: number; exhausts_at: string | null };
 export type ResetAvailability = { account_id: string; provider: string; status: 'ready' | 'unsupported' | 'unavailable' | 'ineligible' | 'disabled'; available_count: number | null; next_expires_at: string | null; pending_request_id?: string | null; error: string | null };
 export type ResetResult = { request_id: string; outcome: 'reset' | 'nothing_to_reset' | 'no_credit' | 'already_redeemed' };
 export type Model = { id: string; provider: string; name?: string; context_length?: number | null; enabled?: boolean; route?: string | null };
@@ -78,7 +77,7 @@ export const management = {
 	status: () => request<Status>('/summary'),
 	providers: () => request<{ providers: Provider[] }>('/providers'),
 	accounts: () => request<{ accounts: Account[] }>('/accounts'),
-	quotas: () => request<{ quotas: Quota[]; forecasts?: WindowForecast[] }>('/quotas'),
+	quotas: () => request<{ quotas: Quota[] }>('/quotas'),
 	models: () => request<ModelsReport>('/models'),
 	refreshModels: (pool?: string) => request<ModelsReport>(`/models/refresh${pool ? `?pool=${encodeURIComponent(pool)}` : ''}`, { method: 'POST' }),
 	setModelsEnabled: (ids: string[], enabled: boolean) => request('/models', { method: 'PATCH', body: JSON.stringify({ ids, enabled }) }),

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import QuotaForecast from './quota-forecast.svelte';
+	import QuotaPace from './quota-pace.svelte';
 	import Search from '@lucide/svelte/icons/search';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import ProviderMark from './provider-mark.svelte';
@@ -9,7 +9,7 @@
 	import EmptyState from './empty-state.svelte';
 	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type Provider } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
-	let { accounts, quotas, forecasts = [], providers = [], busy, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; forecasts?: import('$lib/management').WindowForecast[]; providers?: Provider[]; busy: string; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
+	let { accounts, quotas, providers = [], busy, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
 	let provider = $state('all');
 	let search = $state('');
 	let sort = $state('name');
@@ -19,19 +19,21 @@
 	let providerIds = $derived([...new Set(accounts.map(a => a.provider).filter(id => !unreported.has(id)))].sort((a, b) => (order.indexOf(a) < 0 ? 99 : order.indexOf(a)) - (order.indexOf(b) < 0 ? 99 : order.indexOf(b)) || providerName(a).localeCompare(providerName(b))));
 	let filtered = $derived(accounts.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())).sort((a,b) => sort === 'remaining' ? (remaining(a.id) ?? 101) - (remaining(b.id) ?? 101) : a.name.localeCompare(b.name)));
 	let groups = $derived(providerIds.map(id => ({ id, accounts: filtered.filter(a => a.provider === id) })).filter(group => group.accounts.length));
+	// A disabled or empty paid balance (Claude extra usage off) is noise on a display-only page.
+	const shownCredits = (quota?: Quota) => quota?.credits?.filter(c => c.enabled !== false && (c.unlimited || c.remaining != null || !!c.used)) ?? [];
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
 
-<div class="page-heading"><h1>{t('nav.quotas')}</h1></div>
-
-{#if providerIds.length > 1}
-	<div class="provider-tabs" aria-label={t('quotas.filter')}>
-		<button class:active={provider === 'all'} onclick={() => provider = 'all'} aria-pressed={provider === 'all'}>{t('quotas.all')} <span class="count-badge">{accounts.filter(a => providerIds.includes(a.provider)).length}</span></button>
-		{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={22}/>{providerName(id)}<span class="count-badge">{accounts.filter(a => a.provider === id).length}</span></button>{/each}
-	</div>
-{/if}
-
-<div class="section-toolbar quota-toolbar"><label class="search-input"><Search size={18}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
+<header class="quota-toolbar">
+	<h1>{t('nav.quotas')}</h1>
+	{#if providerIds.length > 1}
+		<div class="provider-tabs" aria-label={t('quotas.filter')}>
+			<button class:active={provider === 'all'} onclick={() => provider = 'all'} aria-pressed={provider === 'all'}>{t('quotas.all')} <span class="count-badge">{accounts.filter(a => providerIds.includes(a.provider)).length}</span></button>
+			{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={20}/>{providerName(id)}<span class="count-badge">{accounts.filter(a => a.provider === id).length}</span></button>{/each}
+		</div>
+	{/if}
+	<div class="quota-filters"><label class="search-input"><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
+</header>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
 {:else if !filtered.length}<section class="ledger"><EmptyState title={t('common.noMatchingAccount')} description={t('common.tryOtherName')}/></section>
@@ -40,17 +42,18 @@
 		{#each groups as group (group.id)}
 			<section class="provider-group" aria-label={t('quotas.group', { provider: providerName(group.id) })}>
 				<header class="provider-heading"><ProviderMark provider={group.id} size={25}/><h2>{providerName(group.id)}</h2><span>{t(group.accounts.length === 1 ? 'common.accountCount.one' : 'common.accountCount.other', { count: group.accounts.length })}</span></header>
-				{#if settings?.show_provider_pace && accounts.some(a => a.provider === group.id && a.enabled)}<QuotaForecast accounts={accounts.filter(a => a.provider === group.id)} {quotas} {forecasts} provider={group.id}/>{/if}
+				{#if settings?.show_provider_pace && accounts.some(a => a.provider === group.id && a.enabled)}<QuotaPace accounts={accounts.filter(a => a.provider === group.id)} {quotas} provider={group.id}/>{/if}
 				<div class="ledger">
 					{#each group.accounts as account (account.id)}
 						{@const quota = quotas.find(q => q.account_id === account.id)}
 						{@const subscription = quota?.subscription ?? account.subscription}
+						{@const credits = shownCredits(quota)}
 						<article class="quota-row" class:disabled-row={!account.enabled}>
 							<div class="account-identity"><h3 class="account-title">{privateLabel(account.name)}</h3>{#if subscription?.label || account.plan}<p class="account-plan">{subscription?.label ?? account.plan}</p>{/if}{#if account.email}<PrivateEmail email={account.email}/>{/if}<AccountResets {account} {busy} updated={resetUpdated}/></div>
 							<div class="quota-details">
 								{#if quota?.verification_required}<p class="verification-needed">{t('quotas.googleVerify')} <a href="#accounts">{t('nav.accounts')}</a></p>{/if}
 								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)}/><p class="reset-date" title={window.reset_at ? t('quotas.resetAt', { date: formatDate(window.reset_at) }) : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : t('quotas.notReported')}</p>{/if}</div>
-								{#if quota?.credits?.length}<div class="credit-windows">{#each quota.credits as credit (credit.id)}<div class="credit-window"><div><span>{usageLabel(credit.label)}</span><strong>{credit.enabled === false ? t('common.disabled') : credit.unlimited ? t('quotas.unlimited') : creditValue(credit.remaining, credit.unit)}{#if credit.enabled !== false && credit.remaining != null}<span class="muted">{` ${t('quotas.remaining')}`}</span>{/if}</strong></div>{#if credit.used != null}<p>{credit.limit != null ? t('quotas.usedOf', { used: creditValue(credit.used, credit.unit), limit: creditValue(credit.limit, credit.unit) }) : t('quotas.used', { used: creditValue(credit.used, credit.unit) })}</p>{/if}{#if credit.reset_at}<p class="reset-date"><RefreshCw size={16}/>{resetLabel(credit.reset_at)}</p>{/if}</div>{/each}</div>{/if}
+								{#if credits.length}<div class="credit-windows">{#each credits as credit (credit.id)}<div class="credit-window"><div><span>{usageLabel(credit.label)}</span><strong>{credit.enabled === false ? t('common.disabled') : credit.unlimited ? t('quotas.unlimited') : creditValue(credit.remaining, credit.unit)}{#if credit.enabled !== false && credit.remaining != null}<span class="muted">{` ${t('quotas.remaining')}`}</span>{/if}</strong></div>{#if credit.used != null}<p>{credit.limit != null ? t('quotas.usedOf', { used: creditValue(credit.used, credit.unit), limit: creditValue(credit.limit, credit.unit) }) : t('quotas.used', { used: creditValue(credit.used, credit.unit) })}</p>{/if}{#if credit.reset_at}<p class="reset-date"><RefreshCw size={16}/>{resetLabel(credit.reset_at)}</p>{/if}</div>{/each}</div>{/if}
 							</div>
 							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? t('common.disabled') : quota?.error ? t('status.check') : account.reserve_reached && ['ready', 'active'].includes(account.status) ? t('status.reserveReached') : accountStatus(account)}</span></div>
 						</article>
@@ -62,8 +65,15 @@
 {/if}
 
 <style>
-	.quota-toolbar { justify-content: flex-end; margin: 20px 0 26px; }
-	.quota-toolbar>select { background: var(--surface); font-size: 15px; }
+	.quota-toolbar { display: flex; align-items: center; gap: 20px; margin-bottom: 24px; }
+	.quota-toolbar h1 { flex-shrink: 0; margin: 0; }
+	.quota-toolbar .provider-tabs { flex: 0 1 auto; min-width: 0; padding: 0; border: 0; }
+	.quota-toolbar .provider-tabs>button { padding: 0 10px; height: 40px; font-size: 14px; }
+	.quota-filters { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: auto; }
+	.quota-filters .search-input { width: 220px; }
+	.quota-filters select { width: 140px; background: var(--surface); }
+	.quota-filters select, .quota-filters .search-input { height: 40px; min-height: 40px; border-radius: 10px; font-size: 14px; }
+	.quota-filters input { font-size: 14px; }
 	.provider-groups { display: grid; gap: 30px; }
 	.provider-heading { display: flex; align-items: center; gap: 12px; margin: 0 0 14px; }
 	.provider-heading h2 { font-family: var(--font-display); font-size: 23px; font-weight: 600; }
@@ -85,7 +95,8 @@
 	.credit-window strong { font-weight: 600; }
 	.credit-window strong>span { font-weight: 400; }
 	.credit-window>p { margin: 8px 0 0; color: var(--muted); font-size: 15px; }
+	@media(max-width:1150px) { .quota-toolbar { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 14px 16px; }.quota-filters { justify-content: flex-end; min-width: 0; }.quota-filters .search-input { width: auto; flex: 1; min-width: 0; }.quota-toolbar .provider-tabs { grid-column: 1/-1; grid-row: 2; } }
 	@media(max-width:1250px) { .quota-row { grid-template-columns: minmax(190px,.7fr) minmax(260px,1.3fr); gap: 22px; }.account-state { grid-column: 1/-1; margin-top: -8px; } }
 	.account-title { font-size: 17px; font-weight: 600; line-height: 1.45; overflow-wrap: anywhere; }
-	@media(max-width:650px) { .quota-toolbar { flex-wrap: nowrap; margin: 16px 0 24px; gap: 10px; }.quota-toolbar>select { max-width: 140px; padding: 0 8px; }.quota-toolbar>.search-input { min-width: 0; width: auto; }.provider-groups { gap: 24px; }.provider-heading h2 { font-size: 22px; }.quota-row { grid-template-columns: 1fr; gap: 18px; padding: 18px; }.quota-windows { grid-template-columns: 1fr; gap: 20px; }.account-state { grid-column: auto; justify-content: flex-start; margin-top: 0; }.credit-window>div { flex-wrap: wrap; } }
+	@media(max-width:650px) { .quota-filters { gap: 6px; }.quota-filters select { width: 120px; padding: 0 8px; }.provider-groups { gap: 24px; }.provider-heading h2 { font-size: 22px; }.quota-row { grid-template-columns: 1fr; gap: 18px; padding: 18px; }.quota-windows { grid-template-columns: 1fr; gap: 20px; }.account-state { grid-column: auto; justify-content: flex-start; margin-top: 0; }.credit-window>div { flex-wrap: wrap; } }
 </style>

@@ -15,12 +15,11 @@ before(async () => {
 after(async () => { await server?.close(); });
 
 function page(options = {}) {
-  const { enabled = true, known = true, current = 50 } = options;
+  const { enabled = true, known = true, current = 50, credits = [] } = options;
   const pace = 'pace' in options ? options.pace : true;
   return render(View, { props: {
     accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'ready', enabled }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled }],
-    quotas: ['a', 'b'].map(account_id => ({ account_id, updated_at: '2026-10-30T12:00:00Z', windows: [{ id: 'weekly', label: 'Weekly', remaining_percent: current, reset_at: '2026-10-31T12:00:00Z' }] })),
-    forecasts: known ? ['a', 'b'].map(account_id => ({ account_id, window_id: 'weekly', rate_per_hour: 3, observed_seconds: 3600, remaining_at_reset: 0, exhausts_at: '2026-10-31T04:40:00Z' })) : [],
+    quotas: ['a', 'b'].map(account_id => ({ account_id, updated_at: '2026-10-30T12:00:00Z', credits, windows: [{ id: 'weekly', label: 'Weekly', remaining_percent: current, reset_at: known ? '2026-10-31T12:00:00Z' : null }] })),
     busy: '', settings: { show_provider_pace: pace }, resetUpdated() {}, manageAccounts() {}
   } }).body;
 }
@@ -45,19 +44,36 @@ test('reset requires an explicit typed confirmation before its submit button is 
   assert.match(body, /<button[^>]+disabled[^>]*>Use 1 reset<\/button>/);
 });
 
-test('one pace line per provider compares consumption with average without repeated window projections', () => {
+test('one pace line per provider is computed from the current weekly reading, with no history', () => {
+  // 50% used with 1 day of 7 left: 50 / (6/7 * 100) = 58% of the sustainable pace.
   const body = page();
   const lines = tags(body, 'meter').filter(tag => tag.includes('pace'));
   assert.equal(lines.length, 2);
-  assert.ok(lines.every(tag => tag.includes('aria-valuenow="144"')));
-  assert.equal((body.match(/\+44% vs average/g) ?? []).length, 2);
+  assert.ok(lines.every(tag => tag.includes('aria-valuenow="58"')));
+  assert.equal((body.match(/Under-used/g) ?? []).length, 2);
   assert.equal(tags(body, 'meter').length, 4);
-  assert.doesNotMatch(body, /Overall pace|At reset \(estimate\)|Run out early:/);
+  assert.doesNotMatch(body, /Not enough data|Overall pace|At reset \(estimate\)/);
+  assert.equal(tags(page({ current: 0 }), 'meter').filter(tag => tag.includes('aria-valuenow="117"')).length, 2);
+});
+
+test('the header holds title, provider tabs, search and sort in one toolbar', () => {
+  const header = page().match(/<header class="quota-toolbar[\s\S]*?<\/header>/)?.[0] ?? '';
+  assert.match(header, /<h1[^>]*>Quotas<\/h1>/);
+  assert.match(header, /provider-tabs/);
+  assert.match(header, /type="search"/);
+  assert.match(header, /<select/);
+});
+
+test('extra usage is hidden when it is off or reports nothing', () => {
+  const credit = extra => ({ id: 'extra', label: 'Extra usage', unit: 'USD', ...extra });
+  assert.doesNotMatch(page({ credits: [credit({ enabled: false })] }), /Extra usage/);
+  assert.doesNotMatch(page({ credits: [credit({ enabled: true })] }), /Extra usage/);
+  assert.match(page({ credits: [credit({ enabled: true, remaining: 12 })] }), /Extra usage/);
 });
 
 test('unknown estimates are visibly partial; disabled accounts retain only their actual quota', () => {
   const body = page({ known: false });
-  assert.match(body, /0\/1 accounts measured/);
+  assert.match(body, /No reset date yet/);
   assert.ok(tags(body, 'meter').filter(tag => tag.includes('pace')).every(tag => !tag.includes('aria-valuenow')));
   assert.equal(tags(page({ enabled: false }), 'meter').length, 2);
   assert.ok(tags(page({ current: null }), 'meter').every(tag => !tag.includes('aria-valuenow')));

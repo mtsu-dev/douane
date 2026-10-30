@@ -1,5 +1,6 @@
 <script lang="ts">
 	import Plus from '@lucide/svelte/icons/plus';
+	import Upload from '@lucide/svelte/icons/upload';
 	import Trash2 from '@lucide/svelte/icons/trash-2';
 	import Search from '@lucide/svelte/icons/search';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
@@ -18,6 +19,7 @@
 	let provider = $state('all');
 	let confirmation = $state<string | null>(null);
 	let dragging = $state(false);
+	let fileInput: HTMLInputElement;
 	let providerIds = $derived([...new Set(accounts.map(a => a.provider))]);
 	let filtered = $derived(accounts.filter(a => (provider === 'all' || !providerIds.includes(provider) || a.provider === provider) && `${a.name} ${a.provider} ${a.route ?? ''} ${a.email ?? ''}`.toLowerCase().includes(search.toLowerCase())));
 	let groups = $derived(providerIds.map(id => ({ id, accounts: filtered.filter(a => a.provider === id) })).filter(group => group.accounts.length));
@@ -31,9 +33,11 @@
 	</div>
 	<div class="account-actions">
 		<button class="button refresh-button" disabled={!!busy || !accounts.length} onclick={() => refresh()} title={t('quotas.refresh')} aria-label={t('quotas.refresh')}><RefreshCw size={17} class={busy === 'quotas' ? 'spinning' : ''}/></button>
+		<button class="button import-button" disabled={!!busy} onclick={() => fileInput.click()} title={t('accounts.importTitle')} aria-label={t('accounts.importTitle')}><Upload size={17}/><span>{t('common.import')}</span></button>
 		<button class="button primary connect-button" onclick={connect} title={t('common.connectAccount')} aria-label={t('common.connectAccount')}><Plus size={17}/><span>{t('accounts.connect')}</span></button>
 	</div>
 </header>
+<input hidden type="file" accept=".json,application/json" multiple bind:this={fileInput} onchange={(event) => { if (event.currentTarget.files?.length) importFiles(event.currentTarget.files); event.currentTarget.value = ''; }}/>
 <div class="account-groups" class:dragging role="region" aria-label={t('accounts.dropLabel')} ondragover={(event) => { event.preventDefault(); dragging = true; }} ondragleave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) dragging = false; }} ondrop={(event) => { event.preventDefault(); dragging = false; if (event.dataTransfer?.files.length && !busy) importFiles(event.dataTransfer.files); }}>
 	{#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('accounts.emptyDescription')} action={t('common.connectAccount')} onclick={connect}/></section>
 	{:else if !filtered.length}<section class="ledger"><EmptyState title={t('common.noMatchingAccount')} description={t('common.tryOtherName')}/></section>
@@ -77,5 +81,6 @@
 	@media(max-width:1150px) { .account-toolbar { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 16px; }.account-filters { grid-column: 1/-1; grid-row: 2; width: 100%; }.account-actions { grid-column: 2; grid-row: 1; }th:first-child { width: 32%; }th:nth-child(3) { width: 27%; }th,td { padding: 12px; } }
 	@media(max-width:850px) { table,tbody { display: block; }thead { display: none; }tr { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border); }tr:last-child { border: 0; }td { padding: 0; border: 0; }.identity-cell,.reserve-cell { grid-column: 1; }.status-cell { grid-column: 2; grid-row: 1; }.actions-cell { grid-column: 2; grid-row: 2; align-self: end; }.account-meta { display: grid; }.group-heading { gap: 10px; } }
 	@media(max-width:500px) { .account-toolbar { gap: 16px 10px; margin-bottom: 24px; }.account-filters select { width: 120px; padding: 0 8px; }.status-cell { grid-column: 1; grid-row: 2; }.reserve-cell { grid-row: 3; grid-column: 1/-1; }.actions-cell { grid-row: 2; }.verified-at { font-size: 12px; } }
+	@media(max-width:500px) { .import-button span { display: none; }.account-toolbar .import-button { width: 40px; padding: 0; } }
 	@media(max-width:360px) { .connect-button span { display: none; }.account-toolbar .connect-button { width: 40px; padding: 0; } }
 </style>

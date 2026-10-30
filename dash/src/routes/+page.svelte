@@ -33,7 +33,6 @@
 	let connectOpen = $state(false);
 	let accounts = $state.raw<Account[]>([]);
 	let quotas = $state.raw<Quota[]>([]);
-	let forecasts = $state.raw<import('$lib/management').WindowForecast[]>([]);
 	let providers = $state.raw<Provider[]>([]);
 	let models = $state.raw<Model[]>([]);
 	let modelListings = $state.raw<Record<string, ModelListing>>({});
@@ -54,7 +53,7 @@
 			const responses = await Promise.allSettled([management.accounts(),management.quotas(),management.providers(),management.models(),management.calls(),management.status(),management.settings(),management.clients()]);
 			const errors: string[] = [];
 			if (responses[0].status === 'fulfilled') accounts = responses[0].value.accounts; else errors.push(responses[0].reason.message);
-			if (responses[1].status === 'fulfilled') { quotas = responses[1].value.quotas; forecasts = responses[1].value.forecasts ?? []; } else { forecasts = []; errors.push(responses[1].reason.message); }
+			if (responses[1].status === 'fulfilled') quotas = responses[1].value.quotas; else errors.push(responses[1].reason.message);
 			if (responses[2].status === 'fulfilled') providers = responses[2].value.providers; else errors.push(responses[2].reason.message);
 			if (responses[3].status === 'fulfilled') { models = responses[3].value.models; modelListings = responses[3].value.listings ?? {}; } else errors.push(responses[3].reason.message);
 			if (responses[4].status === 'fulfilled') calls = responses[4].value.calls; else errors.push(responses[4].reason.message);
@@ -135,7 +134,7 @@
 			{#if failure}<div class="notice error" role="alert"><span>{failure}</span><button class="button small" onclick={() => load()} disabled={loading}>{t('common.retry')}</button></div>{/if}
 			{#if notice}<div class="notice success" role="status">{notice}<button class="icon-button" onclick={() => notice = ''} aria-label={t('page.dismissNotice')}><X size={14}/></button></div>{/if}
 			{#if loading && !summary}<div class="loading-state" role="status"><RefreshCw size={18} class="spinning"/><span>{t('page.loading')}</span></div>{/if}
-			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {forecasts} {providers} {busy} {settings} resetUpdated={() => load(true)} manageAccounts={() => navigate('accounts')}/>
+			{#if screen === 'quotas'}<QuotasView {accounts} {quotas} {providers} {busy} {settings} resetUpdated={() => load(true)} manageAccounts={() => navigate('accounts')}/>
 			{:else if screen === 'accounts'}<AccountsView {accounts} {quotas} {settings} {providers} {refresh} {setQuotaDisplay} {setQuotaWindows} {busy} {rename} {setReserve} {updateEndpoint} connect={() => connectOpen = true} {importFiles} toggle={(account) => mutate('account',() => management.setAccountEnabled(account.id,!account.enabled),t(account.enabled ? 'notice.accountDisabled' : 'notice.accountEnabled'))} remove={(account) => mutate('account',() => management.deleteAccount(account.id),t('notice.accountDeleted'))}/>
 			{:else if screen === 'clients'}<ClientsView report={clients} {accounts} {busy} updated={async (message) => { await load(true); notice = message; }}/>
 			{:else if screen === 'settings'}{#if settings}{#key JSON.stringify(settings)}<SettingsView {settings} {providers} {busy} restore={restoreBackup} save={(next) => mutate('settings',() => management.settingsSave(next),t('notice.settingsSaved'))}/>{/key}{:else}<div class="page-heading"><div><h1>{t('nav.settings')}</h1><p class="page-description">{t('page.settingsUnavailable')}</p></div></div><LanguageSetting/>{/if}
