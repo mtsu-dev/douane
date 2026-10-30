@@ -306,13 +306,20 @@ async fn a_client_limited_to_one_account_lists_only_its_models() {
 
 #[tokio::test]
 async fn a_restore_points_account_access_at_the_ids_accounts_get_there() {
+    let api = serve(Router::new().route(
+        "/models",
+        get(|| async { Json(json!({"models":[{"slug":"gpt-restore-fixture"}]})) }),
+    ))
+    .await;
     let source_dir = tempfile::tempdir().unwrap();
     let source = instance(&source_dir).await;
     let target_dir = tempfile::tempdir().unwrap();
     let target = instance(&target_dir).await;
     // The same Codex account, already known on the target under another id.
-    let codex =
-        || json!({"type":"codex","access_token":"fixture","account_id":"same","name":"Codex"});
+    let codex = || {
+        json!({"type":"codex","access_token":"fixture","account_id":"same","name":"Codex",
+            "base_url":api.url})
+    };
     let source_id = source
         .state
         .accounts
@@ -363,7 +370,7 @@ async fn a_restore_points_account_access_at_the_ids_accounts_get_there() {
     );
     let (status, models) = target.models(Some(&key)).await;
     assert_eq!(status, 200);
-    assert!(models.iter().any(|m| m.starts_with("codex/")), "{models:?}");
+    assert_eq!(models, ["codex/gpt-restore-fixture"]);
 }
 
 #[tokio::test]

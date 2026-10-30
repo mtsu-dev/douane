@@ -1,6 +1,6 @@
 // Serves the built dashboard with sample data, for README captures and UI work
 // without a running douane or any real account: `pnpm build && pnpm mock`.
-// Writes are accepted and ignored, except client keys, kept in memory. Nothing here reaches a provider.
+// Client keys, settings and reset results stay in memory. Nothing here reaches a provider.
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
@@ -48,6 +48,16 @@ const providers = [
 	['xai', 'Grok', true, true], ['copilot', 'GitHub Copilot', true, true], ['antigravity', 'Antigravity', false, true],
 	['kimi', 'Kimi', false, true], ['qwen', 'Qwen', false, false], ['openai_compatible', 'OpenAI-compatible', false, false]
 ].map(([id, name, oauth, quota]) => ({ id, name, oauth, quota, docs_url: 'https://example.com' }));
+// Forecasts are fixtures, never inferred from sample token counts.
+const forecastRates = { 'acc-claude-home': [12, .9, .15], 'acc-claude-work': [10, .5, .2], 'acc-codex': [2, .85], 'acc-grok': [.4], 'acc-go': [0, .2, .02] };
+const forecasts = quotas.flatMap(q => q.windows.flatMap((w, index) => {
+	const rate = forecastRates[q.account_id]?.[index];
+	if (rate == null) return [];
+	const hours = (Date.parse(w.reset_at) - Date.parse(q.updated_at)) / 3600_000;
+	return [{ account_id: q.account_id, window_id: w.id, observed_seconds: 21600, rate_per_hour: rate,
+		remaining_at_reset: Math.max(0, w.remaining_percent - rate * hours),
+		exhausts_at: rate > 0 && w.remaining_percent / rate < hours ? new Date(Date.parse(q.updated_at) + w.remaining_percent / rate * 3600_000).toISOString() : null }];
+}));
 const model = (provider, id, name, context_length) => ({ id: `${provider}/${id}`, provider, name, context_length, enabled: true });
 const models = [
 	model('claude', 'claude-opus-5-5', 'Claude Opus 5.5', 1_000_000), model('claude', 'claude-sonnet-5-5', 'Claude Sonnet 5.5', 1_000_000),
@@ -152,15 +162,25 @@ const summary = {
 };
 const settings = {
 	strategy: 'smart', quota_refresh_seconds: 300, free_before_reset_hours: 6, request_timeout_seconds: 180, default_provider: null,
-	provider_strategies: { claude: 'reset-first' }, quota_display: {}, quota_windows: {}
+	provider_strategies: { claude: 'reset-first' }, quota_display: {}, quota_windows: {}, show_provider_pace: false
 };
+const resetResults = new Map();
 const resets = (id) => {
 	const owner = accounts.find((a) => a.id === id);
 	const ready = owner && ['claude', 'codex'].includes(owner.provider);
-	return { account_id: id, provider: owner?.provider ?? '', status: ready ? 'ready' : 'unsupported', available_count: ready ? (id === 'acc-claude-home' ? 1 : 0) : null, next_expires_at: ready ? at(24 * 9) : null, error: null };
+	return { account_id: id, provider: owner?.provider ?? '', status: ready ? 'ready' : 'unsupported', available_count: ready ? (id === 'acc-claude-home' && ![...resetResults.values()].some(r => r.outcome === 'reset') ? 1 : 0) : null, next_expires_at: ready ? at(24 * 9) : null, error: null };
 };
 
 function api(method, path, body, query = new URLSearchParams()) {
+	if (method === 'PATCH' && path === '/settings') return Object.assign(settings, body);
+	const redeem = path.match(/^\/accounts\/([^/]+)\/resets\/redeem$/);
+	if (method === 'POST' && redeem) {
+		const id = decodeURIComponent(redeem[1]);
+		if (!body?.confirmation || !body.request_id) return [400, { error: { message: 'confirmation and request_id required' } }];
+		const key = `${id}:${body.request_id}`;
+		if (!resetResults.has(key)) resetResults.set(key, { request_id: body.request_id, outcome: resets(id).available_count ? 'reset' : 'no_credit' });
+		return resetResults.get(key);
+	}
 	// A pending device login for the sample dashboard. No provider request or credential is created.
 	if (method === 'POST' && path === '/oauth/start' && body?.provider === 'meta') return {
 		id: 'sample-meta-device', provider: 'meta', url: 'https://auth.meta.com/oidc/device/', user_code: 'MUSE-DEMO',
@@ -179,7 +199,7 @@ function api(method, path, body, query = new URLSearchParams()) {
 		case '/clients': return { clients, usage: usage.filter((row) => row.reset * 1000 > Date.now()) };
 		case '/providers': return { providers };
 		case '/accounts': return { accounts };
-		case '/quotas': return { quotas };
+		case '/quotas': return { quotas, forecasts };
 		case '/models': return { models };
 		case '/calls': return { calls };
 		case '/settings': return settings;

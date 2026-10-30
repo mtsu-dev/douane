@@ -135,6 +135,8 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Check Svelte
         run: pnpm check
+      - name: Test quota forecasts
+        run: pnpm test
       - name: Build dashboard
         run: pnpm build
 

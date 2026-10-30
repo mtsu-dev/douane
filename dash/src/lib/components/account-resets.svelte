@@ -11,6 +11,7 @@
 	let failure = $state('');
 	let result = $state('');
 	let pending = $state(false);
+	let confirmation = $state('');
 	let requestId = '';
 	let dialog = $state<HTMLDialogElement>();
 	let supported = $derived(account.enabled && ['claude', 'codex'].includes(account.provider));
@@ -26,10 +27,10 @@
 	$effect(() => { if (supported) untrack(() => { pending = !!sessionStorage.getItem(storageKey); void check(); }); else availability = null; });
 	function open() {
 		requestId = availability?.pending_request_id ?? sessionStorage.getItem(storageKey) ?? newResetRequestId();
-		failure = ''; result = ''; dialog?.showModal();
+		failure = ''; result = ''; confirmation = ''; dialog?.showModal();
 	}
 	async function redeem() {
-		if (saving || busy) return;
+		if (saving || busy || confirmation !== 'reset' || !dialog?.open) return;
 		saving = true; failure = '';
 		try {
 			sessionStorage.setItem(storageKey, requestId); pending = true;
@@ -64,13 +65,17 @@
 				{#if availability?.next_expires_at}<p>{t('resets.expiresFirst', { date: formatDate(availability.next_expires_at) })}</p>{/if}
 				{#if pending}<p>{t('resets.pending')}</p>{/if}
 				{#if failure}<p class="reset-error" role="alert">{failure}</p>{/if}
-				<div class="dialog-actions"><button class="button" disabled={saving} onclick={() => dialog?.close()}>{t('common.cancel')}</button><button class="button primary" disabled={saving || !!busy} onclick={redeem}>{saving ? t('resets.running') : pending ? t('resets.retrySame') : t('resets.use')}</button></div>
+				<form onsubmit={(event) => { event.preventDefault(); void redeem(); }}>
+					<label class="reset-confirmation">{t('resets.typeConfirmation')}<input bind:value={confirmation} required autocomplete="off" autocapitalize="none" spellcheck={false} disabled={saving}/></label>
+					<div class="dialog-actions"><button type="button" class="button" disabled={saving} onclick={() => dialog?.close()}>{t('common.cancel')}</button><button type="submit" class="button primary" disabled={saving || !!busy || confirmation !== 'reset'}>{saving ? t('resets.running') : pending ? t('resets.retrySame') : t('resets.use')}</button></div>
+				</form>
 			{/if}
 		</div>
 	</dialog>
 {/if}
 
 <style>
+	.reset-confirmation { display: grid; gap: 10px; font-size: 15px; margin-top: 20px; }.reset-confirmation input { width: 100%; }
 	.reset-control { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 15px; }
 	.reset-button { font-size: 15px; padding: 8px 11px; min-height: 42px; }
 	.reset-status { font-size: 15px; color: var(--muted); }

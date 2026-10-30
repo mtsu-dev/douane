@@ -577,7 +577,9 @@ pub async fn delete_account(
     }
 }
 pub async fn quotas(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(json!({"quotas":state.quotas.list().await}))
+    let quotas = state.quotas.list().await;
+    let forecasts = state.quotas.forecasts(&quotas).await;
+    Json(json!({"quotas":quotas,"forecasts":forecasts}))
 }
 pub async fn account_resets(
     State(state): State<Arc<AppState>>,

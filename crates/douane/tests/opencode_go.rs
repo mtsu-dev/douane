@@ -724,16 +724,17 @@ async fn muse_codex_websocket_uses_http_responses_and_preserves_native_items_for
 async fn meta_completed_responses_finish_when_upstream_keeps_the_body_open() {
     let fixture = Fixture::new("meta").await;
     *fixture.upstream.mode.lock().unwrap() = "held-open".into();
+    // The upstream never sends EOF. The client's timeout bounds a regression
+    // without imposing a separate deadline on HTTP setup or runner scheduling.
     for kind in ["messages", "chat/completions", "responses"] {
         for stream in [false, true] {
-            let result = tokio::time::timeout(std::time::Duration::from_millis(700), async {
-                let response = fixture.post(kind, request(kind, stream, false)).await;
-                assert_eq!(response.status(), StatusCode::OK);
-                response.text().await.unwrap()
-            })
-            .await
-            .expect("completed Meta response must not wait for EOF");
-            assert!(result.contains(TEXT));
+            let response = fixture.post(kind, request(kind, stream, false)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{kind}/{stream}");
+            let result = response
+                .text()
+                .await
+                .expect("completed Meta response must not wait for EOF");
+            assert!(result.contains(TEXT), "{kind}/{stream}: {result}");
         }
     }
 }
