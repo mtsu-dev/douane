@@ -35,6 +35,8 @@ export function providerPace(accounts: Account[], quotas: Quota[]) {
     if (!chosen.length) continue;
     // Several buckets of the same length: the busiest one sets the account's pace.
     const busiest = chosen.reduce((a, b) => (b.used * a.elapsed > a.used * b.elapsed ? b : a));
+    // Read at the reset instant: no time has run, so the window says nothing yet.
+    if (busiest.elapsed <= 0) continue;
     used += busiest.used;
     expected += busiest.elapsed;
     known++;

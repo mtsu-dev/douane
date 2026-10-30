@@ -43,3 +43,10 @@ test('a week that has not started or has no reset date stays out instead of bloc
   assert.deepEqual([pace.known, pace.total], [1, 3]);
   assert.equal(providerPace([account('a')], [quota('a', [window('weekly', 100, null)])]).percent, null);
 });
+
+test('a window read at its reset instant stays out instead of inflating the pace', () => {
+  const quotas = [quota('a', [window('weekly', 50, 7 * day)]), quota('b', [window('weekly', 50, 3.5 * day)])];
+  const pace = providerPace([account('a'), account('b')], quotas);
+  assert.equal(pace.percent, 100);
+  assert.deepEqual([pace.known, pace.total], [1, 2]);
+});
