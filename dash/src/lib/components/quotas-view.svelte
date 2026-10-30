@@ -27,12 +27,14 @@
 	// Tab sizes change without the toolbar resizing (Figtree loading late, a provider added, the language switched): observe each tab.
 	let tabsVersion = $state(0);
 	$effect(() => { void providerIds; if (!tabs) return; const observer = new ResizeObserver(() => tabsVersion++); for (const tab of tabs.children) observer.observe(tab); return () => observer.disconnect(); });
-	let tabsWidth = $derived.by(() => { void tabsVersion; const last = tabs?.lastElementChild as HTMLElement | null; return last ? last.offsetLeft + last.offsetWidth - (tabs!.firstElementChild as HTMLElement).offsetLeft : 0; });
+	// The width the tabs need on one line: stacked tabs may wrap, so their offsets no longer give it.
+	let tabsWidth = $derived.by(() => { void tabsVersion; if (!tabs?.children.length) return 0; const items = [...tabs.children] as HTMLElement[]; return items.reduce((sum, tab) => sum + tab.offsetWidth, 0) + (items.length - 1) * (parseFloat(getComputedStyle(tabs).columnGap) || 0); });
+	let searchFocused = $state(false);
 	let stacked = $derived(toolbarWidth > 0 && titleWidth + tabsWidth + filtersWidth + 2 * TOOLBAR_GAP > toolbarWidth);
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
 
-<header class="quota-toolbar" class:stacked bind:clientWidth={toolbarWidth}>
+<header class="quota-toolbar" class:stacked class:searching={searchFocused || !!search} bind:clientWidth={toolbarWidth}>
 	<h1 bind:clientWidth={titleWidth}>{t('nav.quotas')}</h1>
 	{#if providerIds.length > 1}
 		<div class="provider-tabs" aria-label={t('quotas.filter')} bind:this={tabs}>
@@ -40,7 +42,7 @@
 			{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={20}/>{providerName(id)}</button>{/each}
 		</div>
 	{/if}
-	<div class="quota-filters" bind:clientWidth={filtersWidth}><label class="search-input" class:filled={!!search}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
+	<div class="quota-filters" bind:clientWidth={filtersWidth}><label class="search-input" class:filled={!!search} onfocusin={() => searchFocused = true} onfocusout={() => searchFocused = false}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
 </header>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
@@ -80,6 +82,10 @@
 	.quota-toolbar.stacked { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 14px 16px; }
 	.quota-toolbar.stacked .provider-tabs { grid-column: 1/-1; grid-row: 2; }
 	.quota-toolbar.stacked .quota-filters { max-width: 100%; }
+	/* Desktop stacked tabs wrap rather than hide behind a scrollbar a mouse cannot reach; phones keep the swipe strip. */
+	@media(min-width:781px) { .quota-toolbar.stacked .provider-tabs { flex-wrap: wrap; overflow: visible; } }
+	/* A phone gives an open search its own row instead of squeezing it beside the title and sort. */
+	@media(max-width:780px) { .quota-toolbar.stacked.searching .quota-filters { grid-column: 1/-1; grid-row: 2; margin-left: 0; width: 100%; }.quota-toolbar.stacked.searching .search-input { flex-grow: 1; }.quota-toolbar.stacked.searching .provider-tabs { grid-row: 3; } }
 	.quota-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-shrink: 0; min-width: 0; margin-left: auto; }
 	/* Search stays an icon until it is used, so the provider tabs keep the line. */
 	/* A flex basis rather than a width lets an open search shrink inside a narrow (phone) toolbar. */
