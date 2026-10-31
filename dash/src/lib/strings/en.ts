@@ -10,7 +10,7 @@ export const en = {
 	'pace.percent': '{value}% of the sustainable pace',
 	'pace.target': '100%: the quota runs out exactly at reset',
 	'pace.coverage': '{known}/{total} accounts counted',
-	'pace.method': 'Quota used so far divided by the share of its window already elapsed. Each account counts its weekly limit (otherwise its longest limit), weighted by how far that window has run. At 100% the quota runs out exactly at reset; above, it runs out early; below, part of it goes unused. Accounts without a reset date are left out.',
+	'pace.method': 'Quota used so far divided by the share of its window already elapsed. Each account counts only its longest limit (monthly over weekly over 5h), every limit of that length included, weighted by how far it has run. At 100% the quota runs out exactly at reset; above, it runs out early; below, part of it goes unused. Accounts without a reset date are left out.',
 	'common.save': 'Save',
 	'common.cancel': 'Cancel',
 	'common.close': 'Close',

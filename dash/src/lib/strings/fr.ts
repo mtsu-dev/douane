@@ -12,7 +12,7 @@ export const fr: Record<StringKey, string> = {
 	'pace.percent': '{value} % du rythme tenable',
 	'pace.target': '100 % : le quota s’épuise pile au reset',
 	'pace.coverage': '{known}/{total} comptes comptés',
-	'pace.method': 'Quota consommé divisé par la part de sa fenêtre déjà écoulée. Chaque compte compte sa limite hebdo (sinon sa plus longue), pondérée par l’avancement de cette fenêtre. À 100 % le quota s’épuise pile au reset ; au-dessus, il s’épuise avant ; en dessous, une partie est perdue. Les comptes sans date de reset sont exclus.',
+	'pace.method': 'Quota consommé divisé par la part de sa fenêtre déjà écoulée. Chaque compte ne compte que sa limite la plus longue (mensuelle avant hebdo avant 5 h), toutes les limites de cette durée incluses, pondérées par leur avancement. À 100 % le quota s’épuise pile au reset ; au-dessus, il s’épuise avant ; en dessous, une partie est perdue. Les comptes sans date de reset sont exclus.',
 	'common.save': 'Enregistrer',
 	'common.cancel': 'Annuler',
 	'common.close': 'Fermer',
