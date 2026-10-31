@@ -11,20 +11,31 @@ function monthLength(reset: number) {
   return reset - Date.UTC(year, month, Math.min(end.getUTCDate(), lastDay), end.getUTCHours(), end.getUTCMinutes(), end.getUTCSeconds());
 }
 
+const isMonthly = (window: QuotaWindow) => window.id === 'monthly' || (!LENGTHS[window.id] && /month/i.test(window.label));
+
 /** Window length in ms, from its id or, for provider buckets, its label. */
 function windowLength(window: QuotaWindow, reset: number) {
-  if (window.id === 'monthly' || (!LENGTHS[window.id] && /month/i.test(window.label))) return reset > 0 ? monthLength(reset) : null;
+  if (isMonthly(window)) return reset > 0 ? monthLength(reset) : null;
   const known = LENGTHS[window.id] ?? Number(/^window-(\d+)s$/.exec(window.id)?.[1]) * 1000;
   if (known) return known;
   if (/week/i.test(window.label)) return LENGTHS.weekly;
+  if (/five.?hour|\b5\s?h\b/i.test(window.label)) return LENGTHS['five-hour'];
   return null;
+}
+
+/** Nominal size used to pick the longest window: calendar months differ by days, yet stay one class. */
+function windowRank(window: QuotaWindow) {
+  if (isMonthly(window)) return 30 * 24 * HOUR;
+  return windowLength(window, 0) ?? 0;
 }
 
 /**
  * How fast a provider's subscriptions are used: quota used so far against the
  * share of each window already elapsed. 100% spends the quota exactly at reset.
- * Each account counts its weekly window (else its longest known one), weighted
- * by how far that window has run, so a week that just started weighs little.
+ * Each account counts only its longest windows (monthly over weekly over 5h),
+ * every bucket of that length included, weighted by how far it has run, so a
+ * window that just started weighs little. A longest window that says nothing
+ * yet keeps the account out rather than falling back to a shorter one.
  */
 export function providerPace(accounts: Account[], quotas: Quota[]) {
   const enabled = accounts.filter(a => a.enabled);
@@ -32,22 +43,23 @@ export function providerPace(accounts: Account[], quotas: Quota[]) {
   for (const account of enabled) {
     const quota = quotas.find(q => q.account_id === account.id);
     const at = Date.parse(quota?.updated_at ?? '') || Date.now();
-    const windows = (quota?.windows ?? []).flatMap(window => {
+    const all = quota?.windows ?? [];
+    const longest = Math.max(0, ...all.map(windowRank));
+    if (!longest) continue;
+    const windows = all.filter(window => windowRank(window) === longest).flatMap(window => {
       const reset = Date.parse(window.reset_at ?? '');
       const length = windowLength(window, reset);
       const left = reset - at;
       if (!length || !(left > 0) || window.remaining_percent == null) return [];
       const elapsed = Math.min(1, Math.max(0, 1 - left / length)) * 100;
       // Read at the reset instant: no time has run, so the window says nothing yet.
-      return elapsed > 0 ? [{ length, used: 100 - window.remaining_percent, elapsed }] : [];
+      return elapsed > 0 ? [{ used: 100 - window.remaining_percent, elapsed }] : [];
     });
-    const longest = Math.max(...windows.map(w => w.length === LENGTHS.weekly ? Infinity : w.length));
-    const chosen = windows.filter(w => (w.length === LENGTHS.weekly ? Infinity : w.length) === longest);
-    if (!chosen.length) continue;
-    // Several buckets of the same length: the busiest one sets the account's pace.
-    const busiest = chosen.reduce((a, b) => (b.used * a.elapsed > a.used * b.elapsed ? b : a));
-    used += busiest.used;
-    expected += busiest.elapsed;
+    if (!windows.length) continue;
+    for (const window of windows) {
+      used += window.used;
+      expected += window.elapsed;
+    }
     known++;
   }
   return { percent: expected > 0 ? Math.round(used / expected * 100) : null, known, total: enabled.length };

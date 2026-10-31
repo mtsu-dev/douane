@@ -29,11 +29,30 @@ test('the provider pace weighs accounts by the time their week has run', () => {
   assert.deepEqual([pace.known, pace.total], [3, 3]);
 });
 
-test('weekly windows win; otherwise the longest window with a known length counts', () => {
+test('only the longest window counts: monthly beats weekly beats five-hour', () => {
   const quotas = [quota('a', [window('five-hour', 0, 1), window('monthly', 50, 15.5 * day)])];
   assert.equal(providerPace([account('a')], quotas).percent, 100);
   const buckets = [quota('a', [window('bucket-1', 20, 2, 'Gemini 5h'), window('bucket-2', 70, 3.5 * day, 'Gemini Weekly')])];
   assert.equal(providerPace([account('a')], buckets).percent, 60);
+  // Weekly at 150% and monthly on pace: the monthly reading alone sets the pace.
+  const three = [quota('a', [window('five-hour', 0, 1), window('weekly', 25, 3.5 * day), window('monthly', 50, 15.5 * day)])];
+  assert.equal(providerPace([account('a')], three).percent, 100);
+});
+
+test('every window of the longest length counts, not only the busiest', () => {
+  // Two 5h and two weekly buckets: both weekly count (75 + 25 used over two half-elapsed weeks), the 5h never do.
+  const quotas = [quota('a', [
+    window('bucket-1', 0, 1, 'Claude 5h'), window('bucket-2', 25, 3.5 * day, 'Claude Weekly'),
+    window('bucket-3', 0, 2, 'Gemini 5h'), window('bucket-4', 75, 3.5 * day, 'Gemini Weekly')
+  ])];
+  const pace = providerPace([account('a')], quotas);
+  assert.equal(pace.percent, 100);
+  assert.equal(pace.known, 1);
+});
+
+test('a longest window that says nothing yet keeps the account out instead of falling back to a shorter one', () => {
+  const quotas = [quota('a', [window('weekly', 10, 3.5 * day), window('monthly', 100, null)])];
+  assert.equal(providerPace([account('a')], quotas).known, 0);
 });
 
 test('a week that has not started or has no reset date stays out instead of blocking the line', () => {
@@ -51,7 +70,7 @@ test('a window read at its reset instant stays out instead of inflating the pace
   assert.deepEqual([pace.known, pace.total], [1, 2]);
 });
 
-test('a weekly bucket just reset does not hide a busier bucket of the same account', () => {
+test('a weekly bucket just reset does not hide another bucket of the same account', () => {
   const quotas = [quota('a', [window('weekly', 100, 7 * day), window('opus-weekly', 50, 3.5 * day, 'Opus weekly')])];
   const pace = providerPace([account('a')], quotas);
   assert.equal(pace.percent, 100);
@@ -67,4 +86,14 @@ test('a monthly window spans its real calendar month', () => {
   // Read on October 1 at noon, more than 30 days before reset: still counted.
   const early = [{ account_id: 'a', updated_at: '2026-10-01T12:00:00Z', windows: [{ id: 'monthly', label: 'monthly', remaining_percent: 99, reset_at }] }];
   assert.equal(providerPace([account('a')], early).known, 1);
+});
+
+test('five-hour buckets known only by their label count like the 5h window', () => {
+  // Half of a 5h window elapsed: 50% used is on pace, whether the id says it or only the label.
+  const alone = [quota('a', [window('3p-5h', 50, 2.5, 'Claude and GPT models Five Hour Limit Remaining')])];
+  assert.deepEqual([providerPace([account('a')], alone).percent, providerPace([account('a')], alone).known], [100, 1]);
+  const mixed = [quota('a', [window('five-hour', 50, 2.5), window('gemini-5h', 100, 2.5, 'Gemini 5h')])];
+  assert.equal(providerPace([account('a')], mixed).percent, 50);
+  // A label that only contains "5h" inside a longer token is not a five-hour window.
+  assert.equal(providerPace([account('a')], [quota('a', [window('x', 50, 2.5, 'Model 15hz')])]).known, 0);
 });
