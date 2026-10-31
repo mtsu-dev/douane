@@ -82,6 +82,9 @@ test('the toolbar search overrides the mobile minimum and tabs are re-measured w
   assert.match(source, /\.quota-filters \.search-input \{[^}]*min-width: 40px/);
   // A late web font widens the tabs without resizing the toolbar, so the stacking decision must observe the tabs themselves.
   assert.match(source, /new ResizeObserver\(\(\) => tabsVersion\+\+\)/);
+  // At 320px the collapsed search, sort and refresh need 212px beside a 157px cell: the search slid under the title.
+  assert.match(source, /titleWidth \+ filtersNeed \+ 16 > toolbarWidth/);
+  assert.match(source, /class:filters-row=\{filtersRow\}/);
 });
 
 test('extra usage is hidden when it is off or reports nothing', () => {
