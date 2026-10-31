@@ -548,18 +548,20 @@ impl Clients {
         let account = snapshot.account_id.as_str();
         let mut usage = self.usage();
         let usage = &mut *usage;
+        let running: Vec<(String, f64)> = usage
+            .running
+            .get(account)
+            .map(|r| r.iter().map(|(c, n)| (c.clone(), *n as f64)).collect())
+            .unwrap_or_default();
         let weights: Vec<(String, f64)> = match usage.pending.get(account) {
             Some(pending) if !pending.is_empty() => {
                 pending.iter().map(|(c, w)| (c.clone(), *w)).collect()
             }
-            _ => usage
-                .running
-                .get(account)
-                .map(|r| r.iter().map(|(c, n)| (c.clone(), *n as f64)).collect())
-                .unwrap_or_default(),
+            _ => running.clone(),
         };
         let total: f64 = weights.iter().map(|(_, w)| w).sum();
         let mut rose = false;
+        let mut five_hour_reset = false;
         for reading in readings {
             let position = usage
                 .windows
@@ -584,9 +586,11 @@ impl Clients {
             // A later reset, or usage falling by more than sources disagree
             // (usage reads and inference headers round differently), is a
             // new window.
-            if reading.reset > window.reset + RESET_TOLERANCE
-                || reading.used + NEW_WINDOW_DROP < window.used
-            {
+            let new_window = reading.reset > window.reset + RESET_TOLERANCE
+                || reading.used + NEW_WINDOW_DROP < window.used;
+            let new_five_hour = new_window && reading.kind == "five-hour";
+            five_hour_reset |= new_five_hour;
+            if new_window {
                 window.reset = reading.reset;
                 window.used = 0.0;
                 window.clients.clear();
@@ -600,8 +604,15 @@ impl Clients {
                 continue;
             }
             rose = true;
+            // Pending completions belong to the previous five-hour window.
+            // Only active calls can explain usage first observed after its reset.
+            let (weights, total) = if new_five_hour {
+                (&running, running.iter().map(|(_, w)| w).sum())
+            } else {
+                (&weights, total)
+            };
             if total > 0.0 {
-                for (client, weight) in &weights {
+                for (client, weight) in weights {
                     *window.clients.entry(client.clone()).or_default() += delta * weight / total;
                 }
             } else {
@@ -610,7 +621,7 @@ impl Clients {
             window.used = reading.used;
             usage.dirty = true;
         }
-        if rose {
+        if rose || five_hour_reset {
             usage.pending.remove(account);
         }
         // Windows that ended a day ago have nothing left to tell.
@@ -1484,6 +1495,63 @@ mod tests {
             clients.share_blocks(Some(&unshared), &account("a"), Some(&quota), NOW, 8 * 3600),
             Some(reset)
         );
+    }
+
+    #[test]
+    fn old_pending_calls_cannot_spend_another_clients_new_five_hour_window() {
+        for first_used in [0.0, 10.0] {
+            for running in [false, true] {
+                let (_dir, clients) = clients();
+                let mut holders = vec![];
+                for share in [10.0, 20.0] {
+                    holders.push(
+                        clients
+                            .create(ClientPatch {
+                                name: Some(format!("holder {share}")),
+                                shares: Some([("claude".into(), share)].into()),
+                                ..Default::default()
+                            })
+                            .unwrap()
+                            .0,
+                    );
+                }
+                let old = &holders[0];
+                let next = &holders[1];
+                let quota = |used, reset| {
+                    let mut q = snapshot("a", 20.0, NOW + 3 * 86_400);
+                    let mut short = snapshot("a", used, reset).windows.remove(0);
+                    short.id = "five-hour".into();
+                    q.windows.push(short);
+                    q
+                };
+                clients.observe(&quota(9.0, NOW + 60), NOW);
+                clients.call_ended("a", Some(&old.id), 300.0);
+                if running {
+                    clients.call_started("a", Some(&next.id));
+                }
+                let reset = NOW + 18_060;
+                clients.observe(&quota(first_used, reset), NOW + 61);
+                clients.observe(&quota(10.0, reset), NOW + 62);
+                let usage = clients.usage_report(NOW + 62);
+                let short = usage.iter().find(|w| w.kind == "five-hour").unwrap();
+                assert_eq!(short.clients.get(&old.id).copied().unwrap_or(0.0), 0.0);
+                assert_eq!(
+                    short.clients.get(&next.id).copied().unwrap_or(0.0),
+                    if running { 10.0 } else { 0.0 }
+                );
+                assert_eq!(short.outside, if running { 0.0 } else { 10.0 });
+                assert_eq!(
+                    clients.share_blocks(
+                        Some(old),
+                        &account("a"),
+                        Some(&quota(10.0, reset)),
+                        NOW + 62,
+                        0
+                    ),
+                    None
+                );
+            }
+        }
     }
 
     #[test]
