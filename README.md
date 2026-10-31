@@ -1,3 +1,5 @@
+<a href="https://mtsu.dev"><img align="right" src="https://mtsu.dev/press/mtsu-icon-1024.png" width="48" alt="MTSU"></a>
+
 # douane
 
 [![CI](https://github.com/mtsu-dev/douane/actions/workflows/ci.yml/badge.svg)](https://github.com/mtsu-dev/douane/actions/workflows/ci.yml)
