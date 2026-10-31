@@ -9,7 +9,7 @@
 	import EmptyState from './empty-state.svelte';
 	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type Provider } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
-	let { accounts, quotas, providers = [], busy, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
+	let { accounts, quotas, providers = [], busy, refresh, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
 	const TOOLBAR_GAP = 20;
 	let provider = $state('all');
 	let search = $state('');
@@ -47,7 +47,7 @@
 			{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={20}/>{providerName(id)}</button>{/each}
 		</div>
 	{/if}
-	<div class="quota-filters" bind:clientWidth={filtersWidth}><label class="search-input" class:filled={!!search} bind:this={searchLabel} onfocusin={() => searchFocused = true} onfocusout={() => { if (!pressing) searchFocused = false; }}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
+	<div class="quota-filters" bind:clientWidth={filtersWidth}><label class="search-input" class:filled={!!search} bind:this={searchLabel} onfocusin={() => searchFocused = true} onfocusout={() => { if (!pressing) searchFocused = false; }}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select><button class="button refresh-button" disabled={!!busy || !accounts.length} onclick={() => refresh()} title={t('quotas.refresh')} aria-label={t('quotas.refresh')}><RefreshCw size={17} class={busy === 'quotas' ? 'spinning' : ''}/></button></div>
 </header>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
@@ -70,7 +70,7 @@
 								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)}/><p class="reset-date" title={window.reset_at ? t('quotas.resetAt', { date: formatDate(window.reset_at) }) : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : t('quotas.notReported')}</p>{/if}</div>
 								{#if credits.length}<div class="credit-windows">{#each credits as credit (credit.id)}<div class="credit-window"><div><span>{usageLabel(credit.label)}</span><strong>{credit.enabled === false ? t('common.disabled') : credit.unlimited ? t('quotas.unlimited') : creditValue(credit.remaining, credit.unit)}{#if credit.enabled !== false && credit.remaining != null}<span class="muted">{` ${t('quotas.remaining')}`}</span>{/if}</strong></div>{#if credit.used != null}<p>{credit.limit != null ? t('quotas.usedOf', { used: creditValue(credit.used, credit.unit), limit: creditValue(credit.limit, credit.unit) }) : t('quotas.used', { used: creditValue(credit.used, credit.unit) })}</p>{/if}{#if credit.reset_at}<p class="reset-date"><RefreshCw size={16}/>{resetLabel(credit.reset_at)}</p>{/if}</div>{/each}</div>{/if}
 							</div>
-							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? t('common.disabled') : quota?.error ? t('status.check') : account.reserve_reached && ['ready', 'active'].includes(account.status) ? t('status.reserveReached') : accountStatus(account)}</span></div>
+							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? t('common.disabled') : quota?.error ? t('status.check') : account.reserve_reached && ['ready', 'active'].includes(account.status) ? t('status.reserveReached') : accountStatus(account)}</span><button class="icon-button" disabled={!!busy} onclick={() => refresh(account.id)} title={t('quotas.refreshAccount')} aria-label={t('quotas.refreshNamed', { name: privateLabel(account.name) })}><RefreshCw size={19}/></button></div>
 						</article>
 					{/each}
 				</div>
@@ -98,6 +98,7 @@
 	.quota-filters .search-input:focus-within, .quota-filters .search-input.filled { flex-basis: 220px; }
 	.quota-filters .search-input input { min-width: 0; }
 	.quota-filters .search-input :global(svg) { flex-shrink: 0; }
+	.quota-filters .refresh-button { flex-shrink: 0; width: 40px; min-height: 40px; height: 40px; padding: 0; }
 	.quota-filters select { flex-shrink: 0; width: 140px; background: var(--surface); }
 	.quota-filters select, .quota-filters .search-input { height: 40px; min-height: 40px; border-radius: 10px; font-size: 14px; }
 	.quota-filters input { font-size: 14px; }
