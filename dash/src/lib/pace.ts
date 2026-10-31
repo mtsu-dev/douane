@@ -19,6 +19,7 @@ function windowLength(window: QuotaWindow, reset: number) {
   const known = LENGTHS[window.id] ?? Number(/^window-(\d+)s$/.exec(window.id)?.[1]) * 1000;
   if (known) return known;
   if (/week/i.test(window.label)) return LENGTHS.weekly;
+  if (/five.?hour|\b5\s?h\b/i.test(window.label)) return LENGTHS['five-hour'];
   return null;
 }
 

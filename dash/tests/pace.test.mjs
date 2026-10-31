@@ -87,3 +87,13 @@ test('a monthly window spans its real calendar month', () => {
   const early = [{ account_id: 'a', updated_at: '2026-10-01T12:00:00Z', windows: [{ id: 'monthly', label: 'monthly', remaining_percent: 99, reset_at }] }];
   assert.equal(providerPace([account('a')], early).known, 1);
 });
+
+test('five-hour buckets known only by their label count like the 5h window', () => {
+  // Half of a 5h window elapsed: 50% used is on pace, whether the id says it or only the label.
+  const alone = [quota('a', [window('3p-5h', 50, 2.5, 'Claude and GPT models Five Hour Limit Remaining')])];
+  assert.deepEqual([providerPace([account('a')], alone).percent, providerPace([account('a')], alone).known], [100, 1]);
+  const mixed = [quota('a', [window('five-hour', 50, 2.5), window('gemini-5h', 100, 2.5, 'Gemini 5h')])];
+  assert.equal(providerPace([account('a')], mixed).percent, 50);
+  // A label that only contains "5h" inside a longer token is not a five-hour window.
+  assert.equal(providerPace([account('a')], [quota('a', [window('x', 50, 2.5, 'Model 15hz')])]).known, 0);
+});
