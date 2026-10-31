@@ -10,6 +10,7 @@
 	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type Provider } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
 	let { accounts, quotas, providers = [], busy, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
+	const TOOLBAR_GAP = 20;
 	let provider = $state('all');
 	let search = $state('');
 	let sort = $state('name');
@@ -21,18 +22,32 @@
 	let groups = $derived(providerIds.map(id => ({ id, accounts: filtered.filter(a => a.provider === id) })).filter(group => group.accounts.length));
 	// A disabled or empty paid balance (Claude extra usage off) is noise on a display-only page.
 	const shownCredits = (quota?: Quota) => quota?.credits?.filter(c => c.enabled !== false && (c.unlimited || c.remaining != null || !!c.used)) ?? [];
+	// Tabs go to their own row only when the line cannot hold them (many providers, or an open search), so none is ever cut.
+	let toolbarWidth = $state(0), titleWidth = $state(0), filtersWidth = $state(0), tabs = $state<HTMLElement>();
+	// Tab sizes change without the toolbar resizing (Figtree loading late, a provider added, the language switched): observe each tab.
+	let tabsVersion = $state(0);
+	$effect(() => { void providerIds; if (!tabs) return; const observer = new ResizeObserver(() => tabsVersion++); for (const tab of tabs.children) observer.observe(tab); return () => observer.disconnect(); });
+	// The width the tabs need on one line: stacked tabs may wrap, so their offsets no longer give it.
+	let tabsWidth = $derived.by(() => { void tabsVersion; if (!tabs?.children.length) return 0; const items = [...tabs.children] as HTMLElement[]; return items.reduce((sum, tab) => sum + tab.offsetWidth, 0) + (items.length - 1) * (parseFloat(getComputedStyle(tabs).columnGap) || 0); });
+	// Leaving the search collapses its phone row; during a press that would move the tab under the finger, so wait for the press to end.
+	let searchFocused = $state(false), searchLabel = $state<HTMLElement>(), pressing = false;
+	const settleSearch = () => searchFocused = !!searchLabel?.contains(document.activeElement);
+	const pressEnd = () => { pressing = false; setTimeout(settleSearch); };
+	let stacked = $derived(toolbarWidth > 0 && titleWidth + tabsWidth + filtersWidth + 2 * TOOLBAR_GAP > toolbarWidth);
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
 
-<header class="quota-toolbar">
-	<h1>{t('nav.quotas')}</h1>
+<svelte:window onpointerdown={() => pressing = true} onpointerup={pressEnd} onpointercancel={pressEnd}/>
+
+<header class="quota-toolbar" class:stacked class:searching={searchFocused || !!search} bind:clientWidth={toolbarWidth}>
+	<h1 bind:clientWidth={titleWidth}>{t('nav.quotas')}</h1>
 	{#if providerIds.length > 1}
-		<div class="provider-tabs" aria-label={t('quotas.filter')}>
-			<button class:active={provider === 'all'} onclick={() => provider = 'all'} aria-pressed={provider === 'all'}>{t('quotas.all')} <span class="count-badge">{accounts.filter(a => providerIds.includes(a.provider)).length}</span></button>
-			{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={20}/>{providerName(id)}<span class="count-badge">{accounts.filter(a => a.provider === id).length}</span></button>{/each}
+		<div class="provider-tabs" aria-label={t('quotas.filter')} bind:this={tabs}>
+			<button class:active={provider === 'all'} onclick={() => provider = 'all'} aria-pressed={provider === 'all'}>{t('quotas.all')}</button>
+			{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={20}/>{providerName(id)}</button>{/each}
 		</div>
 	{/if}
-	<div class="quota-filters"><label class="search-input"><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
+	<div class="quota-filters" bind:clientWidth={filtersWidth}><label class="search-input" class:filled={!!search} bind:this={searchLabel} onfocusin={() => searchFocused = true} onfocusout={() => { if (!pressing) searchFocused = false; }}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
 </header>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
@@ -69,9 +84,21 @@
 	.quota-toolbar h1 { flex-shrink: 0; margin: 0; }
 	.quota-toolbar .provider-tabs { flex: 0 1 auto; min-width: 0; padding: 0; border: 0; }
 	.quota-toolbar .provider-tabs>button { padding: 0 10px; height: 40px; font-size: 14px; }
-	.quota-filters { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: auto; }
-	.quota-filters .search-input { width: 220px; }
-	.quota-filters select { width: 140px; background: var(--surface); }
+	.quota-toolbar.stacked { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 14px 16px; }
+	.quota-toolbar.stacked .provider-tabs { grid-column: 1/-1; grid-row: 2; }
+	.quota-toolbar.stacked .quota-filters { max-width: 100%; }
+	/* Desktop stacked tabs wrap rather than hide behind a scrollbar a mouse cannot reach; phones keep the swipe strip. */
+	@media(min-width:781px) { .quota-toolbar.stacked .provider-tabs { flex-wrap: wrap; overflow: visible; } }
+	/* A phone gives an open search its own row instead of squeezing it beside the title and sort. */
+	@media(max-width:780px) { .quota-toolbar.stacked.searching .quota-filters { grid-column: 1/-1; grid-row: 2; margin-left: 0; width: 100%; }.quota-toolbar.stacked.searching .search-input { flex-grow: 1; }.quota-toolbar.stacked.searching .provider-tabs { grid-row: 3; } }
+	.quota-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-shrink: 0; min-width: 0; margin-left: auto; }
+	/* Search stays an icon until it is used, so the provider tabs keep the line. */
+	/* A flex basis rather than a width lets an open search shrink inside a narrow (phone) toolbar. */
+	.quota-filters .search-input { flex: 0 1 40px; width: auto; min-width: 40px; padding: 0 11px; cursor: text; transition: flex-basis .2s; }
+	.quota-filters .search-input:focus-within, .quota-filters .search-input.filled { flex-basis: 220px; }
+	.quota-filters .search-input input { min-width: 0; }
+	.quota-filters .search-input :global(svg) { flex-shrink: 0; }
+	.quota-filters select { flex-shrink: 0; width: 140px; background: var(--surface); }
 	.quota-filters select, .quota-filters .search-input { height: 40px; min-height: 40px; border-radius: 10px; font-size: 14px; }
 	.quota-filters input { font-size: 14px; }
 	.provider-groups { display: grid; gap: 30px; }
@@ -95,7 +122,6 @@
 	.credit-window strong { font-weight: 600; }
 	.credit-window strong>span { font-weight: 400; }
 	.credit-window>p { margin: 8px 0 0; color: var(--muted); font-size: 15px; }
-	@media(max-width:1150px) { .quota-toolbar { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 14px 16px; }.quota-filters { justify-content: flex-end; min-width: 0; }.quota-filters .search-input { width: auto; flex: 1; min-width: 0; }.quota-toolbar .provider-tabs { grid-column: 1/-1; grid-row: 2; } }
 	@media(max-width:1250px) { .quota-row { grid-template-columns: minmax(190px,.7fr) minmax(260px,1.3fr); gap: 22px; }.account-state { grid-column: 1/-1; margin-top: -8px; } }
 	.account-title { font-size: 17px; font-weight: 600; line-height: 1.45; overflow-wrap: anywhere; }
 	@media(max-width:650px) { .quota-filters { gap: 6px; }.quota-filters select { width: 120px; padding: 0 8px; }.provider-groups { gap: 24px; }.provider-heading h2 { font-size: 22px; }.quota-row { grid-template-columns: 1fr; gap: 18px; padding: 18px; }.quota-windows { grid-template-columns: 1fr; gap: 20px; }.account-state { grid-column: auto; justify-content: flex-start; margin-top: 0; }.credit-window>div { flex-wrap: wrap; } }

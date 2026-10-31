@@ -1,6 +1,7 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'vite';
 
 let server, View, Resets, render;
@@ -62,6 +63,17 @@ test('the header holds title, provider tabs, search and sort in one toolbar', ()
   assert.match(header, /provider-tabs/);
   assert.match(header, /type="search"/);
   assert.match(header, /<select/);
+  // Counts live in each provider heading; the tabs stay short so the line holds them.
+  assert.doesNotMatch(header, /count-badge/);
+  assert.doesNotMatch(header, /search-input[^"]*filled/);
+});
+
+test('the toolbar search overrides the mobile minimum and tabs are re-measured when they resize', () => {
+  const source = readFileSync(new URL('../src/lib/components/quotas-view.svelte', import.meta.url), 'utf8');
+  // app.css gives every search input min-width: 140px on phones, which pushed the toolbar off a 390px screen.
+  assert.match(source, /\.quota-filters \.search-input \{[^}]*min-width: 40px/);
+  // A late web font widens the tabs without resizing the toolbar, so the stacking decision must observe the tabs themselves.
+  assert.match(source, /new ResizeObserver\(\(\) => tabsVersion\+\+\)/);
 });
 
 test('extra usage is hidden when it is off or reports nothing', () => {
