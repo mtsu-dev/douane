@@ -145,8 +145,8 @@ pub struct WindowUsage {
 #[derive(Default)]
 struct Usage {
     windows: Vec<WindowUsage>,
-    /// Token weight of calls ended since the last rise, by account then client.
-    pending: BTreeMap<String, BTreeMap<String, f64>>,
+    /// Token weight since each window's last rise, by (account, kind) then client.
+    pending: BTreeMap<(String, &'static str), BTreeMap<String, f64>>,
     /// Calls running, by account then client.
     running: BTreeMap<String, BTreeMap<String, u32>>,
     dirty: bool,
@@ -530,12 +530,14 @@ impl Clients {
             }
         }
         if weight > 0.0 && weight.is_finite() {
-            *usage
-                .pending
-                .entry(account.to_owned())
-                .or_default()
-                .entry(client.to_owned())
-                .or_default() += weight;
+            for kind in ["five-hour", "daily", "weekly", "monthly"] {
+                *usage
+                    .pending
+                    .entry((account.to_owned(), kind))
+                    .or_default()
+                    .entry(client.to_owned())
+                    .or_default() += weight;
+            }
         }
     }
 
@@ -553,16 +555,8 @@ impl Clients {
             .get(account)
             .map(|r| r.iter().map(|(c, n)| (c.clone(), *n as f64)).collect())
             .unwrap_or_default();
-        let weights: Vec<(String, f64)> = match usage.pending.get(account) {
-            Some(pending) if !pending.is_empty() => {
-                pending.iter().map(|(c, w)| (c.clone(), *w)).collect()
-            }
-            _ => running.clone(),
-        };
-        let total: f64 = weights.iter().map(|(_, w)| w).sum();
-        let mut rose = false;
-        let mut five_hour_reset = false;
         for reading in readings {
+            let key = (account.to_owned(), reading.kind);
             let position = usage
                 .windows
                 .iter()
@@ -588,9 +582,10 @@ impl Clients {
             // new window.
             let new_window = reading.reset > window.reset + RESET_TOLERANCE
                 || reading.used + NEW_WINDOW_DROP < window.used;
-            let new_five_hour = new_window && reading.kind == "five-hour";
-            five_hour_reset |= new_five_hour;
             if new_window {
+                // Old completions cannot charge a fresh budget. Other windows
+                // retain their weights until their own rise or reset.
+                usage.pending.remove(&key);
                 window.reset = reading.reset;
                 window.used = 0.0;
                 window.clients.clear();
@@ -603,16 +598,13 @@ impl Clients {
             if delta <= 1e-9 {
                 continue;
             }
-            rose = true;
-            // Pending completions belong to the previous five-hour window.
-            // Only active calls can explain usage first observed after its reset.
-            let (weights, total) = if new_five_hour {
-                (&running, running.iter().map(|(_, w)| w).sum())
-            } else {
-                (&weights, total)
+            let weights: Vec<(String, f64)> = match usage.pending.remove(&key) {
+                Some(pending) if !pending.is_empty() => pending.into_iter().collect(),
+                _ => running.clone(),
             };
+            let total: f64 = weights.iter().map(|(_, w)| w).sum();
             if total > 0.0 {
-                for (client, weight) in weights {
+                for (client, weight) in &weights {
                     *window.clients.entry(client.clone()).or_default() += delta * weight / total;
                 }
             } else {
@@ -620,9 +612,6 @@ impl Clients {
             }
             window.used = reading.used;
             usage.dirty = true;
-        }
-        if rose || five_hour_reset {
-            usage.pending.remove(account);
         }
         // Windows that ended a day ago have nothing left to tell.
         let before = usage.windows.len();
@@ -635,7 +624,7 @@ impl Clients {
         let mut usage = self.usage();
         let before = usage.windows.len();
         usage.windows.retain(|w| existing.contains(&w.account_id));
-        usage.pending.retain(|id, _| existing.contains(id));
+        usage.pending.retain(|(id, _), _| existing.contains(id));
         usage.dirty |= usage.windows.len() != before;
     }
 
@@ -1320,12 +1309,12 @@ mod tests {
         clients.observe(&snapshot("a", 24.0, reset), NOW);
         clients.observe(&snapshot("a", 25.0, reset), NOW);
         assert!((clients.usage_report(NOW)[0].clients["perso"] - 8.0).abs() < 1e-9);
-        // A new window starts from zero.
+        // A new window starts from zero and drops the old completions.
         clients.call_ended("a", Some("perso"), 10.0);
         clients.observe(&snapshot("a", 2.0, reset + 7 * 86_400), NOW);
         let window = &clients.usage_report(NOW)[0];
-        assert_eq!(window.clients.len(), 1);
-        assert!((window.clients["perso"] - 2.0).abs() < 1e-9);
+        assert!(window.clients.is_empty());
+        assert_eq!(window.outside, 2.0);
     }
 
     #[test]
@@ -1550,6 +1539,66 @@ mod tests {
                     ),
                     None
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn five_hour_resets_preserve_completions_for_a_delayed_weekly_rise() {
+        for first_used in [0.0, 10.0] {
+            for short_first in [false, true] {
+                let (_dir, clients) = clients();
+                let quota = |short_used, weekly_used, reset| {
+                    let mut q = snapshot("a", weekly_used, NOW + 3 * 86_400);
+                    let mut short = snapshot("a", short_used, reset).windows.remove(0);
+                    short.id = "five-hour".into();
+                    q.windows.push(short);
+                    if short_first {
+                        q.windows.reverse();
+                    }
+                    q
+                };
+                clients.observe(&quota(9.0, 20.0, NOW + 60), NOW);
+                clients.call_ended("a", Some("old"), 300.0);
+                let reset = NOW + 18_060;
+                clients.observe(&quota(first_used, 20.0, reset), NOW + 61);
+                clients.call_ended("a", Some("next"), 100.0);
+                clients.observe(&quota(first_used + 10.0, 20.0, reset), NOW + 62);
+                clients.observe(&quota(first_used + 10.0, 24.0, reset), NOW + 63);
+                let usage = clients.usage_report(NOW + 63);
+                let weekly = usage.iter().find(|w| w.kind == "weekly").unwrap();
+                assert_eq!(weekly.clients.get("old").copied().unwrap_or(0.0), 3.0);
+                assert_eq!(weekly.clients.get("next").copied().unwrap_or(0.0), 1.0);
+                assert_eq!(weekly.outside, 0.0);
+                let short = usage.iter().find(|w| w.kind == "five-hour").unwrap();
+                assert_eq!(short.clients.get("old").copied().unwrap_or(0.0), 0.0);
+                assert_eq!(short.clients["next"], 10.0);
+                assert_eq!(short.outside, first_used);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_completions_do_not_cross_longer_window_resets() {
+        for kind in ["daily", "weekly", "monthly"] {
+            for first_used in [0.0, 2.0] {
+                let (_dir, clients) = clients();
+                let quota = |used, reset| {
+                    let mut q = snapshot("a", used, reset);
+                    q.windows[0].id = kind.into();
+                    q
+                };
+                clients.observe(&quota(20.0, NOW + 60), NOW);
+                clients.call_ended("a", Some("old"), 300.0);
+                let reset = NOW + 3 * 86_400;
+                clients.observe(&quota(first_used, reset), NOW + 61);
+                clients.call_ended("a", Some("next"), 100.0);
+                clients.observe(&quota(first_used + 4.0, reset), NOW + 62);
+                let usage = clients.usage_report(NOW + 62);
+                let window = &usage[0];
+                assert_eq!(window.clients.get("old").copied().unwrap_or(0.0), 0.0);
+                assert_eq!(window.clients["next"], 4.0);
+                assert_eq!(window.outside, first_used);
             }
         }
     }
