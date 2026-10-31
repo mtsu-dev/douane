@@ -5,11 +5,12 @@
 //! douane refuses every call until one is created. A share is a percentage of each
 //! account-wide window (five hours, day, week, month) of every account in a
 //! pool. Unused shares stay reserved for their holders until the last seventh
-//! of the window, when anyone may use them; what no share covers is common.
+//! of longer windows, when anyone may use them; what no share covers is common.
+//! Five-hour shares are always hard caps and keep their reservations until reset.
 //! Account shares override pool shares. When authorized holders promise more
 //! than 100%, unused quota is common and each holder has its own usage cap.
 //! In the hours before an account's weekly reset (`free_before_reset_hours`),
-//! shares hold no one back.
+//! only longer-window shares stop holding callers back.
 //!
 //! Usage is attributed, not read: each rise of a window's utilization goes to
 //! the clients whose calls ended on that account since the previous reading,
@@ -685,19 +686,19 @@ impl Clients {
         };
         let mine = used_by(me);
         let physical = (100.0 - reading.used).max(0.0);
-        if holders.iter().map(|(_, s)| s).sum::<f64>() > 100.0 + 1e-9 {
-            let cap = holders
+        let overbooked = holders.iter().map(|(_, s)| s).sum::<f64>() > 100.0 + 1e-9;
+        let cap = if reading.kind == "five-hour" || overbooked {
+            holders
                 .iter()
                 .find(|(id, _)| id == me)
-                .map(|(_, s)| (s - mine).max(0.0));
-            return (
-                mine,
-                cap.map_or(physical, |c| physical.min(c)),
-                cap.is_some_and(|c| c <= 1e-9),
-            );
-        }
+                .map(|(_, s)| (s - mine).max(0.0))
+        } else {
+            None
+        };
         let length = window_seconds(reading.kind).unwrap_or(0.0);
-        let free = if (reading.reset - now) as f64 <= length / 7.0 {
+        let free = if overbooked
+            || (reading.kind != "five-hour" && (reading.reset - now) as f64 <= length / 7.0)
+        {
             0.0
         } else {
             holders
@@ -706,17 +707,18 @@ impl Clients {
                 .map(|(id, share)| (share - used_by(id)).max(0.0))
                 .sum()
         };
+        let remaining = (physical - free).max(0.0);
         (
             mine,
-            (physical - free).max(0.0),
-            free > 0.0 && physical <= free + 1e-9,
+            cap.map_or(remaining, |c| remaining.min(c)),
+            cap.is_some_and(|c| c <= 1e-9) || (free > 0.0 && physical <= free + 1e-9),
         )
     }
 
     /// The reset of the window where reservations or an overbooked holder's
     /// own cap forbid another call; `None` when shares allow it.
     /// Within `free_before` seconds of the account's weekly reset, shares
-    /// no longer hold anyone back.
+    /// no longer hold anyone back on longer windows. Five-hour limits stay enforced.
     pub fn share_blocks(
         &self,
         client: Option<&Client>,
@@ -727,13 +729,15 @@ impl Clients {
     ) -> Option<i64> {
         let snapshot = snapshot?;
         let holders = self.holders(account.pool(), &account.id);
-        if holders.is_empty() || snapshot.longest_window_ends_within(free_before, now) {
+        if holders.is_empty() {
             return None;
         }
+        let weekly_free = snapshot.longest_window_ends_within(free_before, now);
         let me = client.map(|c| c.id.as_str()).unwrap_or("");
         readings(snapshot)
             .into_iter()
             .filter(|r| r.reset > now)
+            .filter(|r| !weekly_free || r.kind == "five-hour")
             .find(|reading| self.budget(&holders, me, &account.id, reading, now).2)
             .map(|r| r.reset)
     }
@@ -742,8 +746,8 @@ impl Clients {
     /// account-wide window shows the part of what it may use that it has
     /// used, so a bar at 100% means it is held back. A client without a share
     /// sees the account's whole quota, other shares included.
-    /// Windows of an account whose shares are freed before its weekly reset
-    /// stay as they are.
+    /// Longer windows whose shares are freed before the weekly reset stay raw.
+    /// Five-hour windows always show the client's capped budget.
     pub fn client_view(
         &self,
         client: &Client,
@@ -752,11 +756,10 @@ impl Clients {
         now: i64,
         free_before: i64,
     ) -> QuotaSnapshot {
-        if client.share_for(pool, &snapshot.account_id).is_none()
-            || snapshot.longest_window_ends_within(free_before, now)
-        {
+        if client.share_for(pool, &snapshot.account_id).is_none() {
             return snapshot;
         }
+        let weekly_free = snapshot.longest_window_ends_within(free_before, now);
         let holders = self.holders(pool, &snapshot.account_id);
         let account = snapshot.account_id.clone();
         let readings = readings(&snapshot);
@@ -767,7 +770,7 @@ impl Clients {
             let Some(reading) = readings.iter().find(|r| r.kind == kind) else {
                 continue;
             };
-            if reading.reset <= now {
+            if reading.reset <= now || (weekly_free && reading.kind != "five-hour") {
                 continue;
             }
             let (mine, remaining, _) = self.budget(&holders, &client.id, &account, reading, now);
@@ -1373,6 +1376,117 @@ mod tests {
     }
 
     #[test]
+    fn five_hour_caps_survive_common_quota_and_both_release_periods() {
+        for overbooked in [false, true] {
+            for five_hour_left in [2 * 3600, 15 * 60] {
+                for weekly_free in [false, true] {
+                    let (_dir, clients) = clients();
+                    let mut holders = vec![];
+                    for (name, share) in [
+                        ("main", 90.0),
+                        ("other", if overbooked { 15.0 } else { 4.0 }),
+                        ("third", 4.0),
+                    ] {
+                        holders.push(
+                            clients
+                                .create(ClientPatch {
+                                    name: Some(name.into()),
+                                    account_shares: Some([("a".into(), share)].into()),
+                                    ..Default::default()
+                                })
+                                .unwrap()
+                                .0,
+                        );
+                    }
+                    let main = &holders[0];
+                    let reset = NOW + five_hour_left;
+                    let weekly_reset = NOW + if weekly_free { 3600 } else { 3 * 86_400 };
+                    let quota = |used| {
+                        let mut q = snapshot("a", 20.0, weekly_reset);
+                        let mut short = snapshot("a", used, reset).windows.remove(0);
+                        short.id = "five-hour".into();
+                        q.windows.push(short);
+                        q
+                    };
+                    clients.observe(&quota(0.0), NOW);
+                    clients.call_ended("a", Some(&main.id), 1.0);
+                    clients.observe(&quota(89.0), NOW);
+                    let view = clients.client_view(main, quota(89.0), "claude", NOW, 8 * 3600);
+                    assert!(
+                        (view.windows[1].remaining_percent.unwrap() - 100.0 / 90.0).abs() < 1e-9
+                    );
+                    assert_eq!(
+                        clients.share_blocks(
+                            Some(main),
+                            &account("a"),
+                            Some(&quota(89.0)),
+                            NOW,
+                            8 * 3600
+                        ),
+                        None
+                    );
+                    clients.call_ended("a", Some(&main.id), 1.0);
+                    clients.observe(&quota(90.0), NOW);
+                    assert_eq!(
+                        clients.share_blocks(
+                            Some(main),
+                            &account("a"),
+                            Some(&quota(90.0)),
+                            NOW,
+                            8 * 3600
+                        ),
+                        Some(reset)
+                    );
+                    let view = clients.client_view(main, quota(90.0), "claude", NOW, 8 * 3600);
+                    assert_eq!(view.windows[1].remaining_percent, Some(0.0));
+                    if weekly_free {
+                        assert_eq!(view.windows[0].remaining_percent, Some(80.0));
+                    }
+                    let mut fresh = quota(0.0);
+                    fresh.windows[1].reset_at = snapshot("a", 0.0, reset + 18_000)
+                        .windows
+                        .remove(0)
+                        .reset_at;
+                    clients.observe(&fresh, NOW);
+                    assert_eq!(
+                        clients.share_blocks(
+                            Some(main),
+                            &account("a"),
+                            Some(&fresh),
+                            NOW,
+                            8 * 3600
+                        ),
+                        None
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn five_hour_reservations_still_protect_other_clients_near_resets() {
+        let (_dir, clients) = clients();
+        clients
+            .create(ClientPatch {
+                name: Some("holder".into()),
+                shares: Some([("claude".into(), 90.0)].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let (unshared, _) = clients.create(named("unshared")).unwrap();
+        let mut quota = snapshot("a", 20.0, NOW + 3600);
+        let reset = NOW + 15 * 60;
+        let mut short = snapshot("a", 10.0, reset).windows.remove(0);
+        short.id = "five-hour".into();
+        quota.windows.push(short);
+        clients.observe(&quota, NOW);
+        assert_eq!(
+            clients.share_blocks(Some(&unshared), &account("a"), Some(&quota), NOW, 8 * 3600),
+            Some(reset)
+        );
+    }
+
+    #[test]
     fn shares_stop_holding_back_hours_before_the_weekly_reset() {
         let (_dir, clients) = clients();
         let (famille, _) = clients
@@ -1414,10 +1528,10 @@ mod tests {
             clients.share_blocks(Some(&perso), &a, Some(&full), NOW, 4 * 3600),
             Some(five)
         );
-        // Six hours before the weekly reset, nothing is held back any more.
+        // Weekly release never removes the five-hour reservation.
         assert_eq!(
             clients.share_blocks(Some(&perso), &a, Some(&full), NOW, 6 * 3600),
-            None
+            Some(five)
         );
         let view = |free_before: i64| {
             clients
@@ -1426,7 +1540,7 @@ mod tests {
                 .remaining_percent
         };
         assert_eq!(view(0), Some(100.0));
-        assert_eq!(view(6 * 3600), Some(25.0));
+        assert_eq!(view(6 * 3600), Some(100.0));
     }
 
     #[test]
