@@ -9,7 +9,7 @@
 	import EmptyState from './empty-state.svelte';
 	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type Provider } from '$lib/management';
 	import { t } from '$lib/i18n.svelte';
-	let { accounts, quotas, providers = [], busy, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
+	let { accounts, quotas, providers = [], busy, refresh, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
 	const TOOLBAR_GAP = 20;
 	let provider = $state('all');
 	let search = $state('');
@@ -23,7 +23,7 @@
 	// A disabled or empty paid balance (Claude extra usage off) is noise on a display-only page.
 	const shownCredits = (quota?: Quota) => quota?.credits?.filter(c => c.enabled !== false && (c.unlimited || c.remaining != null || !!c.used)) ?? [];
 	// Tabs go to their own row only when the line cannot hold them (many providers, or an open search), so none is ever cut.
-	let toolbarWidth = $state(0), titleWidth = $state(0), filtersWidth = $state(0), tabs = $state<HTMLElement>();
+	let toolbarWidth = $state(0), titleWidth = $state(0), filtersWidth = $state(0), tabs = $state<HTMLElement>(), filters = $state<HTMLElement>();
 	// Tab sizes change without the toolbar resizing (Figtree loading late, a provider added, the language switched): observe each tab.
 	let tabsVersion = $state(0);
 	$effect(() => { void providerIds; if (!tabs) return; const observer = new ResizeObserver(() => tabsVersion++); for (const tab of tabs.children) observer.observe(tab); return () => observer.disconnect(); });
@@ -34,12 +34,15 @@
 	const settleSearch = () => searchFocused = !!searchLabel?.contains(document.activeElement);
 	const pressEnd = () => { pressing = false; setTimeout(settleSearch); };
 	let stacked = $derived(toolbarWidth > 0 && titleWidth + tabsWidth + filtersWidth + 2 * TOOLBAR_GAP > toolbarWidth);
+	// The filters' own minimum (collapsed search, sort, refresh): beside the title they overflow it on the narrowest phones, so they then take their own row.
+	let filtersNeed = $derived.by(() => { void toolbarWidth; if (!filters) return 0; const items = [...filters.children] as HTMLElement[]; return items.reduce((sum, item) => sum + (item === searchLabel ? 40 : item.offsetWidth), 0) + (items.length - 1) * (parseFloat(getComputedStyle(filters).columnGap) || 0); });
+	let filtersRow = $derived(stacked && (searchFocused || !!search || titleWidth + filtersNeed + 16 > toolbarWidth));
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
 
 <svelte:window onpointerdown={() => pressing = true} onpointerup={pressEnd} onpointercancel={pressEnd}/>
 
-<header class="quota-toolbar" class:stacked class:searching={searchFocused || !!search} bind:clientWidth={toolbarWidth}>
+<header class="quota-toolbar" class:stacked class:filters-row={filtersRow} bind:clientWidth={toolbarWidth}>
 	<h1 bind:clientWidth={titleWidth}>{t('nav.quotas')}</h1>
 	{#if providerIds.length > 1}
 		<div class="provider-tabs" aria-label={t('quotas.filter')} bind:this={tabs}>
@@ -47,7 +50,7 @@
 			{#each providerIds as id (id)}<button class:active={provider === id} onclick={() => provider = id} aria-pressed={provider === id}><ProviderMark provider={id} size={20}/>{providerName(id)}</button>{/each}
 		</div>
 	{/if}
-	<div class="quota-filters" bind:clientWidth={filtersWidth}><label class="search-input" class:filled={!!search} bind:this={searchLabel} onfocusin={() => searchFocused = true} onfocusout={() => { if (!pressing) searchFocused = false; }}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select></div>
+	<div class="quota-filters" bind:clientWidth={filtersWidth} bind:this={filters}><label class="search-input" class:filled={!!search} bind:this={searchLabel} onfocusin={() => searchFocused = true} onfocusout={() => { if (!pressing) searchFocused = false; }}><Search size={17}/><input type="search" placeholder={t('quotas.search')} aria-label={t('common.searchAccount')} bind:value={search}/></label><select aria-label={t('quotas.sort')} bind:value={sort}><option value="name">{t('quotas.byName')}</option><option value="remaining">{t('quotas.byRemaining')}</option></select><button class="button refresh-button" disabled={!!busy || !accounts.length} onclick={() => refresh()} title={t('quotas.refresh')} aria-label={t('quotas.refresh')}><RefreshCw size={17} class={busy === 'quotas' ? 'spinning' : ''}/></button></div>
 </header>
 
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
@@ -70,7 +73,7 @@
 								<div class="quota-windows">{#if quota?.windows.length}{#each quota.windows as window (window.id)}<div class="quota-window"><QuotaMeter value={window.remaining_percent} label={usageLabel(window.label)}/><p class="reset-date" title={window.reset_at ? t('quotas.resetAt', { date: formatDate(window.reset_at) }) : undefined}><RefreshCw size={16}/>{resetLabel(window.reset_at)}</p></div>{/each}{:else if !quota?.verification_required}<p class="quota-unavailable">{quota?.error ? privateLabel(quota.error) : t('quotas.notReported')}</p>{/if}</div>
 								{#if credits.length}<div class="credit-windows">{#each credits as credit (credit.id)}<div class="credit-window"><div><span>{usageLabel(credit.label)}</span><strong>{credit.enabled === false ? t('common.disabled') : credit.unlimited ? t('quotas.unlimited') : creditValue(credit.remaining, credit.unit)}{#if credit.enabled !== false && credit.remaining != null}<span class="muted">{` ${t('quotas.remaining')}`}</span>{/if}</strong></div>{#if credit.used != null}<p>{credit.limit != null ? t('quotas.usedOf', { used: creditValue(credit.used, credit.unit), limit: creditValue(credit.limit, credit.unit) }) : t('quotas.used', { used: creditValue(credit.used, credit.unit) })}</p>{/if}{#if credit.reset_at}<p class="reset-date"><RefreshCw size={16}/>{resetLabel(credit.reset_at)}</p>{/if}</div>{/each}</div>{/if}
 							</div>
-							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? t('common.disabled') : quota?.error ? t('status.check') : account.reserve_reached && ['ready', 'active'].includes(account.status) ? t('status.reserveReached') : accountStatus(account)}</span></div>
+							<div class="account-state"><span class="state-badge" class:warning={!!quota?.error || accountWarning(account) || (account.enabled && !!account.reserve_reached)} class:inactive={!account.enabled}><span class="status-pip"></span>{!account.enabled ? t('common.disabled') : quota?.error ? t('status.check') : account.reserve_reached && ['ready', 'active'].includes(account.status) ? t('status.reserveReached') : accountStatus(account)}</span><button class="icon-button" disabled={!!busy} onclick={() => refresh(account.id)} title={t('quotas.refreshAccount')} aria-label={t('quotas.refreshNamed', { name: privateLabel(account.name) })}><RefreshCw size={19}/></button></div>
 						</article>
 					{/each}
 				</div>
@@ -90,7 +93,7 @@
 	/* Desktop stacked tabs wrap rather than hide behind a scrollbar a mouse cannot reach; phones keep the swipe strip. */
 	@media(min-width:781px) { .quota-toolbar.stacked .provider-tabs { flex-wrap: wrap; overflow: visible; } }
 	/* A phone gives an open search its own row instead of squeezing it beside the title and sort. */
-	@media(max-width:780px) { .quota-toolbar.stacked.searching .quota-filters { grid-column: 1/-1; grid-row: 2; margin-left: 0; width: 100%; }.quota-toolbar.stacked.searching .search-input { flex-grow: 1; }.quota-toolbar.stacked.searching .provider-tabs { grid-row: 3; } }
+	@media(max-width:780px) { .quota-toolbar.filters-row .quota-filters { grid-column: 1/-1; grid-row: 2; margin-left: 0; width: 100%; }.quota-toolbar.filters-row .search-input { flex-grow: 1; }.quota-toolbar.filters-row .provider-tabs { grid-row: 3; } }
 	.quota-filters { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-shrink: 0; min-width: 0; margin-left: auto; }
 	/* Search stays an icon until it is used, so the provider tabs keep the line. */
 	/* A flex basis rather than a width lets an open search shrink inside a narrow (phone) toolbar. */
@@ -98,6 +101,7 @@
 	.quota-filters .search-input:focus-within, .quota-filters .search-input.filled { flex-basis: 220px; }
 	.quota-filters .search-input input { min-width: 0; }
 	.quota-filters .search-input :global(svg) { flex-shrink: 0; }
+	.quota-filters .refresh-button { flex-shrink: 0; width: 40px; min-height: 40px; height: 40px; padding: 0; }
 	.quota-filters select { flex-shrink: 0; width: 140px; background: var(--surface); }
 	.quota-filters select, .quota-filters .search-input { height: 40px; min-height: 40px; border-radius: 10px; font-size: 14px; }
 	.quota-filters input { font-size: 14px; }

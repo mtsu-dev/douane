@@ -21,7 +21,7 @@ function page(options = {}) {
   return render(View, { props: {
     accounts: [{ id: 'a', provider: 'claude', name: 'A', status: 'ready', enabled }, { id: 'b', provider: 'codex', name: 'B', status: 'ready', enabled }],
     quotas: ['a', 'b'].map(account_id => ({ account_id, updated_at: '2026-10-30T12:00:00Z', credits, windows: [{ id: 'weekly', label: 'Weekly', remaining_percent: current, reset_at: known ? '2026-10-31T12:00:00Z' : null }] })),
-    busy: '', settings: { show_provider_pace: pace }, resetUpdated() {}, manageAccounts() {}
+    busy: '', settings: { show_provider_pace: pace }, resetUpdated() {}, manageAccounts() {}, refresh() {}
   } }).body;
 }
 const tags = (body, role) => [...body.matchAll(new RegExp(`<[^>]+role="${role}"[^>]*>`, 'g'))].map(([tag]) => tag);
@@ -35,7 +35,15 @@ test('provider pace is hidden unless enabled in settings', () => {
 
 test('quotas only display data and resets; account management lives elsewhere', () => {
   const body = page();
-  assert.doesNotMatch(body, /Connect an account|In Boite \/ clients|Rename account|Refresh quotas|Refresh A|Windows<\/button>/);
+  assert.doesNotMatch(body, /Connect an account|In Boite \/ clients|Rename account|Windows<\/button>/);
+});
+
+test('quotas can be refreshed from the quotas page, all at once or per account', () => {
+  const body = page();
+  // PR46 dropped both buttons from this page, leaving refresh only on Accounts.
+  assert.match(body, /aria-label="Refresh quotas"/);
+  assert.match(body, /aria-label="Refresh A"/);
+  assert.match(body, /aria-label="Refresh B"/);
 });
 
 test('reset requires an explicit typed confirmation before its submit button is enabled', () => {
@@ -74,6 +82,9 @@ test('the toolbar search overrides the mobile minimum and tabs are re-measured w
   assert.match(source, /\.quota-filters \.search-input \{[^}]*min-width: 40px/);
   // A late web font widens the tabs without resizing the toolbar, so the stacking decision must observe the tabs themselves.
   assert.match(source, /new ResizeObserver\(\(\) => tabsVersion\+\+\)/);
+  // At 320px the collapsed search, sort and refresh need 212px beside a 157px cell: the search slid under the title.
+  assert.match(source, /titleWidth \+ filtersNeed \+ 16 > toolbarWidth/);
+  assert.match(source, /class:filters-row=\{filtersRow\}/);
 });
 
 test('extra usage is hidden when it is off or reports nothing', () => {
