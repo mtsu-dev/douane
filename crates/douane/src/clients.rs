@@ -5,11 +5,12 @@
 //! douane refuses every call until one is created. A share is a percentage of each
 //! account-wide window (five hours, day, week, month) of every account in a
 //! pool. Unused shares stay reserved for their holders until the last seventh
-//! of the window, when anyone may use them; what no share covers is common.
+//! of longer windows, when anyone may use them; what no share covers is common.
+//! Five-hour shares are always hard caps and keep their reservations until reset.
 //! Account shares override pool shares. When authorized holders promise more
 //! than 100%, unused quota is common and each holder has its own usage cap.
 //! In the hours before an account's weekly reset (`free_before_reset_hours`),
-//! shares hold no one back.
+//! only longer-window shares stop holding callers back.
 //!
 //! Usage is attributed, not read: each rise of a window's utilization goes to
 //! the clients whose calls ended on that account since the previous reading,
@@ -144,8 +145,8 @@ pub struct WindowUsage {
 #[derive(Default)]
 struct Usage {
     windows: Vec<WindowUsage>,
-    /// Token weight of calls ended since the last rise, by account then client.
-    pending: BTreeMap<String, BTreeMap<String, f64>>,
+    /// Token weight since each window's last rise, by (account, kind) then client.
+    pending: BTreeMap<(String, &'static str), BTreeMap<String, f64>>,
     /// Calls running, by account then client.
     running: BTreeMap<String, BTreeMap<String, u32>>,
     dirty: bool,
@@ -529,12 +530,14 @@ impl Clients {
             }
         }
         if weight > 0.0 && weight.is_finite() {
-            *usage
-                .pending
-                .entry(account.to_owned())
-                .or_default()
-                .entry(client.to_owned())
-                .or_default() += weight;
+            for kind in ["five-hour", "daily", "weekly", "monthly"] {
+                *usage
+                    .pending
+                    .entry((account.to_owned(), kind))
+                    .or_default()
+                    .entry(client.to_owned())
+                    .or_default() += weight;
+            }
         }
     }
 
@@ -547,19 +550,13 @@ impl Clients {
         let account = snapshot.account_id.as_str();
         let mut usage = self.usage();
         let usage = &mut *usage;
-        let weights: Vec<(String, f64)> = match usage.pending.get(account) {
-            Some(pending) if !pending.is_empty() => {
-                pending.iter().map(|(c, w)| (c.clone(), *w)).collect()
-            }
-            _ => usage
-                .running
-                .get(account)
-                .map(|r| r.iter().map(|(c, n)| (c.clone(), *n as f64)).collect())
-                .unwrap_or_default(),
-        };
-        let total: f64 = weights.iter().map(|(_, w)| w).sum();
-        let mut rose = false;
+        let running: Vec<(String, f64)> = usage
+            .running
+            .get(account)
+            .map(|r| r.iter().map(|(c, n)| (c.clone(), *n as f64)).collect())
+            .unwrap_or_default();
         for reading in readings {
+            let key = (account.to_owned(), reading.kind);
             let position = usage
                 .windows
                 .iter()
@@ -583,9 +580,12 @@ impl Clients {
             // A later reset, or usage falling by more than sources disagree
             // (usage reads and inference headers round differently), is a
             // new window.
-            if reading.reset > window.reset + RESET_TOLERANCE
-                || reading.used + NEW_WINDOW_DROP < window.used
-            {
+            let new_window = reading.reset > window.reset + RESET_TOLERANCE
+                || reading.used + NEW_WINDOW_DROP < window.used;
+            if new_window {
+                // Old completions cannot charge a fresh budget. Other windows
+                // retain their weights until their own rise or reset.
+                usage.pending.remove(&key);
                 window.reset = reading.reset;
                 window.used = 0.0;
                 window.clients.clear();
@@ -598,7 +598,11 @@ impl Clients {
             if delta <= 1e-9 {
                 continue;
             }
-            rose = true;
+            let weights: Vec<(String, f64)> = match usage.pending.remove(&key) {
+                Some(pending) if !pending.is_empty() => pending.into_iter().collect(),
+                _ => running.clone(),
+            };
+            let total: f64 = weights.iter().map(|(_, w)| w).sum();
             if total > 0.0 {
                 for (client, weight) in &weights {
                     *window.clients.entry(client.clone()).or_default() += delta * weight / total;
@@ -608,9 +612,6 @@ impl Clients {
             }
             window.used = reading.used;
             usage.dirty = true;
-        }
-        if rose {
-            usage.pending.remove(account);
         }
         // Windows that ended a day ago have nothing left to tell.
         let before = usage.windows.len();
@@ -623,7 +624,7 @@ impl Clients {
         let mut usage = self.usage();
         let before = usage.windows.len();
         usage.windows.retain(|w| existing.contains(&w.account_id));
-        usage.pending.retain(|id, _| existing.contains(id));
+        usage.pending.retain(|(id, _), _| existing.contains(id));
         usage.dirty |= usage.windows.len() != before;
     }
 
@@ -685,19 +686,19 @@ impl Clients {
         };
         let mine = used_by(me);
         let physical = (100.0 - reading.used).max(0.0);
-        if holders.iter().map(|(_, s)| s).sum::<f64>() > 100.0 + 1e-9 {
-            let cap = holders
+        let overbooked = holders.iter().map(|(_, s)| s).sum::<f64>() > 100.0 + 1e-9;
+        let cap = if reading.kind == "five-hour" || overbooked {
+            holders
                 .iter()
                 .find(|(id, _)| id == me)
-                .map(|(_, s)| (s - mine).max(0.0));
-            return (
-                mine,
-                cap.map_or(physical, |c| physical.min(c)),
-                cap.is_some_and(|c| c <= 1e-9),
-            );
-        }
+                .map(|(_, s)| (s - mine).max(0.0))
+        } else {
+            None
+        };
         let length = window_seconds(reading.kind).unwrap_or(0.0);
-        let free = if (reading.reset - now) as f64 <= length / 7.0 {
+        let free = if overbooked
+            || (reading.kind != "five-hour" && (reading.reset - now) as f64 <= length / 7.0)
+        {
             0.0
         } else {
             holders
@@ -706,17 +707,18 @@ impl Clients {
                 .map(|(id, share)| (share - used_by(id)).max(0.0))
                 .sum()
         };
+        let remaining = (physical - free).max(0.0);
         (
             mine,
-            (physical - free).max(0.0),
-            free > 0.0 && physical <= free + 1e-9,
+            cap.map_or(remaining, |c| remaining.min(c)),
+            cap.is_some_and(|c| c <= 1e-9) || (free > 0.0 && physical <= free + 1e-9),
         )
     }
 
     /// The reset of the window where reservations or an overbooked holder's
     /// own cap forbid another call; `None` when shares allow it.
     /// Within `free_before` seconds of the account's weekly reset, shares
-    /// no longer hold anyone back.
+    /// no longer hold anyone back on longer windows. Five-hour limits stay enforced.
     pub fn share_blocks(
         &self,
         client: Option<&Client>,
@@ -727,13 +729,15 @@ impl Clients {
     ) -> Option<i64> {
         let snapshot = snapshot?;
         let holders = self.holders(account.pool(), &account.id);
-        if holders.is_empty() || snapshot.longest_window_ends_within(free_before, now) {
+        if holders.is_empty() {
             return None;
         }
+        let weekly_free = snapshot.longest_window_ends_within(free_before, now);
         let me = client.map(|c| c.id.as_str()).unwrap_or("");
         readings(snapshot)
             .into_iter()
             .filter(|r| r.reset > now)
+            .filter(|r| !weekly_free || r.kind == "five-hour")
             .find(|reading| self.budget(&holders, me, &account.id, reading, now).2)
             .map(|r| r.reset)
     }
@@ -742,8 +746,8 @@ impl Clients {
     /// account-wide window shows the part of what it may use that it has
     /// used, so a bar at 100% means it is held back. A client without a share
     /// sees the account's whole quota, other shares included.
-    /// Windows of an account whose shares are freed before its weekly reset
-    /// stay as they are.
+    /// Longer windows whose shares are freed before the weekly reset stay raw.
+    /// Five-hour windows always show the client's capped budget.
     pub fn client_view(
         &self,
         client: &Client,
@@ -752,11 +756,10 @@ impl Clients {
         now: i64,
         free_before: i64,
     ) -> QuotaSnapshot {
-        if client.share_for(pool, &snapshot.account_id).is_none()
-            || snapshot.longest_window_ends_within(free_before, now)
-        {
+        if client.share_for(pool, &snapshot.account_id).is_none() {
             return snapshot;
         }
+        let weekly_free = snapshot.longest_window_ends_within(free_before, now);
         let holders = self.holders(pool, &snapshot.account_id);
         let account = snapshot.account_id.clone();
         let readings = readings(&snapshot);
@@ -767,7 +770,7 @@ impl Clients {
             let Some(reading) = readings.iter().find(|r| r.kind == kind) else {
                 continue;
             };
-            if reading.reset <= now {
+            if reading.reset <= now || (weekly_free && reading.kind != "five-hour") {
                 continue;
             }
             let (mine, remaining, _) = self.budget(&holders, &client.id, &account, reading, now);
@@ -1306,12 +1309,12 @@ mod tests {
         clients.observe(&snapshot("a", 24.0, reset), NOW);
         clients.observe(&snapshot("a", 25.0, reset), NOW);
         assert!((clients.usage_report(NOW)[0].clients["perso"] - 8.0).abs() < 1e-9);
-        // A new window starts from zero.
+        // A new window starts from zero and drops the old completions.
         clients.call_ended("a", Some("perso"), 10.0);
         clients.observe(&snapshot("a", 2.0, reset + 7 * 86_400), NOW);
         let window = &clients.usage_report(NOW)[0];
-        assert_eq!(window.clients.len(), 1);
-        assert!((window.clients["perso"] - 2.0).abs() < 1e-9);
+        assert!(window.clients.is_empty());
+        assert_eq!(window.outside, 2.0);
     }
 
     #[test]
@@ -1373,6 +1376,234 @@ mod tests {
     }
 
     #[test]
+    fn five_hour_caps_survive_common_quota_and_both_release_periods() {
+        for overbooked in [false, true] {
+            for five_hour_left in [2 * 3600, 15 * 60] {
+                for weekly_free in [false, true] {
+                    let (_dir, clients) = clients();
+                    let mut holders = vec![];
+                    for (name, share) in [
+                        ("main", 90.0),
+                        ("other", if overbooked { 15.0 } else { 4.0 }),
+                        ("third", 4.0),
+                    ] {
+                        holders.push(
+                            clients
+                                .create(ClientPatch {
+                                    name: Some(name.into()),
+                                    account_shares: Some([("a".into(), share)].into()),
+                                    ..Default::default()
+                                })
+                                .unwrap()
+                                .0,
+                        );
+                    }
+                    let main = &holders[0];
+                    let reset = NOW + five_hour_left;
+                    let weekly_reset = NOW + if weekly_free { 3600 } else { 3 * 86_400 };
+                    let quota = |used| {
+                        let mut q = snapshot("a", 20.0, weekly_reset);
+                        let mut short = snapshot("a", used, reset).windows.remove(0);
+                        short.id = "five-hour".into();
+                        q.windows.push(short);
+                        q
+                    };
+                    clients.observe(&quota(0.0), NOW);
+                    clients.call_ended("a", Some(&main.id), 1.0);
+                    clients.observe(&quota(89.0), NOW);
+                    let view = clients.client_view(main, quota(89.0), "claude", NOW, 8 * 3600);
+                    assert!(
+                        (view.windows[1].remaining_percent.unwrap() - 100.0 / 90.0).abs() < 1e-9
+                    );
+                    assert_eq!(
+                        clients.share_blocks(
+                            Some(main),
+                            &account("a"),
+                            Some(&quota(89.0)),
+                            NOW,
+                            8 * 3600
+                        ),
+                        None
+                    );
+                    clients.call_ended("a", Some(&main.id), 1.0);
+                    clients.observe(&quota(90.0), NOW);
+                    assert_eq!(
+                        clients.share_blocks(
+                            Some(main),
+                            &account("a"),
+                            Some(&quota(90.0)),
+                            NOW,
+                            8 * 3600
+                        ),
+                        Some(reset)
+                    );
+                    let view = clients.client_view(main, quota(90.0), "claude", NOW, 8 * 3600);
+                    assert_eq!(view.windows[1].remaining_percent, Some(0.0));
+                    if weekly_free {
+                        assert_eq!(view.windows[0].remaining_percent, Some(80.0));
+                    }
+                    let mut fresh = quota(0.0);
+                    fresh.windows[1].reset_at = snapshot("a", 0.0, reset + 18_000)
+                        .windows
+                        .remove(0)
+                        .reset_at;
+                    clients.observe(&fresh, NOW);
+                    assert_eq!(
+                        clients.share_blocks(
+                            Some(main),
+                            &account("a"),
+                            Some(&fresh),
+                            NOW,
+                            8 * 3600
+                        ),
+                        None
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn five_hour_reservations_still_protect_other_clients_near_resets() {
+        let (_dir, clients) = clients();
+        clients
+            .create(ClientPatch {
+                name: Some("holder".into()),
+                shares: Some([("claude".into(), 90.0)].into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let (unshared, _) = clients.create(named("unshared")).unwrap();
+        let mut quota = snapshot("a", 20.0, NOW + 3600);
+        let reset = NOW + 15 * 60;
+        let mut short = snapshot("a", 10.0, reset).windows.remove(0);
+        short.id = "five-hour".into();
+        quota.windows.push(short);
+        clients.observe(&quota, NOW);
+        assert_eq!(
+            clients.share_blocks(Some(&unshared), &account("a"), Some(&quota), NOW, 8 * 3600),
+            Some(reset)
+        );
+    }
+
+    #[test]
+    fn old_pending_calls_cannot_spend_another_clients_new_five_hour_window() {
+        for first_used in [0.0, 10.0] {
+            for running in [false, true] {
+                let (_dir, clients) = clients();
+                let mut holders = vec![];
+                for share in [10.0, 20.0] {
+                    holders.push(
+                        clients
+                            .create(ClientPatch {
+                                name: Some(format!("holder {share}")),
+                                shares: Some([("claude".into(), share)].into()),
+                                ..Default::default()
+                            })
+                            .unwrap()
+                            .0,
+                    );
+                }
+                let old = &holders[0];
+                let next = &holders[1];
+                let quota = |used, reset| {
+                    let mut q = snapshot("a", 20.0, NOW + 3 * 86_400);
+                    let mut short = snapshot("a", used, reset).windows.remove(0);
+                    short.id = "five-hour".into();
+                    q.windows.push(short);
+                    q
+                };
+                clients.observe(&quota(9.0, NOW + 60), NOW);
+                clients.call_ended("a", Some(&old.id), 300.0);
+                if running {
+                    clients.call_started("a", Some(&next.id));
+                }
+                let reset = NOW + 18_060;
+                clients.observe(&quota(first_used, reset), NOW + 61);
+                clients.observe(&quota(10.0, reset), NOW + 62);
+                let usage = clients.usage_report(NOW + 62);
+                let short = usage.iter().find(|w| w.kind == "five-hour").unwrap();
+                assert_eq!(short.clients.get(&old.id).copied().unwrap_or(0.0), 0.0);
+                assert_eq!(
+                    short.clients.get(&next.id).copied().unwrap_or(0.0),
+                    if running { 10.0 } else { 0.0 }
+                );
+                assert_eq!(short.outside, if running { 0.0 } else { 10.0 });
+                assert_eq!(
+                    clients.share_blocks(
+                        Some(old),
+                        &account("a"),
+                        Some(&quota(10.0, reset)),
+                        NOW + 62,
+                        0
+                    ),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn five_hour_resets_preserve_completions_for_a_delayed_weekly_rise() {
+        for first_used in [0.0, 10.0] {
+            for short_first in [false, true] {
+                let (_dir, clients) = clients();
+                let quota = |short_used, weekly_used, reset| {
+                    let mut q = snapshot("a", weekly_used, NOW + 3 * 86_400);
+                    let mut short = snapshot("a", short_used, reset).windows.remove(0);
+                    short.id = "five-hour".into();
+                    q.windows.push(short);
+                    if short_first {
+                        q.windows.reverse();
+                    }
+                    q
+                };
+                clients.observe(&quota(9.0, 20.0, NOW + 60), NOW);
+                clients.call_ended("a", Some("old"), 300.0);
+                let reset = NOW + 18_060;
+                clients.observe(&quota(first_used, 20.0, reset), NOW + 61);
+                clients.call_ended("a", Some("next"), 100.0);
+                clients.observe(&quota(first_used + 10.0, 20.0, reset), NOW + 62);
+                clients.observe(&quota(first_used + 10.0, 24.0, reset), NOW + 63);
+                let usage = clients.usage_report(NOW + 63);
+                let weekly = usage.iter().find(|w| w.kind == "weekly").unwrap();
+                assert_eq!(weekly.clients.get("old").copied().unwrap_or(0.0), 3.0);
+                assert_eq!(weekly.clients.get("next").copied().unwrap_or(0.0), 1.0);
+                assert_eq!(weekly.outside, 0.0);
+                let short = usage.iter().find(|w| w.kind == "five-hour").unwrap();
+                assert_eq!(short.clients.get("old").copied().unwrap_or(0.0), 0.0);
+                assert_eq!(short.clients["next"], 10.0);
+                assert_eq!(short.outside, first_used);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_completions_do_not_cross_longer_window_resets() {
+        for kind in ["daily", "weekly", "monthly"] {
+            for first_used in [0.0, 2.0] {
+                let (_dir, clients) = clients();
+                let quota = |used, reset| {
+                    let mut q = snapshot("a", used, reset);
+                    q.windows[0].id = kind.into();
+                    q
+                };
+                clients.observe(&quota(20.0, NOW + 60), NOW);
+                clients.call_ended("a", Some("old"), 300.0);
+                let reset = NOW + 3 * 86_400;
+                clients.observe(&quota(first_used, reset), NOW + 61);
+                clients.call_ended("a", Some("next"), 100.0);
+                clients.observe(&quota(first_used + 4.0, reset), NOW + 62);
+                let usage = clients.usage_report(NOW + 62);
+                let window = &usage[0];
+                assert_eq!(window.clients.get("old").copied().unwrap_or(0.0), 0.0);
+                assert_eq!(window.clients["next"], 4.0);
+                assert_eq!(window.outside, first_used);
+            }
+        }
+    }
+
+    #[test]
     fn shares_stop_holding_back_hours_before_the_weekly_reset() {
         let (_dir, clients) = clients();
         let (famille, _) = clients
@@ -1414,10 +1645,10 @@ mod tests {
             clients.share_blocks(Some(&perso), &a, Some(&full), NOW, 4 * 3600),
             Some(five)
         );
-        // Six hours before the weekly reset, nothing is held back any more.
+        // Weekly release never removes the five-hour reservation.
         assert_eq!(
             clients.share_blocks(Some(&perso), &a, Some(&full), NOW, 6 * 3600),
-            None
+            Some(five)
         );
         let view = |free_before: i64| {
             clients
@@ -1426,7 +1657,7 @@ mod tests {
                 .remaining_percent
         };
         assert_eq!(view(0), Some(100.0));
-        assert_eq!(view(6 * 3600), Some(25.0));
+        assert_eq!(view(6 * 3600), Some(100.0));
     }
 
     #[test]
