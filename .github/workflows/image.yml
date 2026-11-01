@@ -50,7 +50,7 @@ jobs:
           # Written from main only, like the Rust cache in ci.yml.
           cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,scope=image-{0},mode=max', matrix.arch) || '' }}
       - run: bash docker/smoke.sh douane:test
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         if: inputs.tags != ''
         with:
           registry: ghcr.io
@@ -91,7 +91,7 @@ jobs:
           path: digests
           merge-multiple: true
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
