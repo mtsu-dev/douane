@@ -21,7 +21,7 @@ RUN cargo build --release --locked --bin douane --bin douanectl \
     && cp target/release/douane target/release/douanectl /out/
 
 # glibc, libgcc and CA certificates, no shell, uid 65532.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:e792ab3d241a468a4fd7519ddbbebe66b49b5f365771716ea688ad40b6c6f1c2
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:b7e81cb1af38d9345680e68bcf564d388f96304e25222030fc8c051faf8565b3
 COPY --from=build /out/douane /out/douanectl /usr/local/bin/
 COPY --from=build --chown=65532:65532 /out/data /data
 COPY LICENSE /usr/share/doc/douane/LICENSE
