@@ -45,11 +45,25 @@ pub struct Settings {
     /// window is a month) when its reserve and client shares stop applying,
     /// so what is left gets used. 0 keeps them to the end.
     pub free_before_reset_hours: u32,
+    /// When the unused part of client shares becomes common on day, week and
+    /// month windows. Five-hour shares always keep their reservations.
+    pub share_release: ShareRelease,
     /// Memory for Antigravity's signed Gemini history, every conversation
     /// together. A conversation squeezed out replays without its native parts.
     pub antigravity_replay_mib: u32,
     /// Minutes an idle conversation keeps its signed Gemini history.
     pub antigravity_replay_idle_minutes: u32,
+}
+
+/// When a share nobody uses stops being reserved for its holder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShareRelease {
+    /// From the last seventh of each longer window (the last day of a week).
+    #[default]
+    LastSeventh,
+    /// Only within `free_before_reset_hours` of the account's weekly reset.
+    BeforeReset,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +116,7 @@ impl Default for Settings {
             quota_windows: BTreeMap::new(),
             show_provider_pace: false,
             free_before_reset_hours: 6,
+            share_release: ShareRelease::default(),
             antigravity_replay_mib: 64,
             antigravity_replay_idle_minutes: 60,
         }
@@ -214,6 +229,14 @@ impl Settings {
         i64::from(self.free_before_reset_hours) * 3600
     }
 
+    /// When client shares stop holding callers back, for [`crate::clients::Clients`].
+    pub fn release(&self) -> crate::clients::Release {
+        crate::clients::Release {
+            before_reset: self.free_before_reset_seconds(),
+            last_seventh: self.share_release == ShareRelease::LastSeventh,
+        }
+    }
+
     pub fn quota_windows(
         &self,
         provider: crate::subscriptions::SubscriptionProvider,
@@ -253,5 +276,31 @@ impl Config {
         tokio::fs::write(&temporary, data).await?;
         tokio::fs::rename(&temporary, path).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn share_release_reads_both_choices_and_defaults_to_the_last_seventh() {
+        let settings: Settings = toml::from_str("free_before_reset_hours = 6").unwrap();
+        assert_eq!(settings.share_release, ShareRelease::LastSeventh);
+        assert!(settings.release().last_seventh);
+        let toml = "free_before_reset_hours = 4\nshare_release = \"before-reset\"";
+        let settings: Settings = toml::from_str(toml).unwrap();
+        assert_eq!(
+            settings.release(),
+            crate::clients::Release {
+                before_reset: 4 * 3600,
+                last_seventh: false
+            }
+        );
+        assert!(toml::from_str::<Settings>("share_release = \"never\"").is_err());
+        assert_eq!(
+            serde_json::to_value(ShareRelease::BeforeReset).unwrap(),
+            serde_json::json!("before-reset")
+        );
     }
 }
