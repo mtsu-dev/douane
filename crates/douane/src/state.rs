@@ -806,7 +806,7 @@ impl AppState {
                         &a,
                         quota.as_ref(),
                         now.unix_timestamp(),
-                        free_before,
+                        config.settings.release(),
                     ) {
                         if held_back.as_ref().is_none_or(|(_, r)| reset < *r) {
                             held_back = Some((pool.to_owned(), reset));
@@ -964,7 +964,7 @@ impl AppState {
         if client.is_some_and(|c| !c.access.allows(account)) {
             return true;
         }
-        let free_before = self.free_before_reset_seconds().await;
+        let release = self.config.read().await.settings.release();
         let snapshot = self.quotas.get(&account.id).await;
         self.clients
             .share_blocks(
@@ -972,7 +972,7 @@ impl AppState {
                 account,
                 snapshot.as_ref(),
                 time::OffsetDateTime::now_utc().unix_timestamp(),
-                free_before,
+                release,
             )
             .is_some()
     }

@@ -930,7 +930,7 @@ pub async fn public_quotas(
                     snapshot,
                     pool,
                     now,
-                    settings.free_before_reset_seconds(),
+                    settings.release(),
                 ))
             })
             .collect();

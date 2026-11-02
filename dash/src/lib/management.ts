@@ -44,7 +44,9 @@ export type ClientSaved = { client: Client; key: string | null };
 export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'smart';
 export type QuotaDisplay = 'accounts' | 'average';
 export type QuotaWindowChoice = { hidden?: string[]; primary?: string | null };
-export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy>; quota_display?: Record<string, QuotaDisplay>; quota_windows?: Record<string, QuotaWindowChoice>; show_provider_pace?: boolean; free_before_reset_hours?: number };
+export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy>; quota_display?: Record<string, QuotaDisplay>; quota_windows?: Record<string, QuotaWindowChoice>; show_provider_pace?: boolean; free_before_reset_hours?: number; share_release?: ShareRelease };
+/** When unused client shares stop being reserved: the last seventh of a window, or only `free_before_reset_hours` before the weekly reset. */
+export type ShareRelease = 'last-seventh' | 'before-reset';
 export type OAuthSession = { id: string; provider: string; url: string; state: string; redirect_uri: string; expires_at: string; status: string; account_id?: string | null; error?: string | null; user_code?: string | null; interval?: number | null; error_code?: string | null; verification_required?: boolean; verification_available?: boolean };
 export type OAuthStatus = Partial<OAuthSession> & { status: string; account?: Account };
 export type ImportError = string | { name?: string | null; error: string };

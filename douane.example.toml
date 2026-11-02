@@ -15,6 +15,10 @@ request_timeout_seconds = 180
 # Hours before an account's weekly reset when its reserve and client shares stop
 # applying, so what is left gets used. 0 keeps them to the end.
 free_before_reset_hours = 6
+# When a client's unused share becomes common on day, week and month windows:
+# "last-seventh" (the last day of a week) or "before-reset" (only within
+# free_before_reset_hours). Five-hour shares always stay reserved.
+share_release = "last-seventh"
 # Memory for Antigravity's signed Gemini history, every conversation together,
 # and how long an idle conversation keeps it. 64 MiB holds ten parallel agents
 # of 150 heavy tool steps each with room to spare. A conversation squeezed out
