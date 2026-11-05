@@ -925,13 +925,11 @@ pub async fn public_quotas(
                     .route
                     .as_deref()
                     .unwrap_or(account.provider.as_str());
-                Some(state.clients.client_view(
-                    client,
-                    snapshot,
-                    pool,
-                    now,
-                    settings.release(),
-                ))
+                Some(
+                    state
+                        .clients
+                        .client_view(client, snapshot, pool, now, settings.release()),
+                )
             })
             .collect();
     }
@@ -963,6 +961,55 @@ const MAX_STATS_HOURS: u32 = 90 * 24;
 
 /// What each client spent over the last `hours` (24 by default): totals by
 /// provider and model, and calls and tokens by UTC hour.
+#[derive(Deserialize)]
+pub struct HistoryRange {
+    from: Option<String>,
+    to: Option<String>,
+}
+
+/// Stored quota readings for the pool chart, by account window. The range
+/// defaults to the last two weeks and spans at most the retention period.
+pub async fn quota_history(
+    State(state): State<Arc<AppState>>,
+    Query(range): Query<HistoryRange>,
+) -> Response {
+    let parse = |value: &Option<String>| match value.as_deref() {
+        None => Ok(None),
+        Some(value) => crate::subscriptions::parse_timestamp(value)
+            .map(|t| Some(t.unix_timestamp()))
+            .ok_or(()),
+    };
+    let (Ok(from), Ok(to)) = (parse(&range.from), parse(&range.to)) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "from and to must be RFC 3339 times",
+        );
+    };
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let to = to.unwrap_or(now);
+    let from = from.unwrap_or(to - 14 * 86400);
+    if from > to || to - from > crate::quota_history::RETENTION_DAYS * 86400 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "the range must end after it starts and span at most 45 days",
+        );
+    }
+    let accounts: std::collections::BTreeSet<String> = state
+        .accounts
+        .list()
+        .await
+        .into_iter()
+        .map(|account| account.id)
+        .collect();
+    let samples = state.ledger.quota_history(from, to).await;
+    // A deleted account's readings stay until they age out, but are not shown.
+    let samples = samples
+        .into_iter()
+        .filter(|sample| accounts.contains(&sample.account_id))
+        .collect();
+    Json(crate::quota_history::series(samples)).into_response()
+}
+
 pub async fn client_stats(
     State(state): State<Arc<AppState>>,
     Query(period): Query<StatsPeriod>,

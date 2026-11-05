@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         loop {
             pass += 1;
             poller.refresh_due_quotas().await;
+            poller.sample_quotas().await;
             if pass.is_multiple_of(20) {
                 poller.quotas.save().await;
             }
@@ -68,6 +69,10 @@ async fn main() -> Result<()> {
             // adds or retires shows without a restart; a live model listing
             // that failed is read again every minute.
             if pass.is_multiple_of(240) {
+                let retention = douane::quota_history::RETENTION_DAYS * 86400;
+                poller
+                    .ledger
+                    .prune_samples(time::OffsetDateTime::now_utc().unix_timestamp() - retention);
                 poller.refresh_models().await;
             } else if pass.is_multiple_of(4) {
                 for pool in poller.stale_pools() {

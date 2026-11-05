@@ -41,6 +41,10 @@ pub struct Settings {
     pub quota_windows: BTreeMap<String, QuotaWindows>,
     /// Show the optional provider consumption pace on the dashboard.
     pub show_provider_pace: bool,
+    /// How much each plan counts in the dashboard's pool and pace, by
+    /// provider then subscription id (`claude.ultra = 10`). A plan left out
+    /// counts its provider-reported multiplier, else 1.
+    pub plan_weights: BTreeMap<String, BTreeMap<String, f64>>,
     /// Hours before an account's weekly reset (monthly when its longest
     /// window is a month) when its reserve and client shares stop applying,
     /// so what is left gets used. 0 keeps them to the end.
@@ -115,6 +119,7 @@ impl Default for Settings {
             quota_display: BTreeMap::new(),
             quota_windows: BTreeMap::new(),
             show_provider_pace: false,
+            plan_weights: BTreeMap::new(),
             free_before_reset_hours: 6,
             share_release: ShareRelease::default(),
             antigravity_replay_mib: 64,
@@ -204,6 +209,21 @@ impl Settings {
             crate::subscriptions::SubscriptionProvider::parse(p).map(|p| p.as_str()) != Some(p)
         }) {
             bail!("unknown quota windows provider");
+        }
+        if self.plan_weights.keys().any(|p| {
+            crate::subscriptions::SubscriptionProvider::parse(p).map(|p| p.as_str()) != Some(p)
+        }) {
+            bail!("unknown plan weights provider");
+        }
+        if self.plan_weights.values().any(|plans| {
+            plans.len() > MAX_HIDDEN_WINDOWS
+                || plans.iter().any(|(plan, weight)| {
+                    !window_id(plan) || !weight.is_finite() || *weight <= 0.0 || *weight > 1000.0
+                })
+        }) {
+            bail!(
+                "plan weights take plan ids of 1 to {MAX_WINDOW_ID} characters and weights above 0, up to 1000"
+            );
         }
         if self.quota_windows.values().any(|choice| {
             choice.hidden.len() > MAX_HIDDEN_WINDOWS

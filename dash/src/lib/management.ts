@@ -20,6 +20,10 @@ export type QuotaWindow = { id: string; label: string; remaining_percent: number
 export type Subscription = { id: string; label: string; multiplier?: number | null; source: string };
 export type CreditUsage = { id: string; label: string; used?: number | null; limit?: number | null; remaining?: number | null; unit: string; reset_at?: string | null; unlimited?: boolean | null; enabled?: boolean | null };
 export type Quota = { account_id: string; windows: QuotaWindow[]; subscription?: Subscription | null; credits?: CreditUsage[]; updated_at?: string | null; error?: string | null; verification_required?: boolean; verification_available?: boolean };
+/** `[unix seconds, remaining percent, reset unix seconds or null]`, ascending. */
+export type HistoryPoint = [number, number, number | null];
+export type HistorySeries = { account_id: string; window_id: string; points: HistoryPoint[] };
+export type QuotaHistory = { series: HistorySeries[] };
 export type ResetAvailability = { account_id: string; provider: string; status: 'ready' | 'unsupported' | 'unavailable' | 'ineligible' | 'disabled'; available_count: number | null; next_expires_at: string | null; pending_request_id?: string | null; error: string | null };
 export type ResetResult = { request_id: string; outcome: 'reset' | 'nothing_to_reset' | 'no_credit' | 'already_redeemed' };
 export type Model = { id: string; provider: string; name?: string; context_length?: number | null; enabled?: boolean; route?: string | null };
@@ -44,7 +48,9 @@ export type ClientSaved = { client: Client; key: string | null };
 export type Strategy = 'round-robin' | 'fill-first' | 'reset-first' | 'smart';
 export type QuotaDisplay = 'accounts' | 'average';
 export type QuotaWindowChoice = { hidden?: string[]; primary?: string | null };
-export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy>; quota_display?: Record<string, QuotaDisplay>; quota_windows?: Record<string, QuotaWindowChoice>; show_provider_pace?: boolean; free_before_reset_hours?: number; share_release?: ShareRelease };
+export type Settings = { strategy: Strategy; quota_refresh_seconds: number; request_timeout_seconds: number; default_provider: string | null; provider_strategies?: Record<string, Strategy>; quota_display?: Record<string, QuotaDisplay>; quota_windows?: Record<string, QuotaWindowChoice>; show_provider_pace?: boolean; free_before_reset_hours?: number; share_release?: ShareRelease; plan_weights?: PlanWeights };
+/** Pool weight per provider id, then per subscription id, in (0, 1000]; absent means the plan multiplier or 1. */
+export type PlanWeights = Record<string, Record<string, number>>;
 /** When unused client shares stop being reserved: the last seventh of a window, or only `free_before_reset_hours` before the weekly reset. */
 export type ShareRelease = 'last-seventh' | 'before-reset';
 export type OAuthSession = { id: string; provider: string; url: string; state: string; redirect_uri: string; expires_at: string; status: string; account_id?: string | null; error?: string | null; user_code?: string | null; interval?: number | null; error_code?: string | null; verification_required?: boolean; verification_available?: boolean };
@@ -80,6 +86,8 @@ export const management = {
 	providers: () => request<{ providers: Provider[] }>('/providers'),
 	accounts: () => request<{ accounts: Account[] }>('/accounts'),
 	quotas: () => request<{ quotas: Quota[] }>('/quotas'),
+	/** Recorded remaining quota between two RFC 3339 instants (45 days at most); `to` defaults to now. */
+	quotaHistory: (from: string, to?: string, signal?: AbortSignal) => request<QuotaHistory>(`/quotas/history?from=${encodeURIComponent(from)}${to ? `&to=${encodeURIComponent(to)}` : ''}`, { signal }),
 	models: () => request<ModelsReport>('/models'),
 	refreshModels: (pool?: string) => request<ModelsReport>(`/models/refresh${pool ? `?pool=${encodeURIComponent(pool)}` : ''}`, { method: 'POST' }),
 	setModelsEnabled: (ids: string[], enabled: boolean) => request('/models', { method: 'PATCH', body: JSON.stringify({ ids, enabled }) }),

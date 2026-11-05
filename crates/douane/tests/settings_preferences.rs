@@ -42,3 +42,54 @@ async fn provider_pace_is_opt_in_and_persists_through_partial_settings_updates()
         }
     }
 }
+
+async fn patch(app: &axum::Router, body: Value) -> (u16, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/admin/api/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn plan_weights_persist_per_provider_plan_and_reject_nonsense() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("douane.toml");
+    let mut config = Config::default();
+    config.server.auth_dir = directory.path().join("auth");
+    config.server.database = directory.path().join("calls.sqlite");
+    let app = douane::router(AppState::new(config, Some(path.clone())).unwrap());
+    let (status, settings) = patch(
+        &app,
+        json!({"plan_weights":{"claude":{"ultra":10,"pro":1}}}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(settings["plan_weights"]["claude"]["ultra"], 10.0);
+    let saved = serde_json::to_value(Config::load(&path).unwrap().settings).unwrap();
+    assert_eq!(saved["plan_weights"]["claude"]["ultra"], 10.0);
+    for invalid in [
+        json!({"plan_weights":{"claude":{"ultra":0}}}),
+        json!({"plan_weights":{"claude":{"ultra":-2}}}),
+        json!({"plan_weights":{"claude":{"ultra":5000}}}),
+        json!({"plan_weights":{"nowhere":{"pro":1}}}),
+        json!({"plan_weights":{"claude":{"":1}}}),
+    ] {
+        assert_eq!(patch(&app, invalid.clone()).await.0, 400, "{invalid}");
+    }
+    let (_, settings) = patch(&app, json!({"quota_refresh_seconds":600})).await;
+    assert_eq!(settings["plan_weights"]["claude"]["pro"], 1.0);
+}

@@ -125,6 +125,8 @@ pub struct AppState {
     pub(crate) antigravity_replay: Mutex<crate::antigravity_replay::ReplayCache>,
     pub management_token: Option<String>,
     pub config_write: tokio::sync::Mutex<()>,
+    /// Which quota readings go to the pool chart history.
+    pub quota_sampler: crate::quota_history::Sampler,
     /// Last background quota refresh started for an account near its reserve.
     reserve_refresh: Mutex<BTreeMap<String, std::time::Instant>>,
     /// Models an account refused although a catalog lists them, by account
@@ -188,10 +190,17 @@ impl AppState {
             antigravity_replay: Mutex::new(antigravity_replay),
             management_token,
             config_write: tokio::sync::Mutex::new(()),
+            quota_sampler: Default::default(),
             reserve_refresh: Mutex::new(BTreeMap::new()),
             refused: Mutex::new(BTreeMap::new()),
             listed: Mutex::new(BTreeMap::new()),
         }))
+    }
+
+    /// Stores the quota readings that moved since the last pass.
+    pub async fn sample_quotas(&self) {
+        let due = self.quota_sampler.due(&self.quotas.list().await);
+        self.ledger.record_samples(due);
     }
 
     /// Apply the replay cache's limits from changed settings.

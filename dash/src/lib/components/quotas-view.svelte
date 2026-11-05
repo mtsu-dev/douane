@@ -1,5 +1,6 @@
 <script lang="ts">
-	import QuotaPace from './quota-pace.svelte';
+	import QuotaPool, { type FutureUsage, type PoolMode } from './quota-pool.svelte';
+	import PoolControls from './pool-controls.svelte';
 	import Search from '@lucide/svelte/icons/search';
 	import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 	import ProviderMark from './provider-mark.svelte';
@@ -7,7 +8,9 @@
 	import PrivateEmail from './private-email.svelte';
 	import AccountResets from './account-resets.svelte';
 	import EmptyState from './empty-state.svelte';
-	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type Provider } from '$lib/management';
+	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type Provider, type HistorySeries, management } from '$lib/management';
+	import { addDays, day, midnight } from '$lib/pool-format';
+	import { historyRequests } from '$lib/pool';
 	import { t } from '$lib/i18n.svelte';
 	let { accounts, quotas, providers = [], busy, refresh, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
 	const TOOLBAR_GAP = 20;
@@ -37,6 +40,37 @@
 	// The filters' own minimum (collapsed search, sort, refresh): beside the title they overflow it on the narrowest phones, so they then take their own row.
 	let filtersNeed = $derived.by(() => { void toolbarWidth; if (!filters) return 0; const items = [...filters.children] as HTMLElement[]; return items.reduce((sum, item) => sum + (item === searchLabel ? 40 : item.offsetWidth), 0) + (items.length - 1) * (parseFloat(getComputedStyle(filters).columnGap) || 0); });
 	let filtersRow = $derived(stacked && (searchFocused || !!search || titleWidth + filtersNeed + 16 > toolbarWidth));
+	// Pool chart: options, a 14-day range (4 days back) and the recorded history behind it.
+	let showPool = $derived(!!settings?.show_provider_pace);
+	let mode = $state<PoolMode>('remaining'), burnHours = $state(3), future = $state<FutureUsage>('same'), showAccounts = $state(false), offset = $state(0);
+	let now = $state(Date.now());
+	let rangeStart = $derived(addDays(midnight(now), -4 + 7 * offset));
+	let rangeEnd = $derived(addDays(rangeStart, 14));
+	let history = $state.raw<HistorySeries[]>([]), historyError = $state('');
+	$effect(() => { if (!showPool) return; const timer = setInterval(() => now = Date.now(), 60_000); return () => clearInterval(timer); });
+	// Refetch on mount, when the range moves and after each quota refresh (a new quotas list); a stale answer is aborted.
+	$effect(() => {
+		if (!showPool) return;
+		void quotas;
+		const controller = new AbortController();
+		loadHistory(rangeStart, rangeEnd, controller.signal).then(series => { history = series; historyError = ''; now = Date.now(); }, (error: Error) => { if (!controller.signal.aborted) { historyError = t('pool.historyError', { error: error.message }); now = Date.now(); } });
+		return () => controller.abort();
+	});
+	/** The range plus the last week the burn averages need, always up to now; merged when the server's 45 days need two requests. */
+	async function loadHistory(start: number, end: number, signal: AbortSignal) {
+		const iso = (ms: number | null) => ms == null ? undefined : new Date(ms).toISOString();
+		const answers = await Promise.all(historyRequests(start, end, Date.now()).map(r => management.quotaHistory(iso(r.from) as string, iso(r.to), signal)));
+		if (answers.length === 1) return answers[0].series;
+		const merged = new Map<string, HistorySeries>();
+		for (const series of answers.flatMap(a => a.series)) {
+			const key = `${series.account_id}|${series.window_id}`;
+			const known = merged.get(key);
+			if (!known) { merged.set(key, { ...series, points: [...series.points] }); continue; }
+			const times = new Set(known.points.map(p => p[0]));
+			known.points = [...known.points, ...series.points.filter(p => !times.has(p[0]))].sort((a, b) => a[0] - b[0]);
+		}
+		return [...merged.values()];
+	}
 	function remaining(id: string) { const values = quotas.find(q => q.account_id === id)?.windows.map(w => w.remaining_percent).filter((v): v is number => v != null) ?? []; return values.length ? Math.min(...values) : null; }
 </script>
 
@@ -56,11 +90,12 @@
 {#if !accounts.length}<section class="ledger"><EmptyState title={t('common.noAccountConnected')} description={t('quotas.emptyDescription')} action={t('nav.accounts')} onclick={manageAccounts}/></section>
 {:else if !filtered.length}<section class="ledger"><EmptyState title={t('common.noMatchingAccount')} description={t('common.tryOtherName')}/></section>
 {:else}
+	{#if showPool}<PoolControls bind:mode bind:burnHours bind:future bind:showAccounts range={t('pool.range', { from: day(rangeStart), to: day(rangeEnd - 1) })} today={offset === 0} shift={weeks => offset = weeks == null ? 0 : offset + weeks} error={historyError}/>{/if}
 	<div class="provider-groups">
 		{#each groups as group (group.id)}
 			<section class="provider-group" aria-label={t('quotas.group', { provider: providerName(group.id) })}>
 				<header class="provider-heading"><ProviderMark provider={group.id} size={25}/><h2>{providerName(group.id)}</h2><span>{t(group.accounts.length === 1 ? 'common.accountCount.one' : 'common.accountCount.other', { count: group.accounts.length })}</span></header>
-				{#if settings?.show_provider_pace && accounts.some(a => a.provider === group.id && a.enabled)}<QuotaPace accounts={accounts.filter(a => a.provider === group.id)} {quotas} provider={group.id}/>{/if}
+				{#if showPool && accounts.some(a => a.provider === group.id && a.enabled)}<QuotaPool provider={group.id} accounts={accounts.filter(a => a.provider === group.id)} {quotas} {history} {now} start={rangeStart} end={rangeEnd} {mode} {burnHours} {future} {showAccounts} planWeights={settings?.plan_weights}/>{/if}
 				<div class="ledger">
 					{#each group.accounts as account (account.id)}
 						{@const quota = quotas.find(q => q.account_id === account.id)}

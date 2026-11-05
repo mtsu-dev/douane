@@ -97,3 +97,13 @@ test('five-hour buckets known only by their label count like the 5h window', () 
   // A label that only contains "5h" inside a longer token is not a five-hour window.
   assert.equal(providerPace([account('a')], [quota('a', [window('x', 50, 2.5, 'Model 15hz')])]).known, 0);
 });
+
+test('a Pro account weighs a twentieth of an Ultra account in the pace', () => {
+  // Ultra half used at half week (on pace), Pro fully used at half week (200%).
+  const accounts = [account('ultra'), account('pro')];
+  const quotas = [quota('ultra', [window('weekly', 50, 3.5 * day)]), quota('pro', [window('weekly', 0, 3.5 * day)])];
+  // Unweighted both count the same: (50 + 100) / (50 + 50).
+  assert.equal(providerPace(accounts, quotas).percent, 150);
+  // Weighted 1x and 0.05x: (50 + 5) / (50 + 2.5).
+  assert.equal(providerPace(accounts, quotas, new Map([['ultra', 1], ['pro', 0.05]])).percent, Math.round(55 / 52.5 * 100));
+});
