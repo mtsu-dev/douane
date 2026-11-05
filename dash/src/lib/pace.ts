@@ -16,7 +16,7 @@ export const isMonthly = (window: QuotaWindow) => window.id === 'monthly' || (!L
 /** Window length in ms, from its id or, for provider buckets, its label. */
 export function windowLength(window: QuotaWindow, reset: number) {
   if (isMonthly(window)) return reset > 0 ? monthLength(reset) : null;
-  const known = LENGTHS[window.id] ?? Number(/^window-(\d+)s$/.exec(window.id)?.[1]) * 1000;
+  const known = LENGTHS[window.id] ?? (Number(/^window-(\d+)s$/.exec(window.id)?.[1]) * 1000 || Number(/(?:^|-)(\d+)h$/.exec(window.id)?.[1]) * HOUR);
   if (known) return known;
   if (/week/i.test(window.label)) return LENGTHS.weekly;
   if (/five.?hour|\b5\s?h\b/i.test(window.label)) return LENGTHS['five-hour'];

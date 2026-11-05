@@ -10,7 +10,7 @@
 	import EmptyState from './empty-state.svelte';
 	import { providerName, formatDate, resetLabel, creditValue, usageLabel, privateLabel, accountStatus, accountWarning, type Account, type Quota, type Settings, type Provider, type HistorySeries, management } from '$lib/management';
 	import { addDays, day, midnight } from '$lib/pool-format';
-	import { DAY, HOUR } from '$lib/pool';
+	import { historyRequests } from '$lib/pool';
 	import { t } from '$lib/i18n.svelte';
 	let { accounts, quotas, providers = [], busy, refresh, resetUpdated, settings, manageAccounts }: { accounts: Account[]; quotas: Quota[]; providers?: Provider[]; busy: string; refresh: (id?: string) => void; resetUpdated: () => Promise<void>; settings: Settings | null; manageAccounts: () => void } = $props();
 	const TOOLBAR_GAP = 20;
@@ -56,15 +56,13 @@
 		loadHistory(rangeStart, rangeEnd, controller.signal).then(series => { history = series; historyError = ''; now = Date.now(); }, (error: Error) => { if (!controller.signal.aborted) { historyError = t('pool.historyError', { error: error.message }); now = Date.now(); } });
 		return () => controller.abort();
 	});
-	/** The range plus the last week the burn averages need, in two requests when they exceed the server's 45 days. */
+	/** The range plus the last week the burn averages need, always up to now; merged when the server's 45 days need two requests. */
 	async function loadHistory(start: number, end: number, signal: AbortSignal) {
-		const at = Date.now(), burnFrom = at - 7 * DAY - HOUR;
-		const to = end > at ? undefined : new Date(end).toISOString();
-		const iso = (ms: number) => new Date(ms).toISOString();
-		if ((end > at ? at : end) - Math.min(start, burnFrom) <= 45 * DAY) return (await management.quotaHistory(iso(Math.min(start, burnFrom)), to, signal)).series;
-		const [range, recent] = await Promise.all([management.quotaHistory(iso(start), to, signal), management.quotaHistory(iso(burnFrom), undefined, signal)]);
+		const iso = (ms: number | null) => ms == null ? undefined : new Date(ms).toISOString();
+		const answers = await Promise.all(historyRequests(start, end, Date.now()).map(r => management.quotaHistory(iso(r.from) as string, iso(r.to), signal)));
+		if (answers.length === 1) return answers[0].series;
 		const merged = new Map<string, HistorySeries>();
-		for (const series of [...range.series, ...recent.series]) {
+		for (const series of answers.flatMap(a => a.series)) {
 			const key = `${series.account_id}|${series.window_id}`;
 			const known = merged.get(key);
 			if (!known) { merged.set(key, { ...series, points: [...series.points] }); continue; }

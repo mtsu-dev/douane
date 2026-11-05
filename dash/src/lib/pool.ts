@@ -49,26 +49,30 @@ export function weightNotes(accounts: Account[], quotas: Quota[], weights: Map<s
 /**
  * The pool's series: per enabled account, only its longest windows (monthly
  * over weekly over 5h); n buckets of that length share the account weight.
- * Recorded points come before `now`; the current snapshot is the last point.
+ * Windows of no known length count only when the account has nothing
+ * longer (Copilot premium requests, a Kimi limit). Recorded points come before
+ * the snapshot, which stays at its own read time, so a stale snapshot adds no
+ * reading and invents no use.
  */
 export function poolSeries(accounts: Account[], quotas: Quota[], history: HistorySeries[], weights: Map<string, number>, now: number): Series[] {
 	const series: Series[] = [];
 	for (const account of accounts) {
 		const weight = weights.get(account.id);
 		if (!account.enabled || weight == null) continue;
-		const all = quotas.find(q => q.account_id === account.id)?.windows ?? [];
+		const quota = quotas.find(q => q.account_id === account.id);
+		const all = (quota?.windows ?? []).filter(w => w.remaining_percent != null);
 		const longest = Math.max(0, ...all.map(windowRank));
-		if (!longest) continue;
-		const chosen = all.filter(w => windowRank(w) === longest && w.remaining_percent != null);
+		const chosen = all.filter(w => windowRank(w) === longest);
+		const read = Math.min(now, Date.parse(quota?.updated_at ?? '') || now);
 		for (const window of chosen) {
 			const reset = Date.parse(window.reset_at ?? '') || null;
 			const recorded = (history.find(h => h.account_id === account.id && h.window_id === window.id)?.points ?? [])
 				.map(([t, v, r]) => ({ t: t * 1000, v, reset: r == null ? null : r * 1000 }))
-				.filter(p => p.t < now);
+				.filter(p => p.t < read);
 			series.push({
 				accountId: account.id, windowId: window.id, weight: weight / chosen.length, monthly: isMonthly(window),
 				length: reset ? windowLength(window, reset) : windowLength(window, 0),
-				points: [...recorded, { t: now, v: window.remaining_percent as number, reset }], history: recorded.length
+				points: [...recorded, { t: read, v: window.remaining_percent as number, reset }], history: recorded.length
 			});
 		}
 	}
@@ -105,6 +109,17 @@ export function valueAt(series: Series, t: number) {
 }
 
 export const poolValue = (series: Series[], t: number) => series.reduce((sum, s) => sum + s.weight * valueAt(s, t), 0);
+
+/**
+ * The history requests behind a range: always up to now, since the burn rate
+ * and its averages need the last week whatever range is shown. One request
+ * when it fits the server's 45 days, else the range plus the last week.
+ */
+export function historyRequests(start: number, end: number, at: number): { from: number; to: number | null }[] {
+	const week = at - 7 * DAY - HOUR;
+	if (at - Math.min(start, week) <= 45 * DAY) return [{ from: Math.min(start, week), to: null }];
+	return [{ from: start, to: end > at ? null : end }, { from: week, to: null }];
+}
 
 /** When the recorded line starts: the earliest reading, or now with no history. */
 export const recordedStart = (series: Series[]) => Math.min(...series.map(s => s.points[0]?.t ?? Infinity));

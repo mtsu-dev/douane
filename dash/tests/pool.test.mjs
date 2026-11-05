@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { accountWeights, weightNotes, poolSeries, capacity, valueAt, poolValue, recordedLine, burnRate, project, firstReset, drainLine, HOUR, DAY } from '../src/lib/pool.ts';
+import { accountWeights, weightNotes, poolSeries, capacity, valueAt, poolValue, recordedLine, burnRate, project, firstReset, drainLine, historyRequests, HOUR, DAY } from '../src/lib/pool.ts';
 
 const now = Date.parse('2026-11-05T12:00:00Z');
 const iso = ms => new Date(ms).toISOString();
@@ -110,4 +110,36 @@ test('each reset brings its series back to 100 with a weighted gain, then repeat
 	assert.deepEqual([p.line[at].v, p.line[at + 1].v], [40, 100]);
 	// An empty series refilled by its reset is not reported as emptying.
 	assert.equal(p.firstEmpty, null);
+});
+
+test('windows of no known length still count when an account has nothing longer (Copilot, Antigravity, Kimi)', () => {
+	const copilot = { id: 'c', name: 'c', provider: 'copilot', enabled: true, status: 'ready' };
+	const quotas = [{ account_id: 'c', windows: [{ id: 'premium', label: 'Premium requests', remaining_percent: 65, reset_at: iso(now + 9 * DAY) }], updated_at: iso(now) }];
+	const series = poolSeries([copilot], quotas, [], new Map([['c', 1]]), now);
+	assert.equal(capacity(series), 100);
+	assert.equal(poolValue(series, now), 65);
+	// A bucket id that names its hours gets that length.
+	const gemini = [{ account_id: 'c', windows: [{ id: 'gemini-5h', label: 'Gemini', remaining_percent: 30, reset_at: iso(now + HOUR) }], updated_at: iso(now) }];
+	assert.equal(poolSeries([copilot], gemini, [], new Map([['c', 1]]), now)[0].length, 5 * HOUR);
+});
+
+test('a stale snapshot keeps its read time and invents no use after a reset it has not seen', () => {
+	const reset = now - HOUR;
+	const read = now - 2 * HOUR;
+	const history = [{ account_id: 'a', window_id: 'weekly', points: [[s(read), 10, s(reset)]] }];
+	const stale = { account_id: 'a', windows: [{ id: 'weekly', label: 'Weekly', remaining_percent: 10, reset_at: iso(reset) }], updated_at: iso(read) };
+	const series = poolSeries([account('a', ultra)], [stale], history, new Map([['a', 1]]), now);
+	assert.equal(series[0].points.at(-1).t, read);
+	assert.equal(poolValue(series, now), 100);
+	assert.equal(burnRate(series, now, 3).rate, 0);
+	assert.equal(project(series, now, now + DAY, 0, [0]).firstEmpty, null);
+});
+
+test('history requests always reach now, so a past range keeps the readings the burn needs', () => {
+	// A range entirely in the past, within the server's 45 days: one request up to now.
+	assert.deepEqual(historyRequests(now - 20 * DAY, now - 6 * DAY, now), [{ from: now - 20 * DAY, to: null }]);
+	// Far in the past: the range itself, plus the last week up to now.
+	assert.deepEqual(historyRequests(now - 60 * DAY, now - 46 * DAY, now), [{ from: now - 60 * DAY, to: now - 46 * DAY }, { from: now - 7 * DAY - HOUR, to: null }]);
+	// The usual range around today reaches back a week for the averages.
+	assert.deepEqual(historyRequests(now - 4 * DAY, now + 10 * DAY, now), [{ from: now - 7 * DAY - HOUR, to: null }]);
 });
