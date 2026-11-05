@@ -6,6 +6,7 @@ mod antigravity_thinking;
 pub mod clients;
 pub mod ledger;
 pub mod management;
+pub mod quota_history;
 pub mod quota_view;
 pub mod relay;
 pub mod scheduler;
@@ -42,6 +43,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             patch(management::update_account).delete(management::delete_account),
         )
         .route("/quotas", get(management::quotas))
+        .route("/quotas/history", get(management::quota_history))
         .route("/accounts/{id}/resets", get(management::account_resets))
         .route(
             "/accounts/{id}/resets/redeem",

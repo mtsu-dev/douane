@@ -1378,6 +1378,17 @@ pub(crate) fn subscription_from_value(
     let rate_tier = text(organization, &["rate_limit_tier", "rateLimitTier"]);
     let mut tier =
         SubscriptionTier::detect(provider, plan.as_deref(), rate_tier.as_deref(), source)?;
+    // Anthropic now names its plans (the Max x20 tier is "Ultra"): the
+    // display name wins over the tier-derived label, the multiplier stays.
+    if provider == SubscriptionProvider::Claude {
+        if let Some(name) = text(organization, &["plan_display_name", "planDisplayName"])
+            .map(|name| name.trim().trim_start_matches("Claude ").trim().to_owned())
+            .filter(|name| !name.is_empty() && name.len() <= 40)
+        {
+            tier.id = name.to_ascii_lowercase().replace(' ', "_");
+            tier.label = format!("Claude {name}");
+        }
+    }
     // The generic Pro identifier does not prove an allowance multiplier.
     // Only an explicit provider field can add it.
     if provider == SubscriptionProvider::Codex {
@@ -1418,6 +1429,18 @@ mod tests {
     fn tier_detection_uses_provider_metadata_and_keeps_unknowns_unknown() {
         let claude = subscription_from_value(SubscriptionProvider::Claude, &json!({"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}), "provider_profile").unwrap();
         assert_eq!(claude.label, "Claude Max x5");
+        // Anthropic renamed Max x20 to Ultra: the profile names the plan and
+        // the rate tier still carries the allowance multiplier.
+        let ultra = subscription_from_value(SubscriptionProvider::Claude, &json!({"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_20x","plan_display_name":"Ultra"}}), "provider_profile").unwrap();
+        assert_eq!(
+            (ultra.id.as_str(), ultra.label.as_str(), ultra.multiplier),
+            ("ultra", "Claude Ultra", Some(20))
+        );
+        let pro = subscription_from_value(SubscriptionProvider::Claude, &json!({"organization":{"organization_type":"claude_pro","rate_limit_tier":"default_claude_ai"}}), "provider_profile").unwrap();
+        assert_eq!(
+            (pro.id.as_str(), pro.label.as_str(), pro.multiplier),
+            ("pro", "Claude Pro", None)
+        );
         let codex = subscription_from_value(
             SubscriptionProvider::Codex,
             &json!({"plan_type":"pro"}),
