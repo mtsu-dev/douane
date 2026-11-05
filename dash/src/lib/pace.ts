@@ -4,17 +4,17 @@ const HOUR = 3600_000;
 const LENGTHS: Record<string, number> = { 'five-hour': 5 * HOUR, daily: 24 * HOUR, weekly: 168 * HOUR, 'seven-day': 168 * HOUR, seven_day: 168 * HOUR };
 
 /** A month ending at reset started the same day of the previous month (clamped to its last day). */
-function monthLength(reset: number) {
+export function monthLength(reset: number) {
   const end = new Date(reset);
   const year = end.getUTCFullYear(), month = end.getUTCMonth() - 1;
   const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
   return reset - Date.UTC(year, month, Math.min(end.getUTCDate(), lastDay), end.getUTCHours(), end.getUTCMinutes(), end.getUTCSeconds());
 }
 
-const isMonthly = (window: QuotaWindow) => window.id === 'monthly' || (!LENGTHS[window.id] && /month/i.test(window.label));
+export const isMonthly = (window: QuotaWindow) => window.id === 'monthly' || (!LENGTHS[window.id] && /month/i.test(window.label));
 
 /** Window length in ms, from its id or, for provider buckets, its label. */
-function windowLength(window: QuotaWindow, reset: number) {
+export function windowLength(window: QuotaWindow, reset: number) {
   if (isMonthly(window)) return reset > 0 ? monthLength(reset) : null;
   const known = LENGTHS[window.id] ?? Number(/^window-(\d+)s$/.exec(window.id)?.[1]) * 1000;
   if (known) return known;
@@ -24,7 +24,7 @@ function windowLength(window: QuotaWindow, reset: number) {
 }
 
 /** Nominal size used to pick the longest window: calendar months differ by days, yet stay one class. */
-function windowRank(window: QuotaWindow) {
+export function windowRank(window: QuotaWindow) {
   if (isMonthly(window)) return 30 * 24 * HOUR;
   return windowLength(window, 0) ?? 0;
 }
@@ -36,8 +36,10 @@ function windowRank(window: QuotaWindow) {
  * every bucket of that length included, weighted by how far it has run, so a
  * window that just started weighs little. A longest window that says nothing
  * yet keeps the account out rather than falling back to a shorter one.
+ * `weights` (account id to plan weight, 1 when absent) scales each account's
+ * used and expected share, so a Pro account weighs a twentieth of an Ultra one.
  */
-export function providerPace(accounts: Account[], quotas: Quota[]) {
+export function providerPace(accounts: Account[], quotas: Quota[], weights?: Map<string, number>) {
   const enabled = accounts.filter(a => a.enabled);
   let used = 0, expected = 0, known = 0;
   for (const account of enabled) {
@@ -56,9 +58,10 @@ export function providerPace(accounts: Account[], quotas: Quota[]) {
       return elapsed > 0 ? [{ used: 100 - window.remaining_percent, elapsed }] : [];
     });
     if (!windows.length) continue;
+    const weight = weights?.get(account.id) ?? 1;
     for (const window of windows) {
-      used += window.used;
-      expected += window.elapsed;
+      used += weight * window.used;
+      expected += weight * window.elapsed;
     }
     known++;
   }

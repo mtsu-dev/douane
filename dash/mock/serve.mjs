@@ -19,8 +19,10 @@ const account = (id, provider, name, extra = {}) => ({
 });
 const tier = (id, label, multiplier = null) => ({ id, label, multiplier, source: 'provider_usage' });
 const accounts = [
-	account('acc-claude-home', 'claude', 'Home', { email: 'alex@example.com', subscription: tier('max', 'Claude Max x20', 20), reserve_percent: 5 }),
-	account('acc-claude-work', 'claude', 'Work', { email: 'alex.work@example.com', subscription: tier('max', 'Claude Max x5', 5) }),
+	account('acc-claude-home', 'claude', 'Home', { email: 'alex@example.com', subscription: tier('ultra', 'Claude Ultra', 20), reserve_percent: 5 }),
+	account('acc-claude-work', 'claude', 'Work', { email: 'alex.work@example.com', subscription: tier('ultra', 'Claude Ultra', 20) }),
+	account('acc-claude-studio', 'claude', 'Studio', { email: 'studio@example.com', subscription: tier('ultra', 'Claude Ultra', 20) }),
+	account('acc-claude-side', 'claude', 'Side', { email: 'side@example.com', subscription: tier('pro', 'Claude Pro') }),
 	account('acc-codex', 'codex', 'ChatGPT', { email: 'alex@example.com', subscription: tier('pro', 'Codex Pro') }),
 	account('acc-grok', 'xai', 'SuperGrok', { subscription: tier('supergrok', 'SuperGrok') }),
 	account('acc-copilot', 'copilot', 'GitHub', { subscription: tier('pro', 'Copilot Pro') }),
@@ -39,6 +41,8 @@ const quotas = [
 		credits: [{ id: 'extra-usage', label: 'Extra usage', used: null, limit: null, remaining: null, unit: 'USD', reset_at: null, unlimited: null, enabled: false }]
 	}),
 	quota('acc-claude-work', [window('five-hour', '5 hours', 34, 1.4), window('weekly', 'Weekly', 22, 110), window('seven-day-opus', 'Opus weekly', 74, 110)]),
+	quota('acc-claude-studio', [window('five-hour', '5 hours', 88, 4.2), window('weekly', 'Weekly', 48, 20)]),
+	quota('acc-claude-side', [window('five-hour', '5 hours', 60, 3.1), window('weekly', 'Weekly', 35, 90)]),
 	quota('acc-codex', [window('five-hour', '5 hours', 92, 3.9), window('weekly', 'Weekly', 77, 85)], {
 		credits: [{ id: 'credits', label: 'Codex credits', used: null, limit: null, remaining: 1250, unit: 'credits', reset_at: null, unlimited: false, enabled: true }]
 	}),
@@ -46,6 +50,57 @@ const quotas = [
 	quota('acc-copilot', [window('premium', 'Premium requests', 81, 24 * 15)]),
 	quota('acc-go', [window('five-hour', '5 hours', 100, 5), window('weekly', 'Weekly', 88, 70), window('monthly', 'Monthly', 61, 24 * 15)])
 ];
+// Recorded quota history over the last six days, consistent with the snapshot above:
+// each window drains during the day toward its current value and restarts at 100 on reset.
+// A point is kept on a 0.5% move, a reset change, or hourly as a heartbeat, like the server.
+const HOUR_MS = 3600_000;
+const lengths = { 'five-hour': 5, weekly: 168, 'seven-day-opus': 168, monthly: 24 * 30 };
+const activity = (t, phase) => {
+	const hour = (new Date(t).getUTCHours() + 1) % 24;
+	return hour >= 8 && hour <= 23 ? 1 + 0.7 * Math.sin(t / (3 * HOUR_MS) + phase) : 0.08;
+};
+const history = [];
+quotas.forEach((q, qi) => q.windows.forEach((w, wi) => {
+	const hours = lengths[w.id];
+	if (!hours || w.remaining_percent == null) return;
+	const phase = qi * 1.7 + wi;
+	const stepMs = 10 * 60_000, start = now - 6 * 24 * HOUR_MS;
+	const reset = Date.parse(w.reset_at);
+	const cumulative = (from, to) => { let sum = 0; for (let t = from; t < to; t += stepMs) sum += activity(t, phase); return sum; };
+	const points = [];
+	let last = null;
+	const push = (t, v, r) => {
+		if (last && last[2] === Math.floor(r / 1000) && Math.abs(last[1] - v) < 0.5 && t - last[0] * 1000 < HOUR_MS) return;
+		last = [Math.floor(t / 1000), Math.round(v * 10) / 10, Math.floor(r / 1000)];
+		points.push(last);
+	};
+	// Walk window by window from six days ago to now; the current window ends at the snapshot value.
+	let windowEnd = reset;
+	while (windowEnd - hours * HOUR_MS > start) windowEnd -= hours * HOUR_MS;
+	for (let end = windowEnd; end - hours * HOUR_MS < now; end += hours * HOUR_MS) {
+		const begin = end - hours * HOUR_MS;
+		const current = end === reset;
+		const target = current ? 100 - w.remaining_percent : [88, 70, 100, 55, 64][(qi + wi + Math.round(end / HOUR_MS)) % 5];
+		const total = cumulative(begin, current ? now : end) || 1;
+		let acc = cumulative(begin, Math.max(begin, start));
+		for (let t = Math.max(begin, start); t < Math.min(end, now); t += stepMs) {
+			push(t, Math.max(0, 100 - target * acc / total), end);
+			acc += activity(t, phase);
+		}
+	}
+	history.push({ account_id: q.account_id, window_id: w.id, points: points.filter(p => p[0] * 1000 < now - 60_000) });
+}));
+function quotaHistory(query) {
+	const from = Date.parse(query.get('from') ?? ''), to = query.get('to') ? Date.parse(query.get('to')) : Date.now();
+	if (!Number.isFinite(from) || !Number.isFinite(to) || to < from || to - from > 45 * 24 * HOUR_MS) return [400, { error: { message: 'from and to must be RFC 3339, at most 45 days apart' } }];
+	return {
+		series: history.map(({ account_id, window_id, points }) => {
+			const before = points.filter(p => p[0] * 1000 < from).at(-1);
+			const inside = points.filter(p => p[0] * 1000 >= from && p[0] * 1000 <= to);
+			return { account_id, window_id, points: before ? [before, ...inside] : inside };
+		}).filter(series => series.points.length)
+	};
+}
 const providers = [
 	['claude', 'Claude', true, true], ['codex', 'Codex', true, true], ['meta', 'Muse Code', true, true], ['opencode_go', 'OpenCode Go', false, true],
 	['xai', 'Grok', true, true], ['copilot', 'GitHub Copilot', true, true], ['antigravity', 'Antigravity', false, true],
@@ -155,7 +210,7 @@ const summary = {
 };
 const settings = {
 	strategy: 'smart', quota_refresh_seconds: 300, free_before_reset_hours: 6, request_timeout_seconds: 180, default_provider: null,
-	provider_strategies: { claude: 'reset-first' }, quota_display: {}, quota_windows: {}, show_provider_pace: process.env.MOCK_PACE === '1'
+	provider_strategies: { claude: 'reset-first' }, quota_display: {}, quota_windows: {}, show_provider_pace: process.env.MOCK_PACE === '1', plan_weights: {}
 };
 const resetResults = new Map();
 const resets = (id) => {
@@ -186,6 +241,7 @@ function api(method, path, body, query = new URLSearchParams()) {
 	if (method !== 'GET') return { ok: true };
 	const reset = path.match(/^\/accounts\/([^/]+)\/resets$/);
 	if (reset) return resets(decodeURIComponent(reset[1]));
+	if (path === '/quotas/history') return quotaHistory(query);
 	if (path === '/clients/stats') return clientStats(Number(query.get('hours') ?? 24));
 	switch (path) {
 		case '/summary': case '/status': return { ...summary, clients: clients.length };
