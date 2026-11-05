@@ -47,7 +47,7 @@ export const fr: Record<StringKey, string> = {
 	'pool.mode': 'Graphique',
 	'pool.controls': 'Options du graphique de pool',
 	'pool.duration.days': '{d} j {h} h',
-	'pool.duration.hours': '{h} h {m}',
+	'pool.duration.hours': '{h} h {m} min',
 	'pool.duration.minutes': '{m} min',
 	'pool.historyError': 'Historique indisponible, affichage des quotas actuels : {error}',
 	'settings.planWeights': 'Poids des offres',

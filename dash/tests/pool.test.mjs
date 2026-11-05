@@ -43,7 +43,7 @@ test('a reading holds until the next one and returns to 100 once its reset passe
 	// The recorded line draws a vertical step at the reset.
 	const line = recordedLine([series], now - 12 * HOUR, now);
 	const at = line.findIndex(p => p.t === now - 5 * HOUR);
-	assert.deepEqual([line[at - 1].v, line[at].v], [30, 100]);
+	assert.deepEqual([line[at - 1].t, line[at - 1].v, line[at].v], [now - 5 * HOUR - 1, 30, 100]);
 	assert.equal(line[0].t, now - 10 * HOUR);
 	assert.equal(line.at(-1).v, 90);
 });

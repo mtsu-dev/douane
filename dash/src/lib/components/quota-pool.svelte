@@ -27,8 +27,8 @@
 	let current = $derived(poolValue(series, now));
 	let burn = $derived(burnRate(series, now, burnHours));
 	let usage = $derived(future === 'same' ? burn : burnRate(series, now, future === 'day' ? 24 : 168));
-	// Stats look ahead to the range end, or a week when the range is behind.
-	let statsEnd = $derived(end > now ? end : now + 7 * DAY);
+	// Stats look ahead to the range end, or a week when the range is behind, never past the 45-day forecast.
+	let statsEnd = $derived(Math.min(end > now ? end : now + 7 * DAY, now + 45 * DAY));
 	let earliestReset = $derived(Math.min(...series.map(s => s.points[s.points.length - 1].reset ?? Infinity).filter(r => r > now)));
 	let horizon = $derived(Math.min(now + 45 * DAY, Math.max(statsEnd, Number.isFinite(earliestReset) ? earliestReset + 1 : 0)));
 	let projection = $derived(project(series, now, horizon, usage.rate, usage.rates));
