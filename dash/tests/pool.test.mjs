@@ -158,3 +158,13 @@ test('Copilot premium requests are a monthly window: average since reset and mon
 	assert.ok(Math.abs(burnRate([series], now, 3).rate - 0.324) < 0.001);
 	assert.deepEqual(project([series], now, Date.parse('2027-01-02T00:00:00Z'), 0.3, [0.3]).resets.map(r => iso(r.t)), ['2026-12-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z']);
 });
+
+test('Copilot Free chat and completions are monthly too', () => {
+	const copilot = { id: 'c', name: 'c', provider: 'copilot', enabled: true, status: 'ready' };
+	const reset = Date.parse('2026-12-01T00:00:00Z');
+	for (const id of ['chat', 'completions']) {
+		const [series] = poolSeries([copilot], [{ account_id: 'c', windows: [{ id, label: id, remaining_percent: 20, reset_at: iso(reset) }], updated_at: iso(now) }], [], new Map([['c', 1]]), now);
+		assert.equal(series.monthly, true);
+		assert.ok(Math.abs(burnRate([series], now, 3).rate - 0.741) < 0.001);
+	}
+});
