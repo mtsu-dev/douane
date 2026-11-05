@@ -60,9 +60,9 @@ export function poolSeries(accounts: Account[], quotas: Quota[], history: Histor
 		const weight = weights.get(account.id);
 		if (!account.enabled || weight == null) continue;
 		const quota = quotas.find(q => q.account_id === account.id);
-		const all = (quota?.windows ?? []).filter(w => w.remaining_percent != null);
+		const all = quota?.windows ?? [];
 		const longest = Math.max(0, ...all.map(windowRank));
-		const chosen = all.filter(w => windowRank(w) === longest);
+		const chosen = all.filter(w => windowRank(w) === longest && w.remaining_percent != null);
 		const read = Math.min(now, Date.parse(quota?.updated_at ?? '') || now);
 		for (const window of chosen) {
 			const reset = Date.parse(window.reset_at ?? '') || null;

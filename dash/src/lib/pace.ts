@@ -11,7 +11,8 @@ export function monthLength(reset: number) {
   return reset - Date.UTC(year, month, Math.min(end.getUTCDate(), lastDay), end.getUTCHours(), end.getUTCMinutes(), end.getUTCSeconds());
 }
 
-export const isMonthly = (window: QuotaWindow) => window.id === 'monthly' || (!LENGTHS[window.id] && /month/i.test(window.label));
+/** Monthly windows: by id, by label, and Copilot's premium requests, which reset each month. */
+export const isMonthly = (window: QuotaWindow) => window.id === 'monthly' || window.id === 'premium' || (!LENGTHS[window.id] && /month/i.test(window.label));
 
 /** Window length in ms, from its id or, for provider buckets, its label. */
 export function windowLength(window: QuotaWindow, reset: number) {

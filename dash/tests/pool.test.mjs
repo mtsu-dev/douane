@@ -143,3 +143,18 @@ test('history requests always reach now, so a past range keeps the readings the 
 	// The usual range around today reaches back a week for the averages.
 	assert.deepEqual(historyRequests(now - 4 * DAY, now + 10 * DAY, now), [{ from: now - 7 * DAY - HOUR, to: null }]);
 });
+
+test('an unread longest window keeps the account out rather than falling back to a shorter one', () => {
+	const quotas = [quota('a', [{ id: 'five-hour', label: '5 hours', remaining_percent: 10, reset_at: iso(now + HOUR) }, weekly(null, DAY)])];
+	assert.deepEqual(poolSeries([account('a', ultra)], quotas, [], new Map([['a', 1]]), now), []);
+});
+
+test('Copilot premium requests are a monthly window: average since reset and monthly resets', () => {
+	const copilot = { id: 'c', name: 'c', provider: 'copilot', enabled: true, status: 'ready' };
+	const reset = Date.parse('2026-12-01T00:00:00Z');
+	const quotas = [{ account_id: 'c', windows: [{ id: 'premium', label: 'Premium requests', remaining_percent: 65, reset_at: iso(reset) }], updated_at: iso(now) }];
+	const [series] = poolSeries([copilot], quotas, [], new Map([['c', 1]]), now);
+	assert.equal(series.monthly, true);
+	assert.ok(Math.abs(burnRate([series], now, 3).rate - 0.324) < 0.001);
+	assert.deepEqual(project([series], now, Date.parse('2027-01-02T00:00:00Z'), 0.3, [0.3]).resets.map(r => iso(r.t)), ['2026-12-01T00:00:00.000Z', '2027-01-01T00:00:00.000Z']);
+});
